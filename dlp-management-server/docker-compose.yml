@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: dlp-server-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dlp
+      POSTGRES_USER: dlp
+      POSTGRES_PASSWORD: dlp_dev_password_change_me
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Bind mount: all database files live in ./data/postgres on the host.
+      # Stopping or even deleting the container loses nothing — the data
+      # stays in this folder and is picked up again on the next start.
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dlp -d dlp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
