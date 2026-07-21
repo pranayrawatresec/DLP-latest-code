@@ -5,7 +5,9 @@
   "scripts": {
     "start": "nodemon ./bin/www",
     "migrate": "node db/migrate.js",
-    "bootstrap-admin": "node bin/bootstrap-admin.js"
+    "bootstrap-admin": "node bin/bootstrap-admin.js",
+    "init-ca": "node bin/init-ca.js",
+    "test:ca": "node test/ca.test.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -16,6 +18,7 @@
     "http-errors": "~1.6.3",
     "jade": "~1.11.0",
     "morgan": "~1.9.1",
+    "node-forge": "^1.4.0",
     "nodemon": "^3.1.14",
     "pg": "^8.22.0"
   }

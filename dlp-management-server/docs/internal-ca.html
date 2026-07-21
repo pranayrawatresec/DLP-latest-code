@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Internal CA — Implementation & Test Report</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f7f8fa; --border: #e4e7ec; --ink: #1a1d23;
+    --muted: #667085; --accent: #1f2937; --green: #067647; --green-bg: #ecfdf3;
+    --red: #b42318; --amber: #b54708; --amber-bg: #fffaeb; --code: #f2f4f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.65 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 40px 24px 96px; }
+  header.hero { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 32px; }
+  .tag { display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: 28px; margin: 8px 0 6px; letter-spacing: -0.01em; }
+  h2 { font-size: 20px; margin: 40px 0 12px; padding-top: 8px; letter-spacing: -0.01em; }
+  h3 { font-size: 15px; margin: 24px 0 8px; }
+  p { color: #344054; } .muted { color: var(--muted); }
+  .lead { font-size: 16px; color: #344054; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 999px; font-size: 12.5px; font-weight: 600; }
+  .pill.ok { background: var(--green-bg); color: var(--green); }
+  .summary { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+  .stat { flex: 1 1 130px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 16px; }
+  .stat .n { font-size: 24px; font-weight: 700; }
+  .stat .l { font-size: 12.5px; color: var(--muted); }
+  code, pre { font-family: "SF Mono", Consolas, "Roboto Mono", monospace; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 5px; font-size: 13px; }
+  pre { background: var(--accent); color: #e5e7eb; padding: 16px; border-radius: 10px;
+    overflow-x: auto; font-size: 12.5px; line-height: 1.55; }
+  .diagram { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; overflow-x: auto; }
+  .diagram pre { background: transparent; color: var(--ink); padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border);
+    vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
+  td.id { font-family: monospace; color: var(--muted); white-space: nowrap; }
+  .st { font-weight: 700; font-size: 12px; padding: 2px 8px; border-radius: 999px; }
+  .st.pass { background: var(--green-bg); color: var(--green); }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 18px; margin: 12px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+  ul.check { list-style: none; padding: 0; margin: 8px 0; }
+  ul.check li { padding: 5px 0 5px 26px; position: relative; }
+  ul.check li::before { content: "✓"; position: absolute; left: 0; color: var(--green);
+    font-weight: 700; }
+  .note { background: var(--amber-bg); border: 1px solid #fedf89; border-radius: 10px;
+    padding: 12px 14px; font-size: 13.5px; color: #573b00; }
+  .kv { font-size: 13.5px; }
+  .kv b { font-weight: 600; } .fn { font-family: monospace; font-size: 13px; }
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border);
+    font-size: 12.5px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <span class="tag">DLP Management Server · Phase 2 · Plane 2</span>
+  <h1>Internal Certificate Authority</h1>
+  <p class="lead">The server is its own private CA. It issues and verifies every certificate
+  locally, so agent identity works with <b>no internet and no external CA</b> — the property that
+  lets the product run in air-gapped defence sites.</p>
+  <div class="summary">
+    <div class="stat"><div class="n">21 / 21</div><div class="l">tests passing</div></div>
+    <div class="stat"><div class="n">2</div><div class="l">independent verifiers<br>(Node native + OpenSSL)</div></div>
+    <div class="stat"><div class="n">0</div><div class="l">crypto deps beyond<br>node-forge (pinned)</div></div>
+    <div class="stat"><div class="n">RSA<br>4096 / 2048</div><div class="l">CA / leaf · SHA-256</div></div>
+  </div>
+  <p style="margin-top:14px"><span class="pill ok">● Implemented &amp; verified</span></p>
+</header>
+
+<h2>1. What this layer does</h2>
+<p>It is the "badge printer" of the whole trust model. Four capabilities:</p>
+<div class="grid2">
+  <div class="card"><b>Create the root CA</b><p class="muted" style="margin:6px 0 0">One key pair +
+  self-signed certificate, generated once on the server box. The single root of trust everything
+  else derives from.</p></div>
+  <div class="card"><b>Issue the server certificate</b><p class="muted" style="margin:6px 0 0">The
+  identity the agent-listener presents over mTLS, so agents can prove they're talking to the genuine
+  server — not a counterfeit console.</p></div>
+  <div class="card"><b>Sign agent CSRs</b><p class="muted" style="margin:6px 0 0">During enrollment,
+  turn an agent's certificate request into a signed client certificate. The identity is
+  <b>server-assigned</b>, never what the request asked for.</p></div>
+  <div class="card"><b>Serve trust material</b><p class="muted" style="margin:6px 0 0">Hand the mTLS
+  listener its key/cert and the CA as the anchor for verifying agent certificates.</p></div>
+</div>
+
+<h2>2. How it connects to the admin login we already built</h2>
+<p>The CA doesn't authorize agents on its own — a <b>human sysadmin</b>, authenticated and authorized by
+the existing RBAC system, is the root of an agent's authority. The two planes meet at exactly one seam:
+the enrollment token (built next). CA creation itself is a setup action recorded in the same
+tamper-evident audit log as every admin action.</p>
+<div class="diagram"><pre>
+  PLANE 3 — humans (built)                 PLANE 2 — machines (this layer + next)
+  ────────────────────────                 ─────────────────────────────────────
+  sysadmin logs in
+   (session + RBAC)
+        │  authorized action
+        ▼
+   mint enrollment token  ──── secret ────▶  installer carries token to a PC
+        │                                          │
+        │ audit_log (hash-chained)                 ▼
+        │                                    agent sends CSR + token
+        ▼                                          │
+   ┌─────────────────────────────┐                ▼
+   │  INTERNAL CA  (this layer)   │◀───────  server signs CSR → agent certificate
+   │  root key · signs everything │                │
+   └─────────────────────────────┘                ▼
+        ca.init event → audit_log          every check-in = mutual TLS
+</pre></div>
+
+<h2>3. Architecture &amp; certificate hierarchy</h2>
+<div class="diagram"><pre>
+                 ┌───────────────────────────────┐
+                 │   Root CA  (self-signed)       │   RSA-4096, 10 yr
+                 │   CA:TRUE, pathlen:0           │   keyCertSign + cRLSign
+                 │   ca-key.pem  (crown jewel)    │
+                 └───────────────┬───────────────┘
+                        signs    │
+              ┌──────────────────┴──────────────────┐
+              ▼                                      ▼
+   ┌─────────────────────┐              ┌─────────────────────────┐
+   │ Server certificate  │ RSA-2048     │ Agent certificates      │ RSA-2048
+   │ EKU: serverAuth     │ 2 yr         │ EKU: clientAuth         │ 1 yr
+   │ SAN: dns + 127.0.0.1│              │ CN: server-assigned id  │
+   │ (mTLS listener)     │              │ (one per enrolled PC)   │
+   └─────────────────────┘              └─────────────────────────┘
+        proves the server                    proves each agent
+        to agents                            to the server
+</pre></div>
+<p class="muted">Single-level CA by design: <code>pathlen:0</code> forbids sub-CAs. An offline
+root / intermediate split and an HSM are deferred to Phase 6 hardening.</p>
+
+<h2>4. Files produced by <span class="fn">npm run init-ca</span></h2>
+<table>
+  <tr><th>File</th><th>Contents</th><th>Sensitivity</th></tr>
+  <tr><td class="fn">ca-cert.pem</td><td>Root CA certificate — the trust anchor</td><td>Public · shipped to every agent</td></tr>
+  <tr><td class="fn">ca-key.pem</td><td>Root CA private key (PKCS#8, optional AES-256)</td><td><b style="color:var(--red)">Crown jewel</b> · never leaves, back up offline</td></tr>
+  <tr><td class="fn">server-cert.pem</td><td>mTLS listener certificate</td><td>Public</td></tr>
+  <tr><td class="fn">server-key.pem</td><td>mTLS listener private key</td><td>Secret · mode 0600</td></tr>
+  <tr><td class="fn">ca-meta.json</td><td>Algorithm, serial, dates, encryption flag</td><td>Non-secret metadata</td></tr>
+</table>
+<p class="muted">The entire <code>ca/</code> directory is git-ignored. Losing <code>ca-key.pem</code>
+forces every field agent to re-enroll — the init command warns about this explicitly.</p>
+
+<h2>5. Security best practices applied</h2>
+<div class="grid2">
+<div>
+<ul class="check">
+  <li>Key generation via Node's native OpenSSL-backed CSPRNG</li>
+  <li>node-forge only assembles/signs the X.509 structure</li>
+  <li>128-bit random, positive serial numbers (unpredictable)</li>
+  <li>CA: <code>basicConstraints cA:TRUE, pathlen:0</code> (critical)</li>
+  <li>CA keyUsage limited to <code>keyCertSign + cRLSign</code></li>
+</ul>
+</div>
+<div>
+<ul class="check">
+  <li>Leaf EKU split: <code>serverAuth</code> vs <code>clientAuth</code></li>
+  <li>SAN-based server identity (modern TLS ignores CN)</li>
+  <li>Subject &amp; Authority Key Identifiers for chain building</li>
+  <li>CSR identity ignored — CA assigns the name (anti-spoofing)</li>
+  <li>Proof-of-possession: CSR self-signature verified before signing</li>
+  <li>Optional AES-256 encryption of the CA key at rest</li>
+  <li>Refuses to overwrite an existing CA (anti-footgun)</li>
+  <li>Clock-skew backdating of <code>notBefore</code></li>
+</ul>
+</div>
+</div>
+<div class="note"><b>Why node-forge and not native cert minting?</b> Node's <code>crypto</code> can
+generate keys and <em>read/verify</em> certificates but cannot <em>mint</em> them. We rejected
+<code>@peculiar/x509</code> (drags in a DI framework + reflection polyfill — needless supply-chain
+surface for an air-gapped product) and hand-rolled ASN.1 (the "don't roll your own crypto" trap).
+node-forge is a single, pinned dependency that only builds structure; the sensitive key generation
+stays in native crypto, and every output is cross-checked by two independent verifiers.</div>
+
+<h2>6. Public API — <span class="fn">lib/ca.js</span></h2>
+<pre>caExists()                          // is the CA initialized?
+initializeCa({ commonName, organization, country,
+               serverDnsNames, serverIpAddresses,
+               passphrase, force })  // one-time: root CA + server cert
+signCertificateRequest(csrPem, { commonName, validityDays, passphrase })
+                                    // enrollment core: CSR -> client cert
+loadCaCertificatePem()              // the public trust anchor
+loadServerTlsMaterial()             // { key, cert, ca } for the mTLS listener
+canonicalSerial(serial)             // normalize serials for peer-cert matching</pre>
+<p class="muted">Pure crypto + filesystem. It never touches the database or audit log — callers own
+persistence and auditing, which keeps the module unit-testable in isolation. <code>bin/init-ca.js</code>
+is the thin CLI that adds the <code>ca.init</code> audit entry.</p>
+
+<h2>7. Test &amp; edge-case results</h2>
+<p class="muted">All 21 checks pass. Every generated certificate is validated by <b>both</b> Node's
+native <code>crypto.X509Certificate</code> and the system <b>OpenSSL</b> — results below are the actual
+observed run, not assertions of intent.</p>
+<table>
+  <tr><th>ID</th><th>Check</th><th>Status</th></tr>
+  <tr><td class="id">T01</td><td>initializeCa creates all key/cert files</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T02</td><td>caExists() is true after init</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T03</td><td>re-init without force is refused (would orphan agents)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T04</td><td>CA cert: native X509 parses; self-issued</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T05</td><td>CA cert: basicConstraints cA=TRUE, pathlen 0 (OpenSSL)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T06</td><td>CA key is RSA-4096</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T07</td><td>server cert chains to CA (native verify)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T08</td><td>server cert chains to CA (independent OpenSSL)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T09</td><td>server cert has SAN (dns + ip) and EKU serverAuth</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T10</td><td>server key and cert form a matching pair</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T11</td><td>valid CSR signed into client cert chaining to CA</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T12</td><td>CA-assigned identity overrides the CSR subject</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T13</td><td>agent cert carries EKU clientAuth (not serverAuth)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T14</td><td>malformed CSR is rejected</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T15</td><td>CSR with tampered signature rejected (proof-of-possession)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T16</td><td>signing without server-assigned commonName is refused</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T17</td><td>cert from a different CA does NOT verify against ours</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T18</td><td>serials unique, positive, 128-bit (500-sample)</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T19</td><td>notBefore backdated; agent validity ~365d</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T20</td><td>encrypted CA key: wrong pass fails, right pass signs</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">T21</td><td>issued cert survives simulated process restart</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+<p class="kv muted">Reproduce: <code>npm run test:ca</code> — runs against a throwaway
+<code>test/.ca-tmp/</code> directory, never the real <code>ca/</code>.</p>
+
+<h3>Adversarial cases explicitly covered</h3>
+<ul class="check">
+  <li><b>Agent tries to name itself</b> (T12) — a CSR requesting <code>CN=i-am-the-sysadmin</code>
+  still gets the server-assigned identity; the requested name never reaches the certificate.</li>
+  <li><b>Forged / replayed CSR</b> (T15) — a CSR whose self-signature was tampered is rejected, so an
+  attacker can't get a certificate for a key they don't hold.</li>
+  <li><b>Counterfeit CA</b> (T17) — a certificate from an unrelated CA fails verification against ours,
+  under both Node and OpenSSL.</li>
+  <li><b>Operator footgun</b> (T03) — re-running init can't silently destroy the live CA.</li>
+</ul>
+
+<h2>8. Verified live (real CA, not the test dir)</h2>
+<pre>$ npm run init-ca
+CA created in .../ca
+  root CA serial   372f9720d616b75cff273ad5dd01a82
+  root valid until 2036-07-21
+  server cert CN   desktop-k8e7f5d  (SAN: desktop-k8e7f5d, localhost, 127.0.0.1)
+
+$ openssl verify -CAfile ca/ca-cert.pem ca/server-cert.pem
+ca/server-cert.pem: OK
+$ node -e "verifyChain()"     # after the ca.init audit event
+AUDIT CHAIN INTACT</pre>
+
+<h2>9. Deferred (later phases)</h2>
+<div class="card">
+<span class="kv"><b>Phase 6 hardening:</b> HSM-held CA key · FIPS-validated crypto module ·
+offline root + intermediate CA hierarchy · CRL/OCSP distribution.</span><br>
+<span class="kv"><b>Next (Phase 2 continued):</b> enrollment-token API (RBAC-gated) → agent enrollment
+endpoint → mTLS listener + check-in → fake-agent test harness → the real Rust agent. Revocation for
+now is the server refusing to renew a retired agent's entitlement at check-in.</span>
+</div>
+
+<footer>
+  DLP Management Server — Internal CA implementation report. Files: <span class="fn">lib/ca.js</span>,
+  <span class="fn">bin/init-ca.js</span>, <span class="fn">test/ca.test.js</span>.
+  Independent verifiers: Node <span class="fn">crypto.X509Certificate</span> + system OpenSSL.
+</footer>
+
+</div>
+</body>
+</html>

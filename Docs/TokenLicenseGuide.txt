@@ -1,0 +1,388 @@
+Yes. In fact, this PDF is describing exactly the architecture I recommended, but it goes one step further by defining how you should implement it in an enterprise DLP product. It's an excellent engineering guide.
+
+The main difference is:
+
+My explanation focused on teaching you what PKI is and why it is needed.
+The PDF explains how PKI fits into your DLP architecture, along with licensing, entitlement, and offline deployments.
+
+Let's compare them.
+
+1. Internal Certificate Authority (CA)
+
+This is exactly what I explained.
+
+I said:
+
+Company Root CA
+        |
+Management Server
+        |
+Agent Certificates
+
+The PDF says:
+
+The management server runs its own private Certificate Authority (CA). Everything is issued and verified locally.
+
+That means:
+
+           Management Server
+          (Internal CA)
+
+          Issues Certificates
+
+      Agent1
+      Agent2
+      Agent3
+
+This is the correct approach because your customers (nuclear plants, defence organizations, etc.) may not have Internet access.
+
+2. Agent Enrollment
+
+This section is almost identical to what I described.
+
+The PDF's flow is:
+
+Install Agent
+
+↓
+
+One-time Enrollment Token
+
+↓
+
+Agent contacts Server
+
+↓
+
+Server validates token
+
+↓
+
+Server issues Client Certificate
+
+↓
+
+Future communication uses mTLS
+
+Exactly as described in the guide.
+
+3. Mutual TLS
+
+I explained:
+
+Agent ---- Certificate ----> Server
+
+Server ---- Certificate ----> Agent
+
+The PDF says:
+
+Every check-in uses mutual TLS: the server proves its identity with a server certificate and the agent proves its identity with a client certificate.
+
+This prevents:
+
+Fake agents
+Fake management servers
+MITM attacks
+
+Exactly the purpose of PKI.
+
+4. Policy Signing
+
+I explained:
+
+policy.json
+
+↓
+
+Sign
+
+↓
+
+policy.sig
+
+↓
+
+Agent verifies
+
+The PDF says:
+
+The server sends a signed policy bundle, and the agent verifies the server's signature before applying it.
+
+This is exactly digital signatures.
+
+5. Short-Lived Entitlement Tokens
+
+This is something new that the PDF introduces, and it's a very good design.
+
+Instead of saying:
+
+Certificate = License
+
+it separates identity from authorization.
+
+Certificate
+
+↓
+
+Identity
+
+↓
+
+Entitlement Token
+
+↓
+
+Permission
+
+This is an important distinction.
+
+Certificate answers
+
+Who are you?
+
+Example:
+
+Agent 1542
+Entitlement Token answers
+
+What are you allowed to do?
+
+Example:
+
+Allowed
+
+USB Blocking
+
+OCR
+
+Fingerprinting
+
+Expires tomorrow
+
+So:
+
+Certificate
+
+↓
+
+Identity
+
+↓
+
+Server checks License
+
+↓
+
+Issue Token
+
+↓
+
+Agent works
+
+This is a very mature enterprise design.
+
+6. License Verification
+
+The PDF introduces another PKI use case.
+
+It says your license itself is signed.
+
+License
+
+↓
+
+Digital Signature
+
+↓
+
+Verify
+
+↓
+
+Valid
+
+The license contains:
+
+Customer
+
+Seats
+
+Modules
+
+Expiry
+
+Signature
+
+The server verifies the signature using an embedded public key. If someone edits the license (for example, changing 100 seats to 1000), the signature becomes invalid.
+
+This is another practical use of PKI.
+
+7. HSM
+
+I briefly mentioned HSMs.
+
+The PDF goes into more detail.
+
+Vendor
+
+Private Key
+
+↓
+
+HSM
+
+↓
+
+Signs License
+
+↓
+
+Customer receives License
+
+The private key never leaves the HSM.
+
+That is how commercial products protect their signing keys.
+
+8. Offline Operation
+
+This is probably the biggest difference.
+
+The PDF is written specifically for:
+
+Defence
+Nuclear
+Government
+Air-gapped environments
+
+Therefore it emphasizes:
+
+No Internet
+
+↓
+
+Everything Verified Locally
+
+It explicitly states:
+
+Internal CA
+Local certificate validation
+No cloud dependency
+Offline activation
+Offline renewals
+
+That is exactly how enterprise security products are built.
+
+9. Three Different Authentication Planes
+
+This is one of the strongest ideas in the PDF.
+
+It separates authentication into three independent trust domains:
+
+Plane 1
+
+License
+
+↓
+
+Is the license genuine?
+
+------------
+
+Plane 2
+
+Agent
+
+↓
+
+Is this a genuine agent?
+
+------------
+
+Plane 3
+
+Administrator
+
+↓
+
+Is this really an authorized human?
+
+Each uses different authentication and authorization mechanisms.
+
+Many engineers accidentally mix these together, but separating them makes the system much easier to reason about.
+
+10. Build Order
+
+The PDF recommends building the system in this order:
+
+Server
+
+↓
+
+Internal CA
+
+↓
+
+Enrollment
+
+↓
+
+mTLS
+
+↓
+
+Licensing
+
+↓
+
+Entitlement Tokens
+
+↓
+
+Evidence Storage
+
+↓
+
+Dashboard
+
+I think this is the right sequence because every later feature depends on a secure trust foundation.
+
+One Architectural Improvement I'd Recommend
+
+The PDF says:
+
+The management server runs its own internal CA.
+
+For a production-grade system, I would refine this slightly:
+
+                Offline Root CA
+                      │
+                      │ signs
+                      ▼
+           Intermediate CA
+      (on the Management Server)
+                      │
+         ┌────────────┼────────────┐
+         ▼            ▼            ▼
+      Agent 1      Agent 2      Agent 3
+
+Why?
+
+The Root CA stays offline and is used only to sign the Intermediate CA.
+The Management Server uses the Intermediate CA to issue agent certificates.
+If the Management Server is compromised, you revoke the Intermediate CA and issue a new one. The offline Root CA remains trusted.
+
+This is the same layered PKI model used by enterprises and public certificate authorities.
+
+Overall assessment
+
+I would rate this document 9.5/10 as an engineering guide.
+
+What it does well:
+
+Explains authentication vs authorization clearly.
+Uses PKI correctly with an internal CA and mTLS.
+Separates identity (certificates) from permissions (entitlement tokens).
+Supports offline and air-gapped deployments.
+Covers licensing, policy signing, and secure build order.
+
+The only enhancement I'd make is introducing the concept of an offline Root CA with an Intermediate CA rather than having the management server effectively act as the root of trust. That small change makes the PKI architecture more resilient and aligns it with established enterprise PKI practices.
