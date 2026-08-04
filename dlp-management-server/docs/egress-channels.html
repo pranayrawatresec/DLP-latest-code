@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Egress Channels — Coverage Map, Enforcement Mechanisms &amp; Build Roadmap</title>
+<style>
+  :root{--bg:#fff;--panel:#f7f8fa;--border:#e4e7ec;--ink:#1a1d23;--muted:#667085;--accent:#1f2937;
+    --green:#067647;--green-bg:#ecfdf3;--red:#b42318;--red-bg:#fef3f2;--amber:#b54708;--amber-bg:#fffaeb;--code:#f2f4f7;
+    --blue:#175cd3;--blue-bg:#eff8ff;--purple:#6941c6;--purple-bg:#f4f3ff;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:960px;margin:0 auto;padding:40px 24px 96px;}
+  header.hero{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:32px;}
+  .tag{display:inline-block;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);}
+  h1{font-size:28px;margin:8px 0 6px;letter-spacing:-.01em;}
+  h2{font-size:20px;margin:42px 0 12px;letter-spacing:-.01em;}
+  h3{font-size:15px;margin:22px 0 8px;}
+  p{color:#344054;} .muted{color:var(--muted);} .lead{font-size:16px;color:#344054;}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12.5px;font-weight:600;}
+  .pill.plan{background:var(--blue-bg);color:var(--blue);}
+  .summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;}
+  .stat{flex:1 1 150px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .stat .n{font-size:22px;font-weight:700;} .stat .l{font-size:12.5px;color:var(--muted);}
+  code,pre{font-family:"SF Mono",Consolas,"Roboto Mono",monospace;}
+  code{background:var(--code);padding:1px 5px;border-radius:5px;font-size:13px;}
+  pre{background:var(--accent);color:#e5e7eb;padding:16px;border-radius:10px;overflow-x:auto;font-size:12.5px;line-height:1.55;}
+  .diagram{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;overflow-x:auto;}
+  .diagram pre{background:transparent;color:var(--ink);padding:0;}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px;}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin:12px 0;}
+  .mech{border-left:3px solid var(--blue);}
+  ul.check{list-style:none;padding:0;margin:8px 0;}
+  ul.check li{padding:5px 0 5px 26px;position:relative;}
+  ul.check li::before{content:"✓";position:absolute;left:0;color:var(--green);font-weight:700;}
+  .note{background:var(--amber-bg);border:1px solid #fedf89;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#573b00;margin:12px 0;}
+  .blue{background:var(--blue-bg);border:1px solid #b2ddff;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#194185;margin:12px 0;}
+  .danger{background:var(--red-bg);border:1px solid #fecdca;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#912018;margin:12px 0;}
+  .st{font-weight:700;font-size:11.5px;padding:2px 8px;border-radius:999px;white-space:nowrap;display:inline-block;}
+  .t1{background:var(--green-bg);color:var(--green);}
+  .t2{background:var(--blue-bg);color:var(--blue);}
+  .t3{background:var(--amber-bg);color:var(--amber);}
+  .t4{background:var(--red-bg);color:var(--red);}
+  .feas{font-weight:700;font-size:11.5px;}
+  .fe-clean{color:var(--green);} .fe-hard{color:var(--amber);} .fe-partial{color:var(--blue);} .fe-no{color:var(--red);}
+  .done{background:var(--purple-bg);color:var(--purple);}
+  footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--border);font-size:12.5px;color:var(--muted);}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin:10px 0 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <span class="tag">DLP · Endpoint Agent · Channel Coverage Design</span>
+  <h1>Egress Channels — Coverage Map &amp; Enforcement Roadmap</h1>
+  <p class="lead">Every path by which data can leave a Windows endpoint, mapped to the
+  <b>enforcement mechanism</b> that covers it, its <b>technical feasibility</b>, and the
+  <b>build tier</b> it belongs to. The organising principle: you don't build one monitor per
+  app — you build ~10 mechanisms, and each covers a whole family of channels.</p>
+  <div class="summary">
+    <div class="stat"><div class="n">~40 channels</div><div class="l">covered by ~10 enforcement mechanisms</div></div>
+    <div class="stat"><div class="n">Content-based</div><div class="l">the agent inspects <i>bytes crossing a boundary</i>, not <i>which process</i> — malware and users are equal</div></div>
+    <div class="stat"><div class="n">Breadth &gt; depth</div><div class="l">a perfect USB blocker beside an open upload path stops nothing determined</div></div>
+    <div class="stat"><div class="n">Honest scope</div><div class="l">4 channel classes are named as out-of-scope, not hidden</div></div>
+  </div>
+  <p style="margin-top:14px"><span class="pill plan">● Design &amp; roadmap — Tier 1 built (except print)</span></p>
+</header>
+
+<div class="blue"><b>Build status — 2026-08-04.</b> <b>Tier 1 is built except print (⑥).</b>
+① <b>Minifilter</b>: compiles/links/analyzes to a valid <code>dlpflt.sys</code>; covers removable +
+SMB + fixed/sync volumes (fixed only when a watch-set is configured). ② <b>Device control</b>:
+USB allow/read-only/block + MTP/WPD block + USB-tethering block (build-verified). ⑤ <b>Clipboard</b>:
+built (text/files/HTML, empty-clipboard enforcement). All the above are <b>compile/test-verified</b>;
+<b>kernel runtime and live device/clipboard/registry behavior are operator-manual (VM-only)</b> — not
+yet runtime-proven. ⑥ <b>Print</b>: not built (intentionally deferred). CD/DVD burn: partial via
+staging, no dedicated hook. Details in <code>DONE-2026-08-04.md</code> and
+<code>dlp-agent/docs/tier1-completion-spec.md</code>.</div>
+
+<h2>1. The core principle: monitor mechanisms, not channels</h2>
+<p>“Dropbox”, “Google Drive”, and “WeTransfer” are not three engineering problems — they are one
+<b>HTTPS-upload hook</b>. The whole channel-coverage effort collapses from ~40 targets to ~10
+enforcement points, each covering a family. The agent is <b>content-and-channel based, not
+identity-based</b>: it asks only “are sensitive bytes crossing a monitored boundary in a form I can
+read?”. It does not care whether the process is Word or <code>malware.exe</code> — which is exactly
+why the same hook that stops a careless employee also stops unsophisticated exfil malware.</p>
+
+<div class="diagram"><pre>
+   CONTENT                    ENFORCEMENT MECHANISM (build once)        CHANNEL FAMILY (covered free)
+   ───────                    ─────────────────────────────────        ─────────────────────────────
+   file / clipboard  ──▶  ①  Filesystem minifilter (kernel)      ──▶  USB · CD/DVD · SMB share · sync folder · disk staging
+   text / bytes            ②  Device control (WPD / CfgMgr)       ──▶  phones (MTP) · USB class · tethering
+   ─── verdict() ───▶      ③  Network filter (WFP)                ──▶  every TCP/UDP dest (ciphertext-only)
+   (the detection          ④  Browser / app / email hooks         ──▶  web upload · webmail · Teams/Slack · Outlook
+    engine you already     ⑤  Clipboard API                       ──▶  copy-paste · cloud clipboard · RDP paste
+    built: IDM/EDM/ML)     ⑥  Print subsystem                     ──▶  paper · print-to-PDF · fax
+                           ⑦  Screen-capture path                 ──▶  screenshots · recording · casting (partial)
+                           ⑧  Remote / sub-OS redirection         ──▶  RDP/Citrix · local VMs · WSL2 · Sandbox
+                           ⑨  Wireless radios                     ──▶  Bluetooth · Nearby Share · WWAN · Phone Link
+                           ⑩  (none — physics)                    ──▶  screen photo · stego · TEMPEST · covert tunnels
+</pre></div>
+
+<div class="blue"><b>One detection engine, many channels.</b> Every file-bearing mechanism calls the
+same <code>verdict()</code> you already built and tested (IDM fingerprinting + EDM + future ML). The
+channel work is plumbing that feeds bytes into that engine and acts on its answer — not new
+detection logic each time.</div>
+
+<h2>2. Feasibility &amp; tier legend</h2>
+<div class="legend">
+  <span><b class="fe-clean">CLEAN</b> — well-supported OS hook, self-contained</span>
+  <span><b class="fe-partial">PARTIAL</b> — coverable but leaky or per-app</span>
+  <span><b class="fe-hard">HARD</b> — significant effort / fights encryption</span>
+  <span><b class="fe-no">NONE</b> — not addressable in software</span>
+</div>
+<div class="legend" style="margin-top:8px">
+  <span><span class="st t1">TIER 1</span> must-have, high ROI, clean</span>
+  <span><span class="st t2">TIER 2</span> high value, harder (network/content)</span>
+  <span><span class="st t3">TIER 3</span> deter or disable by policy</span>
+  <span><span class="st t4">TIER 4</span> out of scope — document honestly</span>
+  <span><span class="st done">FOUNDATION</span> detection engine already built</span>
+</div>
+
+<h2>3. The master coverage matrix</h2>
+<table>
+  <thead>
+    <tr><th>Channel</th><th>How data leaves</th><th>Mechanism</th><th>Feasibility</th><th>Tier</th></tr>
+  </thead>
+  <tbody>
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Removable &amp; local media</td></tr>
+    <tr><td><b>USB mass storage</b></td><td>File copy to flash / external HDD-SSD / card reader (mounts as a drive letter)</td><td>① Minifilter</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td><b>MTP / PTP devices</b></td><td>Phones, cameras — move files via WPD API, <b>never mount as a filesystem</b> (minifilter is blind)</td><td>② Device control</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>CD / DVD / Blu-ray burn</td><td>Optical burning subsystem / IMAPI</td><td>① Minifilter + burn API</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>SMB / mapped network drive</td><td>Copy to <code>\\server\share</code> or a mapped drive letter</td><td>① Minifilter</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>Local disk staging</td><td>Malware writes a collected archive to disk before exfil — caught at the write</td><td>① Minifilter</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>Cloud-sync folder</td><td>OneDrive / Dropbox / GDrive — file lands in the local sync folder (plaintext) <i>before</i> the TLS upload</td><td>① Minifilter</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>USB device policy</td><td>Allow/deny by device class or serial; force read-only</td><td>② Device control</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Network — web, cloud &amp; transfer</td></tr>
+    <tr><td><b>Web / HTTPS upload</b></td><td>Any site's file upload, web file-share, pastebin, social</td><td>④ Browser hook</td><td class="feas fe-hard">HARD</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td><b>Webmail</b></td><td>Gmail / Outlook web — attachment <i>and</i> body text</td><td>④ Browser hook</td><td class="feas fe-hard">HARD</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>Cloud storage web UI</td><td>Direct upload via browser (not the sync client)</td><td>④ Browser hook</td><td class="feas fe-hard">HARD</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>FTP / SFTP / FTPS / WebDAV</td><td>File-transfer clients &amp; command-line</td><td>③ WFP (dest) + ① (staged files)</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>git push · cloud CLIs</td><td><code>git push</code>, <code>aws s3 cp</code>, <code>az</code>, <code>scp</code></td><td>③ WFP (dest) + policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>Any destination (blocklist)</td><td>Connection exists at all — WFP sees who/how-much, not what (TLS = ciphertext)</td><td>③ WFP</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t2">TIER 2</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Email &amp; messaging</td></tr>
+    <tr><td>Outlook / desktop email</td><td>Attachment + body via MAPI / SMTP</td><td>④ Outlook add-in / MAPI</td><td class="feas fe-hard">HARD</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>Teams / Slack / Discord</td><td>File share + chat text (desktop app or web)</td><td>④ App hook / browser / ① (cached file)</td><td class="feas fe-hard">HARD</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>WhatsApp / Telegram / Signal desktop</td><td>File send + message text</td><td>④ per-app / ① (cache) / ⑨ policy-block</td><td class="feas fe-hard">HARD</td><td><span class="st t3">TIER 3</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Local OS surfaces</td></tr>
+    <tr><td><b>Clipboard</b></td><td>Copy-paste into another app, webmail body, or remote session</td><td>⑤ Clipboard API</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>Cloud clipboard / managers</td><td>Windows Cloud Clipboard sync across devices; 3rd-party clip managers</td><td>⑤ Clipboard API + policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td><b>Print</b></td><td>Physical printer, network printer</td><td>⑥ Print provider</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>Print-to-PDF / XPS / file</td><td>“Printing” a classified doc to a file you then move</td><td>⑥ Print provider (+ ① on the output)</td><td class="feas fe-clean">CLEAN</td><td><span class="st t1">TIER 1</span></td></tr>
+    <tr><td>Fax</td><td>Analog phone line via fax driver</td><td>⑥ Print/fax provider</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Screen &amp; display</td></tr>
+    <tr><td>Screenshot / screen recording</td><td>PrintScreen, Snipping Tool, capture software</td><td>⑦ API hook / <code>SetWindowDisplayAffinity</code></td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td>Screen share / casting</td><td>Conferencing share, Miracast, Chromecast</td><td>⑦ + ⑨ policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td><b>Photo of the monitor</b></td><td>Phone camera; QR on screen scanned by phone</td><td>⑩ none — the “analog hole”</td><td class="feas fe-no">NONE</td><td><span class="st t4">TIER 4</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Remote access &amp; sub-OS</td></tr>
+    <tr><td>RDP / Citrix / Horizon</td><td>Clipboard, drive redirection, printer redirection, in-session file copy</td><td>⑧ Session-redirection policy</td><td class="feas fe-hard">HARD</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>Local VMs (VBox/VMware/Hyper-V)</td><td>Shared folders + VM clipboard; guest has its <i>own</i> egress the host can't see</td><td>⑧ + host-policy on VM software</td><td class="feas fe-hard">HARD</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td><b>WSL2</b></td><td>Real Linux kernel in a light VM with its <b>own network stack</b> — Linux-side <code>curl</code>/<code>scp</code> can bypass host WFP</td><td>⑧ — genuinely hard</td><td class="feas fe-hard">HARD</td><td><span class="st t3">TIER 3</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Wireless radios</td></tr>
+    <tr><td>Bluetooth (OBEX/PAN)</td><td>File push / personal-area network</td><td>② + ⑨ radio policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td>Nearby Sharing / Wi-Fi Direct</td><td>Windows' AirDrop equivalent, ad-hoc Wi-Fi</td><td>⑨ radio/feature policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td>Cellular / WWAN modem</td><td>Built-in mobile broadband — an egress path independent of corp network</td><td>⑨ device policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td>Phone Link / “Your Phone”</td><td>Push files/photos to a paired phone</td><td>⑨ + app policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+    <tr><td>NFC · Infrared (legacy)</td><td>Very-near-field transfer</td><td>⑨ device policy</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t3">TIER 3</span></td></tr>
+
+    <tr><td colspan="5" style="background:var(--panel);font-weight:600;color:var(--muted)">Covert &amp; exotic</td></tr>
+    <tr><td>Encrypted/obfuscated archive</td><td>Zip+encrypt / encode <i>before</i> egress → content is opaque to IDM/EDM/ML</td><td>fail-secure: unreadable + monitored = block</td><td class="feas fe-partial">PARTIAL</td><td><span class="st t2">TIER 2</span></td></tr>
+    <tr><td>Steganography</td><td>Hide the document inside an image that leaves via an allowed channel</td><td>⑩ none (defeats content match)</td><td class="feas fe-no">NONE</td><td><span class="st t4">TIER 4</span></td></tr>
+    <tr><td>DNS / ICMP tunneling</td><td>Data smuggled in protocol fields</td><td>③ WFP anomaly/throttle only</td><td class="feas fe-no">NONE</td><td><span class="st t4">TIER 4</span></td></tr>
+    <tr><td>TEMPEST · ultrasonic · LED</td><td>Electromagnetic / acoustic / optical emanation (air-gap research attacks)</td><td>⑩ physical security, not software</td><td class="feas fe-no">NONE</td><td><span class="st t4">TIER 4</span></td></tr>
+  </tbody>
+</table>
+
+<h2>4. The mechanisms, in build detail</h2>
+
+<div class="card mech"><b>① Filesystem minifilter (kernel driver) — the workhorse</b><br>
+Intercepts <code>IRP_MJ_CREATE</code>/<code>WRITE</code> on any mounted volume pre-completion, asks the
+user-mode service for a <code>verdict()</code>, and allows / denies / shadow-copies. One driver covers
+USB, optical, SMB shares, mapped drives, disk staging, <i>and</i> cloud-sync folders (the file is a
+plaintext write to the sync folder before it is uploaded). This is the single highest-value component
+and the first thing to build. Cost: EV code-signing + Microsoft attestation, a real testing burden,
+and (for air-gapped sites) an offline driver-update story. Rust minifilter support is young — the
+pragmatic route is a small C/C++ driver with all logic in the Rust service over a
+<code>FilterCommunicationPort</code>.</div>
+
+<div class="card mech"><b>② Device control (user-mode, no driver)</b><br>
+Reacts to device arrival (<code>CM_Register_Notification</code>), identifies it (VID/PID, serial,
+class, container ID), and applies allow / read-only / block via <code>CM_Disable_DevNode</code>, the
+Removable Storage Access policies, or Device Installation Restrictions. <b>Essential for MTP/WPD</b>
+(phones), which the minifilter cannot see because they never mount a filesystem. Also does USB-class
+allowlisting (“only issued encrypted drives”) and blocks USB network tethering.</div>
+
+<div class="card mech"><b>③ Network filter (WFP) &nbsp;+&nbsp; ④ Browser/app/email hooks</b><br>
+WFP sees every outbound connection but only <b>ciphertext</b> for TLS — good for destination-blocking
+and volume-anomaly detection, blind to content. Real network <i>content</i> DLP must sit
+<b>above the encryption</b>: a browser extension / native-messaging host (web uploads, webmail body +
+attachment), an Outlook add-in / MAPI hook (desktop mail), or an enterprise TLS-inspection proxy with
+the corporate CA on the endpoint. This tier is where effort explodes — every app is its own
+integration — so prioritise by what the customer actually uses (usually webmail + one browser + Teams).
+Note the <b>overlap with ①</b>: many apps cache the outbound attachment to disk first, so the
+minifilter catches it even without an app hook.</div>
+
+<div class="card mech"><b>⑤ Clipboard &nbsp;·&nbsp; ⑥ Print — clean Tier-1 wins</b><br>
+Clipboard: <code>WM_CLIPBOARDUPDATE</code> to inspect copied text/data against <code>verdict()</code>
+before it can be pasted elsewhere (incl. into RDP sessions and cloud-clipboard sync). Print: a print
+provider / port monitor spools the job through content inspection, covering paper, network printers,
+and print-to-PDF/XPS (whose output file the minifilter <i>also</i> catches). Both are self-contained,
+don't fight TLS, and cover very common real-world leak paths.</div>
+
+<div class="card mech"><b>⑦ Screen · ⑧ Remote/sub-OS · ⑨ Radios — deter or disable</b><br>
+Screen capture is only partially hookable (<code>SetWindowDisplayAffinity</code> per window, DXGI/BitBlt
+interception) and never stops a phone camera — pair a best-effort block with <b>user-ID screen
+watermarking</b> so any leaked image is traceable. Remote/session redirections (RDP/Citrix drive &amp;
+clipboard, local VMs, <b>WSL2's own network stack</b>) are best handled by <b>disabling the
+redirection/feature</b> on a hardened build rather than intercepting it. Radios (Bluetooth, Nearby
+Share, WWAN, Phone Link): on a defence build the realistic answer is <b>policy-disable the radio</b>,
+not clever interception.</div>
+
+<h2>5. What we consciously place out of scope (Tier 4)</h2>
+<div class="danger">Naming these plainly is a <b>credibility asset</b> in a defence evaluation, not a
+weakness — it tells the customer which <i>other</i> controls must sit alongside the DLP.
+<ul style="margin:8px 0 0">
+  <li><b>The analog hole</b> — photographing the screen, or scanning an on-screen QR code. No software
+      stops it; mitigate with watermarking + physical/camera policy in secure areas.</li>
+  <li><b>Steganography</b> — a document hidden inside an innocuous image defeats all content matching.</li>
+  <li><b>Covert protocol tunnels</b> (DNS/ICMP) — WFP can throttle or anomaly-flag, not content-inspect.</li>
+  <li><b>TEMPEST / acoustic / optical emanation</b> — physical-security and shielding territory.</li>
+  <li><b>A kernel-privileged adversary</b> — can unhook the filter or read raw disk beneath it. DLP is
+      defence-in-depth <i>with</i> EDR / least-privilege / OS hardening, never a standalone anti-APT guarantee.</li>
+</ul></div>
+
+<h2>6. Recommended build order — breadth per unit effort</h2>
+<div class="diagram"><pre>
+  PHASE A  (Tier 1, clean, covers the most channels per mechanism)
+    A1  Filesystem minifilter  ①            → USB · CD · SMB · sync folders · disk staging
+        └─ first consumer of the verdict() engine you already built + tested
+    A2  Device control          ②            → phones (MTP) · USB class allow/deny/read-only · tethering
+    A3  Clipboard monitor       ⑤            → copy-paste · cloud clipboard
+    A4  Print provider          ⑥            → paper · network · print-to-PDF
+
+  PHASE B  (Tier 2, high value, harder — the content-on-network layer)
+    B1  Browser hook            ④            → web upload · webmail (body + attachment) · cloud web UI
+    B2  Outlook / mail hook     ④            → desktop email
+    B3  WFP destination control ③            → dest blocklists, volume anomaly, covert-tunnel flags
+    B4  Fail-secure on unreadable egress     → encrypted-container + monitored channel = block
+
+  PHASE C  (Tier 3, policy-disable / deter — not custom interception)
+    C1  Radio &amp; feature policy  ⑨            → Bluetooth · Nearby Share · WWAN · Phone Link off
+    C2  Session-redirection policy ⑧          → RDP/Citrix drive+clipboard, WSL2, VM sharing off
+    C3  Screen watermark + capture block ⑦    → traceability over prevention
+
+  OUT OF SCOPE (Tier 4) — documented, delegated to EDR / physical security / network egress control
+</pre></div>
+<div class="blue"><b>Why this order.</b> Phase A mechanisms are clean OS hooks that each cover a whole
+family of channels and reuse the existing detection engine — maximum coverage per unit effort, and the
+minifilter foundation is shared by every future file-based channel. Phase B is where the real
+adversary and the TLS problem live; it's essential but expensive, so it's scoped to the customer's
+actual app set. Phase C is configuration, not engineering. The strategic rule throughout:
+<b>breadth beats depth</b> — closing nine doors imperfectly beats bolting one shut while eight stand open.</div>
+
+<h2>7. How this connects to what's already built</h2>
+<ul class="check">
+  <li>The <b>detection engine</b> (IDM fingerprinting, EDM, future ML/semantic) is done and verified —
+      every file-bearing mechanism above calls its single <code>verdict()</code> entry point.</li>
+  <li>The <b>signed index bundle + mTLS distribution</b> already ships policy/fingerprints to agents
+      offline — every channel enforces from the same cached bundle, fail-secure when the server is unreachable.</li>
+  <li><b>Incidents</b> already round-trip (agent verdict → server resolution → reviewer view); each new
+      channel just tags its incidents with its own <code>channel</code> value (<code>usb</code>,
+      <code>print</code>, <code>web-upload</code>…).</li>
+  <li><b>Next build = Phase A1</b>: stand up mechanism ① (the minifilter) and wire the existing
+      <code>verdict()</code> into the write path. The USB channel is not a new detection problem — it is
+      the first consumer of the foundation already in place.</li>
+</ul>
+
+<footer>
+  DLP Management Server &amp; Agent · Egress channel coverage map &amp; enforcement roadmap ·
+  Companion to <code>docs/fingerprinting.html</code> (the detection engine these channels feed) ·
+  Status (2026-08-04): Tier 1 build-complete except print (⑥); kernel + live-device runtime is
+  operator-manual. Next: Tier 2 (network/content) or runtime hardening of Tier 1.
+</footer>
+
+</div>
+</body>
+</html>

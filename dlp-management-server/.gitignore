@@ -4,3 +4,7 @@ data/
 ca/
 test/.ca-tmp/
 scripts/.demo/
+scripts/.fake-agent/
+data/blobs/
+data/index/
+test/.*-results.json

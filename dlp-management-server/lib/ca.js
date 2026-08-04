@@ -270,6 +270,17 @@ function signCertificateRequest(csrPem, opts = {}) {
   }
   if (!csr.verify()) throw new Error('CSR self-signature invalid'); // proof-of-possession
 
+  // Reject weak or unsupported keys. We issue and expect RSA leaves (>= 2048);
+  // a rogue/legacy agent must not enroll with a breakable key.
+  const pub = csr.publicKey;
+  if (!pub || !pub.n || typeof pub.n.bitLength !== 'function') {
+    throw new Error('unsupported key type (RSA required)');
+  }
+  const keyBits = pub.n.bitLength();
+  if (keyBits < LEAF_KEY_BITS) {
+    throw new Error(`weak key: ${keyBits}-bit (minimum ${LEAF_KEY_BITS})`);
+  }
+
   const caKey = readForgePrivateKey(F.caKey, passphrase);
   const caCert = pki.certificateFromPem(fs.readFileSync(p(F.caCert), 'utf8'));
 
@@ -296,6 +307,27 @@ function loadCaCertificatePem() {
   return fs.readFileSync(p(F.caCert), 'utf8');
 }
 
+// RSASSA-PKCS1-v1_5 / SHA-256 signature over an arbitrary buffer with the CA
+// private key — used to sign index bundles so agents can verify them against
+// the CA certificate they already pin from enrollment. Same algorithm as the
+// X.509 signing above (sha256WithRSAEncryption), just over raw bytes.
+function signBuffer(buffer, opts = {}) {
+  const { passphrase = process.env.CA_KEY_PASSPHRASE || null } = opts;
+  if (!Buffer.isBuffer(buffer)) throw new Error('signBuffer expects a Buffer');
+  const pem = fs.readFileSync(p(F.caKey), 'utf8');
+  // Normalize through Node crypto so both encrypted and plain PKCS#8 load.
+  const keyObj = crypto.createPrivateKey(passphrase ? { key: pem, passphrase } : pem);
+  return crypto.sign('sha256', buffer, keyObj);
+}
+
+// Verify a signBuffer() signature against a CA certificate PEM. Pure
+// verification — needs no key material, so agents/tests can run it anywhere.
+function verifyBufferSignature(buffer, signature, caCertPem) {
+  if (!Buffer.isBuffer(buffer) || !Buffer.isBuffer(signature)) return false;
+  const cert = new crypto.X509Certificate(String(caCertPem));
+  return crypto.verify('sha256', buffer, cert.publicKey, signature);
+}
+
 // Material for the mTLS listener: its key/cert plus the CA as the trust
 // anchor for verifying agent client certificates.
 function loadServerTlsMaterial() {
@@ -316,6 +348,8 @@ module.exports = {
   caExists,
   initializeCa,
   signCertificateRequest,
+  signBuffer,
+  verifyBufferSignature,
   loadCaCertificatePem,
   loadServerTlsMaterial,
   readMeta,

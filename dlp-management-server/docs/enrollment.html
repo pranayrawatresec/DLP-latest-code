@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Enrollment & mTLS Check-in — Implementation & Test Report</title>
+<style>
+  :root{--bg:#fff;--panel:#f7f8fa;--border:#e4e7ec;--ink:#1a1d23;--muted:#667085;--accent:#1f2937;
+    --green:#067647;--green-bg:#ecfdf3;--red:#b42318;--amber:#b54708;--amber-bg:#fffaeb;--code:#f2f4f7;
+    --blue:#175cd3;--blue-bg:#eff8ff;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:900px;margin:0 auto;padding:40px 24px 96px;}
+  header.hero{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:32px;}
+  .tag{display:inline-block;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);}
+  h1{font-size:28px;margin:8px 0 6px;letter-spacing:-.01em;}
+  h2{font-size:20px;margin:40px 0 12px;letter-spacing:-.01em;}
+  h3{font-size:15px;margin:22px 0 8px;}
+  p{color:#344054;} .muted{color:var(--muted);} .lead{font-size:16px;color:#344054;}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12.5px;font-weight:600;}
+  .pill.ok{background:var(--green-bg);color:var(--green);}
+  .summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;}
+  .stat{flex:1 1 130px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .stat .n{font-size:24px;font-weight:700;} .stat .l{font-size:12.5px;color:var(--muted);}
+  code,pre{font-family:"SF Mono",Consolas,"Roboto Mono",monospace;}
+  code{background:var(--code);padding:1px 5px;border-radius:5px;font-size:13px;}
+  pre{background:var(--accent);color:#e5e7eb;padding:16px;border-radius:10px;overflow-x:auto;font-size:12.5px;line-height:1.55;}
+  .diagram{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;overflow-x:auto;}
+  .diagram pre{background:transparent;color:var(--ink);padding:0;}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px;}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);}
+  td.id{font-family:monospace;color:var(--muted);white-space:nowrap;}
+  .st{font-weight:700;font-size:12px;padding:2px 8px;border-radius:999px;}
+  .st.pass{background:var(--green-bg);color:var(--green);}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin:12px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+  @media (max-width:640px){.grid2{grid-template-columns:1fr;}}
+  ul.check{list-style:none;padding:0;margin:8px 0;}
+  ul.check li{padding:5px 0 5px 26px;position:relative;}
+  ul.check li::before{content:"✓";position:absolute;left:0;color:var(--green);font-weight:700;}
+  .note{background:var(--amber-bg);border:1px solid #fedf89;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#573b00;}
+  .blue{background:var(--blue-bg);border:1px solid #b2ddff;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#194185;}
+  .fn{font-family:monospace;font-size:13px;}
+  footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--border);font-size:12.5px;color:var(--muted);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <span class="tag">DLP Management Server · Phase 2 · the secure channel completed</span>
+  <h1>Agent Enrollment &amp; mTLS Check-in</h1>
+  <p class="lead">The payoff layer: it composes the CA and the token layers so a brand-new PC becomes a
+  <b>trusted, individually-identified agent</b>. Token in → certificate out → mutual-TLS heartbeat.
+  This reaches the guide's Phase 2 milestone — <b>one agent talking to the server securely</b> — proven
+  end to end with a stand-in agent.</p>
+  <div class="summary">
+    <div class="stat"><div class="n">17 / 17</div><div class="l">tests passing</div></div>
+    <div class="stat"><div class="n">real mTLS</div><div class="l">in-process listener, real client certs</div></div>
+    <div class="stat"><div class="n">atomic</div><div class="l">enroll = 1 transaction, no wasted uses</div></div>
+    <div class="stat"><div class="n">2 doors</div><div class="l">cookies for humans · certs for machines</div></div>
+  </div>
+  <p style="margin-top:14px"><span class="pill ok">● Implemented &amp; verified</span></p>
+</header>
+
+<h2>1. The end-to-end flow</h2>
+<div class="diagram"><pre>
+  AGENT (a new PC)                          MANAGEMENT SERVER (mTLS listener :8443)
+  ────────────────                          ───────────────────────────────────────
+  generate key pair
+   (private key NEVER leaves)
+  build CSR (public key)
+        │  token + CSR + hostname
+        ▼   POST /agent/enroll  ─────────▶  ONE transaction:
+        │   (no client cert yet)             1. redeemToken()  — atomic consume
+        │                                     2. insert agent  — server-assigned id
+        │                                     3. signCertificateRequest()  — CA signs
+        │                                     4. bind serial    — commit
+        ◀───────────── 201 { certificate, ca, checkinInterval }
+  store cert; pin CA
+        │
+        │  every few minutes, MUTUAL TLS
+        ▼   POST /agent/checkin  ────────▶  verify client cert (chains to CA),
+        │   (client cert required)           match serial → agent, refuse if retired,
+        ◀───────────── 200 { active }        update last_seen, status → active
+</pre></div>
+
+<h2>2. The two design pillars</h2>
+<div class="grid2">
+  <div class="card"><b>Two trust surfaces, never mixed</b>
+    <p class="muted" style="margin:6px 0 0">The console port trusts session <b>cookies</b> from humans;
+    this agent port trusts client <b>certificates</b> from machines. <code>/agent/enroll</code> is the one
+    route reachable without a cert (a new PC has none yet) — everything past it enforces
+    <code>req.socket.authorized</code>.</p></div>
+  <div class="card"><b>Enrollment is one atomic transaction</b>
+    <p class="muted" style="margin:6px 0 0">Consume-token → insert-agent → sign-CSR → bind-serial either all
+    commit or all roll back. A malformed CSR or weak key <b>releases the token use</b> — a failed
+    enrollment never burns a seat or leaves a half-created agent.</p></div>
+</div>
+
+<h2>3. Security best practices applied</h2>
+<div class="grid2">
+<div><ul class="check">
+  <li>Agent generates its own key; only the CSR (public key) is sent</li>
+  <li>Server-assigned identity — the CSR's requested name is ignored</li>
+  <li>Weak / non-RSA keys rejected (RSA &lt; 2048 refused)</li>
+  <li>Atomic transactional enrollment (no wasted token uses)</li>
+  <li>Mutual TLS, <code>minVersion TLSv1.2</code></li>
+</ul></div>
+<div><ul class="check">
+  <li>Fail-secure de-enrollment: retired agent refused at check-in</li>
+  <li>Revocation via DB status — no CRL infra needed on-prem</li>
+  <li>64&nbsp;KB body cap on the unauthenticated enroll endpoint</li>
+  <li>Flood-resistant auditing: unknown-token probes are <b>not</b> logged; recognized-token misuse is</li>
+  <li>Routine check-ins not audited; transitions &amp; refusals are</li>
+</ul></div>
+</div>
+<div class="note"><b>Why unknown-token attempts aren't audited.</b> The append-only log can't be pruned, so
+logging every random-token probe would let an attacker bloat it. A valid deployment never produces
+"unknown token" (installers carry real tokens), so we reject those generically <em>without</em> a log
+row, while still auditing every <em>recognized-but-unusable</em> token (revoked / expired / exhausted) —
+the events that actually signal misuse.</div>
+
+<h2>4. Test &amp; edge-case results</h2>
+<p class="muted">Tests drive a <b>real in-process mTLS listener</b> with the actual CA material; clients
+present real key pairs and certificates. Issued certs are cross-checked with Node's native X509 <b>and
+the system OpenSSL</b>; agent/token state is inspected directly in the database. All results below are
+the actual observed run.</p>
+
+<h3>Enrollment</h3>
+<table>
+  <tr><th>ID</th><th>Check</th><th>Observed</th><th></th></tr>
+  <tr><td class="id">N01</td><td>valid token+CSR → 201; cert chains to CA, clientAuth, server-assigned CN</td><td class="muted">openssl OK</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N02</td><td>agent recorded with cert_serial, status=enrolled</td><td class="muted">serial bound</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N03</td><td>issued cert public key matches the agent's CSR key</td><td class="muted">keypair bound</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N04</td><td>missing fields → 400</td><td class="muted">400</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N05</td><td>unknown token → 403 generic, NOT audited (flood-resistant)</td><td class="muted">no audit row</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N06</td><td>revoked token → 403, IS audited (misuse signal)</td><td class="muted">403 + audited</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N07</td><td>exhausted token → 403 (maxUses=1, 2nd fails)</td><td class="muted">201 then 403</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N08</td><td>malformed CSR + valid token → 400 &amp; token use RELEASED</td><td class="muted">retry 201 — not wasted</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N09</td><td>weak key (RSA-1024) rejected → 400</td><td class="muted">refused</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N10</td><td><b>RACE</b>: 1 single-use token, 8 concurrent enrolls</td><td class="muted">exactly 1 enrolled, 1 agent row</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+
+<h3>Check-in over mutual TLS</h3>
+<table>
+  <tr><th>ID</th><th>Check</th><th>Observed</th><th></th></tr>
+  <tr><td class="id">N11</td><td>check-in without a client cert → 401</td><td class="muted">401</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N12</td><td>check-in with enrolled cert (mTLS) → 200; enrolled→active</td><td class="muted">last_seen set</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N13</td><td>cert from a DIFFERENT CA → 401 at the TLS gate</td><td class="muted">rogue rejected</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N14</td><td>valid CA cert, serial NOT enrolled → 403 unknown agent</td><td class="muted">403</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N15</td><td>RETIRED agent refused check-in (fail-secure) + audited</td><td class="muted">403 + audited</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+
+<h3>Invariants</h3>
+<table>
+  <tr><td class="id">N16</td><td>audit has enroll + activation events</td><td class="muted">present</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">N17</td><td>audit hash-chain intact after all operations</td><td class="muted">AUDIT CHAIN INTACT</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+<p class="kv muted">Reproduce: <code>npm run test:enroll</code> — stands up the listener, enrolls, checks in,
+cleans up its own tokens/agents.</p>
+
+<h3>Adversarial cases explicitly covered</h3>
+<ul class="check">
+  <li><b>Agent names itself</b> (N01) — a CSR requesting <code>i-want-to-be-admin</code> still gets the server-assigned <code>dlp-agent-&lt;id&gt;</code>.</li>
+  <li><b>Wasted-token attack via bad CSR</b> (N08) — a valid token + malformed CSR rolls back, so the token is still usable.</li>
+  <li><b>Counterfeit agent</b> (N13) — a client cert from a rogue CA can't even pass the mTLS gate.</li>
+  <li><b>Self-signed / unenrolled cert</b> (N14) — chains to our CA but no agent owns the serial → refused.</li>
+  <li><b>Double-spend race</b> (N10) — 8 agents, one single-use token, exactly one wins.</li>
+  <li><b>De-enrolled agent</b> (N15) — retiring an agent stops its check-ins immediately, no PC access needed.</li>
+</ul>
+
+<h2>5. Verified live with a stand-in agent</h2>
+<p class="muted">Before any Rust exists, <code>scripts/fake-agent.js</code> proves the whole channel:</p>
+<pre>$ npm run agent-server                       # the mTLS listener
+$ node scripts/fake-agent.js &lt;token&gt;
+  [1/4] generating an RSA-2048 key pair + CSR (private key stays local)…
+  [2/4] enrolling: presenting the one-time token + CSR…
+  ✓ enrolled as agent 44b212f4-…
+  [3/4] checking in over MUTUAL TLS (server verifies us, we verify server)…
+  ✓ check-in accepted — status=active, next in 300s
+  ✓ SECURE CHANNEL VERIFIED: enroll → mTLS check-in</pre>
+
+<h2>6. API</h2>
+<pre>POST /agent/enroll      { token, csrPem, hostname, os?, agentVersion? }
+                        → 201 { agentId, certificate, ca, checkinIntervalSeconds }
+                        (no client cert required — the one bootstrap door)
+
+POST /agent/checkin     { agentVersion? }                        [requires client cert / mTLS]
+                        → 200 { status, agentId, checkinIntervalSeconds, policyBundle:null }</pre>
+
+<h2>7. Deferred (next phases)</h2>
+<div class="card"><span class="kv"><b>Phase 3 (licensing):</b> at check-in the server will draw a seat from
+the licence and issue a short-lived signed <b>entitlement token</b> — that hook is exactly where
+<code>checkin</code> returns today. <b>Phase 6 hardening:</b> CRL/OCSP, certificate auto-renewal near
+expiry, rate-limiting the enroll endpoint. <b>Now:</b> the real <b>Rust agent</b> — a Windows service
+that does precisely what <code>scripts/fake-agent.js</code> just proved.</span></div>
+
+<footer>
+  DLP Management Server — Enrollment &amp; mTLS layer report. Files:
+  <span class="fn">agent/agentApp.js</span>, <span class="fn">bin/agent-server.js</span>,
+  <span class="fn">test/enrollment.test.js</span>, <span class="fn">scripts/fake-agent.js</span>.
+  Independent verifiers: real mutual TLS · Node <span class="fn">X509Certificate</span> · system OpenSSL · direct DB inspection.
+</footer>
+
+</div>
+</body>
+</html>

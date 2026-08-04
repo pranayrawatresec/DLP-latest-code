@@ -1,0 +1,22 @@
+# DLP agent configuration.
+# In production the MSI installer writes this to C:\ProgramData\DLPAgent\agent.toml
+# and provisions ca-cert.pem alongside it. The enrollment token is supplied
+# per rollout wave (one token, sized to the number of PCs).
+
+# The management server's mTLS listener. Its host MUST appear in the server
+# certificate's SAN, or CA-pinned verification will (correctly) reject it.
+server_url = "https://dlp-server.internal:8443"
+
+# One-time enrollment token (from the console: Enrollment tokens → Create).
+# Only used until the agent has its certificate; ignored afterwards.
+enrollment_token = "dlpenr_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# CA certificate shipped with the installer — the trust anchor the agent pins
+# to verify the server from the very first connection (including enrollment).
+ca_cert_path = "C:\\ProgramData\\DLPAgent\\ca-cert.pem"
+
+# Where the agent stores its DPAPI-sealed identity and cached policy.
+state_dir = "C:\\ProgramData\\DLPAgent"
+
+# Fallback cadence; the server's response takes precedence.
+checkin_interval_seconds = 300

@@ -7,7 +7,18 @@
     "migrate": "node db/migrate.js",
     "bootstrap-admin": "node bin/bootstrap-admin.js",
     "init-ca": "node bin/init-ca.js",
-    "test:ca": "node test/ca.test.js"
+    "agent-server": "node bin/agent-server.js",
+    "worker": "node bin/fingerprint-worker.js",
+    "test:ca": "node test/ca.test.js",
+    "test:tokens": "node test/enrollmentTokens.test.js",
+    "test:enroll": "node test/enrollment.test.js",
+    "test:fingerprint": "node test/fingerprint.test.js",
+    "test:extract": "node test/extract.test.js",
+    "test:blobstore": "node test/blobStore.test.js",
+    "test:idm": "node test/idm.test.js",
+    "test:edm": "node test/edm.test.js",
+    "test:bundle": "node test/bundle.test.js",
+    "e2e:detection": "node scripts/detection-e2e.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -20,6 +31,8 @@
     "morgan": "~1.9.1",
     "node-forge": "^1.4.0",
     "nodemon": "^3.1.14",
-    "pg": "^8.22.0"
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.22.0",
+    "yauzl": "^3.4.0"
   }
 }

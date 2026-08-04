@@ -1,0 +1,85 @@
+SECRET // EXERCISE // FICTITIOUS - FOR DLP SYSTEM TESTING ONLY
+OPERATION HIMALAYAN SHIELD - OPERATION ORDER 07/2026
+Reference: Northern Command Contingency Plan HS-2026. Time Zone Used Throughout the Order:
+INDIA STANDARD TIME (IST).
+Task Organisation. 14 Mountain Brigade (main effort), reinforced by one mechanised infantry
+battalion, one medium artillery regiment (155mm), one combat engineer company, and one army
+aviation flight (utility and reconnaissance). 27 Signals Regiment provides area communications.
+Attached: one field surgical team and one forward logistics element.
+1. SITUATION.
+a. Enemy Forces. Opposing formations are assessed to hold prepared defensive positions along
+the northern approaches to the Leh sector at a strength of approximately two reinforced
+battalions, supported by dug-in anti-tank guided missile teams and dispersed mortar sections.
+Enemy air activity is assessed as limited to unmanned reconnaissance. Most likely enemy course
+of action is a mobile defence oriented on the two principal valley roads, trading space for
+time while attempting to canalise our advance into pre-registered artillery engagement areas.
+Most dangerous course of action is a spoiling attack against our assembly areas during the
+hours of darkness preceding H-Hour.
+b. Friendly Forces. 3 Infantry Division continues the defence of the eastern sector and
+protects the right flank of this brigade. Corps artillery is prepared to deliver
+counter-battery fire on call. Higher intent is to secure the Leh axis, restore the integrity of
+the line of actual control in the assigned area, and establish conditions for a follow-on
+relief in place by 8 Mountain Division.
+c. Attachments and Detachments. Effective from 0300 hours on D-1, the mechanised infantry
+battalion is attached to 14 Mountain Brigade. The combat engineer company reverts to divisional
+control on completion of the breach and passage of lines.
+2. MISSION.
+14 Mountain Brigade seizes and secures the dominating ground overlooking the northern
+approaches to the Leh sector not later than 0600 hours on D-Day, in order to deny the enemy
+observation and direct fire onto the main supply route and to enable the forward passage of
+divisional reserves.
+3. EXECUTION.
+a. Commander’s Intent. My intent is to close with the enemy along the western valley while
+fixing him in the east with deception and harassing fires. The decisive operation is the
+seizure of Objective FALCON by the main effort; supporting operations isolate the objective and
+secure the lines of communication. The end state is achieved when the dominating ground is
+under our control, the main supply route is protected from direct fire and observation, and the
+brigade is postured to hand over to the relieving formation without a pause in the defence.
+b. Concept of Operations. The operation is conducted in three phases. Phase One, shaping,
+extends from D-2 to H-Hour and comprises reconnaissance, obstacle reduction, and the movement
+of forces to attack positions under cover of darkness and electromagnetic emission control.
+Phase Two, the decisive action, begins at H-Hour with a synchronised assault on Objective
+FALCON supported by preparatory artillery fires and close air support on call. Phase Three,
+consolidation, begins on seizure of the objective and includes reorganisation, casualty
+evacuation, resupply, and preparation for the relief in place.
+c. Scheme of Manoeuvre. The main effort advances along the western axis with two assault
+battalions forward and one in depth. The mechanised battalion conducts a supporting attack
+along the eastern axis to fix the enemy and to protect the right flank. The reconnaissance
+flight screens the northern approaches and provides early warning of any enemy repositioning.
+Engineers reduce the linear obstacle at the valley mouth and mark two lanes for the passage of
+the mechanised force.
+d. Fires. Priority of fires is to the main effort throughout. A programme of preparatory fires
+strikes identified command posts, mortar positions, and anti-tank teams from H minus fifteen
+minutes. Counter-battery fire is on call from corps artillery. Restrictions: no fires within
+one thousand metres of the marked cultural site at grid reference sector nine; all requests
+routed through the brigade fire support coordination cell.
+e. Coordinating Instructions. H-Hour is confirmed by codeword THUNDERBOLT transmitted on the
+command net. Timings are relative to H-Hour unless stated otherwise. The rules of engagement in
+force are those promulgated for the exercise and remain in effect until formally rescinded. All
+units report crossing of phase lines using the designated checkpoints.
+4. SERVICE SUPPORT.
+a. Sustainment. The brigade maintenance area is established two kilometres south of the
+assembly area. Combat supplies are pushed forward on a daily maintenance cycle; two days of
+supply are held at unit level. Water is drawn from the divisional point and distributed by unit
+transport. Ammunition resupply during the decisive action is by pre-positioned caches at the
+attack positions.
+b. Medical. The field surgical team is co-located with the brigade maintenance area. Casualty
+evacuation is by ground ambulance to the collection point and thence by air to the divisional
+hospital, weather permitting. Each battalion establishes a regimental aid post forward.
+c. Transport and Movement. Movement forward is by unit vehicles along the designated route,
+staggered to preserve tactical dispersion. Traffic control points are manned by the provost
+detachment from D-1.
+5. COMMAND AND SIGNAL.
+a. Command. The brigade commander locates with the tactical headquarters on the western axis
+during the decisive action. Succession of command is the deputy commander, then the commanding
+officer of the leading assault battalion. Main headquarters remains in the assembly area.
+b. Signal. Primary means of communication is secure combat net radio; alternate is line to
+fixed locations; contingency is dispatch rider; emergency is pyrotechnic signal per the signal
+instruction. Electromagnetic emission control state is amber until H-Hour, thereafter green.
+Codewords, nicknames, and the challenge and password for the period are issued separately under
+the signal instruction.
+Acknowledge. Distribution is restricted to addressed headquarters and units only. This is a
+fictitious exercise document created solely to test data-leak-prevention fingerprinting and
+contains no real operational information.
+
+ADDITIONAL NOTE FOR DISTRIBUTION. This annex is provided for discussion purposes only and does not alter the coordinating instructions above.

@@ -26,7 +26,14 @@ const authSlice = createSlice({
     user: null, // identity from /api/auth/me, or null
     checking: true, // true until the initial fetchMe settles
   },
-  reducers: {},
+  reducers: {
+    // Drop to signed-out locally — used when any API call returns 401
+    // (the session expired or was revoked server-side).
+    clearUser(state) {
+      state.user = null
+      state.checking = false
+    },
+  },
   extraReducers: (builder) => {
     builder
       .addCase(fetchMe.fulfilled, (state, action) => {
@@ -51,7 +58,12 @@ const authSlice = createSlice({
   },
 })
 
+export const { clearUser } = authSlice.actions
+
 export const selectUser = (state) => state.auth.user
 export const selectAuthChecking = (state) => state.auth.checking
+// Convenience selector: does the signed-in user hold a given permission?
+export const selectHasPermission = (permission) => (state) =>
+  Boolean(state.auth.user?.permissions?.includes(permission))
 
 export default authSlice.reducer

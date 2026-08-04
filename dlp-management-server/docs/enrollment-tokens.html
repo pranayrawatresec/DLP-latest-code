@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Enrollment Tokens — Implementation & Test Report</title>
+<style>
+  :root {
+    --bg:#fff; --panel:#f7f8fa; --border:#e4e7ec; --ink:#1a1d23; --muted:#667085;
+    --accent:#1f2937; --green:#067647; --green-bg:#ecfdf3; --red:#b42318;
+    --amber:#b54708; --amber-bg:#fffaeb; --code:#f2f4f7; --blue:#175cd3; --blue-bg:#eff8ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.65 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:900px; margin:0 auto; padding:40px 24px 96px; }
+  header.hero { border-bottom:1px solid var(--border); padding-bottom:24px; margin-bottom:32px; }
+  .tag { display:inline-block; font-size:12px; font-weight:600; letter-spacing:.04em;
+    text-transform:uppercase; color:var(--muted); }
+  h1 { font-size:28px; margin:8px 0 6px; letter-spacing:-.01em; }
+  h2 { font-size:20px; margin:40px 0 12px; letter-spacing:-.01em; }
+  h3 { font-size:15px; margin:22px 0 8px; }
+  p { color:#344054; } .muted { color:var(--muted); }
+  .lead { font-size:16px; color:#344054; }
+  .pill { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px;
+    font-size:12.5px; font-weight:600; }
+  .pill.ok { background:var(--green-bg); color:var(--green); }
+  .summary { display:flex; gap:12px; flex-wrap:wrap; margin-top:16px; }
+  .stat { flex:1 1 130px; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .stat .n { font-size:24px; font-weight:700; } .stat .l { font-size:12.5px; color:var(--muted); }
+  code,pre { font-family:"SF Mono",Consolas,"Roboto Mono",monospace; }
+  code { background:var(--code); padding:1px 5px; border-radius:5px; font-size:13px; }
+  pre { background:var(--accent); color:#e5e7eb; padding:16px; border-radius:10px; overflow-x:auto;
+    font-size:12.5px; line-height:1.55; }
+  .diagram { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px; overflow-x:auto; }
+  .diagram pre { background:transparent; color:var(--ink); padding:0; }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:13.5px; }
+  th,td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.03em; color:var(--muted); }
+  td.id { font-family:monospace; color:var(--muted); white-space:nowrap; }
+  .st { font-weight:700; font-size:12px; padding:2px 8px; border-radius:999px; }
+  .st.pass { background:var(--green-bg); color:var(--green); }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:16px 18px; margin:12px 0; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:640px){ .grid2 { grid-template-columns:1fr; } }
+  ul.check { list-style:none; padding:0; margin:8px 0; }
+  ul.check li { padding:5px 0 5px 26px; position:relative; }
+  ul.check li::before { content:"✓"; position:absolute; left:0; color:var(--green); font-weight:700; }
+  .note { background:var(--amber-bg); border:1px solid #fedf89; border-radius:10px; padding:12px 14px;
+    font-size:13.5px; color:#573b00; }
+  .bug { background:var(--blue-bg); border:1px solid #b2ddff; border-radius:10px; padding:12px 14px;
+    font-size:13.5px; color:#194185; }
+  .fn { font-family:monospace; font-size:13px; }
+  footer { margin-top:48px; padding-top:16px; border-top:1px solid var(--border); font-size:12.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <span class="tag">DLP Management Server · Phase 2 · Plane 2 ↔ Plane 3 seam</span>
+  <h1>Enrollment Tokens</h1>
+  <p class="lead">The one bridge between the human admin plane and the machine plane. A sysadmin mints a
+  one-time secret; an agent spends it once to enroll and receive its certificate. This is how a
+  <b>logged-in human's authority becomes an agent's authority</b> — no separate agent-authorization system.</p>
+  <div class="summary">
+    <div class="stat"><div class="n">20 / 20</div><div class="l">tests passing</div></div>
+    <div class="stat"><div class="n">3 levels</div><div class="l">library · HTTP+RBAC · DB invariants</div></div>
+    <div class="stat"><div class="n">256-bit</div><div class="l">CSPRNG token · SHA-256 stored</div></div>
+    <div class="stat"><div class="n">race-safe</div><div class="l">atomic one-time redemption</div></div>
+  </div>
+  <p style="margin-top:14px"><span class="pill ok">● Implemented &amp; verified</span></p>
+</header>
+
+<h2>1. Where it fits</h2>
+<div class="diagram"><pre>
+  PLANE 3 — humans (built earlier)              PLANE 2 — machines
+  ───────────────────────────────              ──────────────────────────────
+  sysadmin logs in (session + RBAC)
+        │  requirePermission('enrollment.manage')
+        ▼
+  POST /api/enrollment-tokens  ─────────────▶  raw token → installer config
+        │  (raw token shown ONCE)                     │  (deployed to a PC)
+        │  audit_log: enrollment_token.create         ▼
+        │                                       agent redeems it ONCE
+        ▼                                             │
+  only SHA-256(token) stored  ◀───────────  redeemToken(): atomic consume
+                                                      │
+                                                      ▼
+                                             (next phase) CA signs the CSR
+</pre></div>
+<p class="muted">A brand-new PC has no identity yet, so it can't use a certificate to prove it belongs.
+The enrollment token is the bootstrap proof that <b>the customer's IT sanctioned this install</b> —
+the only thing that lets a machine cross from "unknown" to "trusted".</p>
+
+<h2>2. The token lifecycle</h2>
+<table>
+  <tr><th>Operation</th><th>Who</th><th>What happens</th></tr>
+  <tr><td class="fn">createToken</td><td>sysadmin (RBAC-gated)</td><td>256-bit token minted; raw value returned <b>once</b>; only its SHA-256 stored</td></tr>
+  <tr><td class="fn">listTokens</td><td>sysadmin</td><td>metadata + computed status (active / expired / exhausted / revoked); never the token or hash</td></tr>
+  <tr><td class="fn">revokeToken</td><td>sysadmin</td><td>soft revoke — row kept for audit history; immediately unusable</td></tr>
+  <tr><td class="fn">redeemToken</td><td>agent (next phase)</td><td>atomic one-time consume; returns a reason on failure for the audit log only</td></tr>
+</table>
+
+<h2>3. Security best practices applied</h2>
+<div class="grid2">
+<div><ul class="check">
+  <li>256-bit CSPRNG token, prefixed <code>dlpenr_</code> for leak-scanners</li>
+  <li>Only <code>SHA-256(token)</code> stored — raw value never persisted or logged</li>
+  <li>Raw token returned exactly once, with a one-time warning</li>
+  <li>Atomic conditional <code>UPDATE</code> → no double-spend under concurrency</li>
+</ul></div>
+<div><ul class="check">
+  <li>Two-gate pattern: <code>requireAuth</code> then <code>requirePermission</code></li>
+  <li>Soft revoke — audit history never deleted</li>
+  <li>Generic failure to the agent; real reason only in the audit log</li>
+  <li>Input caps: maxUses ≤ 10000, expiry ≤ 1 year, description ≤ 500</li>
+  <li>Every create / revoke / denial written to the hash-chained audit log</li>
+</ul></div>
+</div>
+<div class="note"><b>Why SHA-256 here, but bcrypt for passwords?</b> A password is low-entropy and
+human-chosen, so it must be slow-hashed (bcrypt) to resist brute force. An enrollment token is 256
+bits of CSPRNG output — there is nothing to brute-force, and we need an O(1) exact-match lookup by
+hash. A fast hash is the <em>correct</em> choice; bcrypt would be both wrong (salted, un-lookup-able)
+and pointless here.</div>
+
+<h2>4. The atomic redemption — the crux</h2>
+<p>The one security-critical operation. A single conditional <code>UPDATE</code> makes "check the token
+is still usable" and "consume one use" one indivisible step. Postgres row-locks the matched row, so if
+25 agents present the same single-use token at once, exactly one can move <code>use_count</code> from 0→1
+while the guard still holds; the rest match zero rows.</p>
+<pre>UPDATE enrollment_tokens
+   SET use_count = use_count + 1
+ WHERE token_hash = $1
+   AND revoked = false
+   AND (expires_at IS NULL OR expires_at &gt; now())
+   AND use_count &lt; max_uses
+ RETURNING id, use_count, max_uses;      -- 1 row = success, 0 rows = refused</pre>
+<p class="muted">Verified live: <b>25 concurrent redeems of a single-use token → exactly 1 winner, 24
+rejected, <code>use_count</code> never overshoots 1.</b> No <code>SELECT … FOR UPDATE</code> round-trip,
+no held transaction.</p>
+
+<h2>5. Test &amp; edge-case results</h2>
+<p class="muted">Three levels of verification. HTTP tests drive the <b>real Express app</b> on an ephemeral
+port with <b>real login cookies</b>; invariants are checked by inspecting the <b>database directly</b>.
+All results below are the actual observed run.</p>
+
+<h3>A · Library — lifecycle &amp; atomic use</h3>
+<table>
+  <tr><th>ID</th><th>Check</th><th>Result</th><th></th></tr>
+  <tr><td class="id">E01</td><td>token is prefixed, 256-bit, returned once</td><td class="muted">prefix + base64url, ≥43 chars</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E02</td><td>DB stores ONLY the SHA-256 hash</td><td class="muted">raw token absent from every column</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E03</td><td>valid token redeems; use_count increments</td><td class="muted">0→1</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E04</td><td>maxUses=3: 3 succeed, 4th exhausted</td><td class="muted">3/3 then exhausted</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E05</td><td>unknown token → unknown_token</td><td class="muted">rejected</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E06</td><td>revoked token cannot be redeemed</td><td class="muted">rejected</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E07</td><td>expired token cannot be redeemed</td><td class="muted">rejected</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E08</td><td><b>RACE</b>: 25 concurrent redeems, maxUses=1</td><td class="muted">exactly 1 winner, no double-spend</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E09</td><td>validation: maxUses=0 rejected</td><td class="muted">ValidationError</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E10</td><td>validation: negative expiry rejected</td><td class="muted">ValidationError</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E11</td><td>validation: maxUses over cap rejected</td><td class="muted">ValidationError</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+
+<h3>B · HTTP + RBAC — the real app, real cookies</h3>
+<table>
+  <tr><th>ID</th><th>Check</th><th>Result</th><th></th></tr>
+  <tr><td class="id">E12</td><td>create as sysadmin → 201 with token + warning</td><td class="muted">201</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E13</td><td>create as policy_author → 403 + audited</td><td class="muted">403, authz.denied logged</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E14</td><td>create unauthenticated → 401</td><td class="muted">401</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E15</td><td>list never leaks token or hash</td><td class="muted">metadata only</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E16</td><td>revoke via API → 200; token then unusable</td><td class="muted">revoked then rejected</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E17</td><td>revoke unknown id → 404; malformed id → 404</td><td class="muted">both 404, no 500</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E18</td><td>API validation: maxUses=0 → 400</td><td class="muted">400</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+
+<h3>C · Independent invariants — direct DB inspection</h3>
+<table>
+  <tr><th>ID</th><th>Check</th><th>Result</th><th></th></tr>
+  <tr><td class="id">E19</td><td>create + revoke events present in audit_log</td><td class="muted">create 2, revoke 1</td><td><span class="st pass">PASS</span></td></tr>
+  <tr><td class="id">E20</td><td>audit hash-chain intact after all operations</td><td class="muted">AUDIT CHAIN INTACT</td><td><span class="st pass">PASS</span></td></tr>
+</table>
+<p class="kv muted">Reproduce: <code>npm run test:tokens</code> — creates its own throwaway users/tokens
+and cleans them up.</p>
+
+<h2>6. A real bug this testing caught (and fixed)</h2>
+<div class="bug"><b>E20 failed on the first run — the audit chain broke.</b> Root cause: the audit
+canonicalizer treated a <code>Date</code> in a log entry's <code>detail</code> as an empty object
+<code>{}</code>, while the value actually stored in the <code>jsonb</code> column was the Date's ISO
+string. So the hash written and the hash recomputed on verification disagreed the moment any entry
+carried a Date (the token's <code>expiresAt</code> was the first). <b>Fix:</b> normalize
+<code>detail</code> through the same JSON round-trip that jsonb storage performs, and handle
+<code>Date</code> explicitly in the canonicalizer — so the hash is always computed over exactly what
+verification later reads back. This is precisely the kind of latent tamper-evidence bug that only
+end-to-end testing surfaces.</div>
+
+<h2>7. Manual walkthrough &amp; API</h2>
+<p>See the token mechanics yourself (narrated, self-cleaning):</p>
+<pre>node scripts/token-demo.js        # mint → hash-only storage → redeem → exhaust
+                                  # → forged-reject → revoke → 20-way race</pre>
+<pre>POST   /api/enrollment-tokens          { description?, maxUses?, expiresInHours? }  → 201 {token,…}
+GET    /api/enrollment-tokens                                                       → 200 [metadata]
+POST   /api/enrollment-tokens/:id/revoke                                            → 200 {ok:true}
+                                        (all sysadmin-only, all audited)</pre>
+
+<h2>8. What's next</h2>
+<div class="card"><span class="kv"><b>Next (Phase 2):</b> the agent enrollment endpoint —
+<code>POST /agent/enroll</code> — which calls <code>redeemToken()</code> to spend the token and the
+CA's <code>signCertificateRequest()</code> to issue the agent's certificate, mapping every failure to
+one generic response. Then the mTLS listener + check-in, then the fake-agent harness, then the real
+Rust agent.</span></div>
+
+<footer>
+  DLP Management Server — Enrollment-token layer report. Files:
+  <span class="fn">lib/enrollmentTokens.js</span>, <span class="fn">routes/enrollmentTokens.js</span>,
+  <span class="fn">test/enrollmentTokens.test.js</span>, <span class="fn">scripts/token-demo.js</span>.
+</footer>
+
+</div>
+</body>
+</html>

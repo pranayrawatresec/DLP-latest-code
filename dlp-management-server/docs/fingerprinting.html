@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Content Detection Engine — Fingerprinting, EDM &amp; Protected Content Repository — Architecture</title>
+<style>
+  :root{--bg:#fff;--panel:#f7f8fa;--border:#e4e7ec;--ink:#1a1d23;--muted:#667085;--accent:#1f2937;
+    --green:#067647;--green-bg:#ecfdf3;--red:#b42318;--red-bg:#fef3f2;--amber:#b54708;--amber-bg:#fffaeb;--code:#f2f4f7;
+    --blue:#175cd3;--blue-bg:#eff8ff;}
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:920px;margin:0 auto;padding:40px 24px 96px;}
+  header.hero{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:32px;}
+  .tag{display:inline-block;font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);}
+  h1{font-size:28px;margin:8px 0 6px;letter-spacing:-.01em;}
+  h2{font-size:20px;margin:40px 0 12px;letter-spacing:-.01em;}
+  h3{font-size:15px;margin:22px 0 8px;}
+  p{color:#344054;} .muted{color:var(--muted);} .lead{font-size:16px;color:#344054;}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12.5px;font-weight:600;}
+  .pill.plan{background:var(--blue-bg);color:var(--blue);}
+  .summary{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px;}
+  .stat{flex:1 1 130px;background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .stat .n{font-size:22px;font-weight:700;} .stat .l{font-size:12.5px;color:var(--muted);}
+  code,pre{font-family:"SF Mono",Consolas,"Roboto Mono",monospace;}
+  code{background:var(--code);padding:1px 5px;border-radius:5px;font-size:13px;}
+  pre{background:var(--accent);color:#e5e7eb;padding:16px;border-radius:10px;overflow-x:auto;font-size:12.5px;line-height:1.55;}
+  .diagram{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;overflow-x:auto;}
+  .diagram pre{background:transparent;color:var(--ink);padding:0;}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px;}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:top;}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin:12px 0;}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+  @media (max-width:640px){.grid2{grid-template-columns:1fr;}}
+  ul.check{list-style:none;padding:0;margin:8px 0;}
+  ul.check li{padding:5px 0 5px 26px;position:relative;}
+  ul.check li::before{content:"✓";position:absolute;left:0;color:var(--green);font-weight:700;}
+  ul.cross{list-style:none;padding:0;margin:8px 0;}
+  ul.cross li{padding:5px 0 5px 26px;position:relative;}
+  ul.cross li::before{content:"✗";position:absolute;left:0;color:var(--red);font-weight:700;}
+  .note{background:var(--amber-bg);border:1px solid #fedf89;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#573b00;margin:12px 0;}
+  .blue{background:var(--blue-bg);border:1px solid #b2ddff;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#194185;margin:12px 0;}
+  .danger{background:var(--red-bg);border:1px solid #fecdca;border-radius:10px;padding:12px 14px;font-size:13.5px;color:#912018;margin:12px 0;}
+  .st{font-weight:700;font-size:12px;padding:2px 8px;border-radius:999px;white-space:nowrap;}
+  .st.p1{background:var(--green-bg);color:var(--green);}
+  .st.p2{background:var(--blue-bg);color:var(--blue);}
+  .st.p3{background:var(--amber-bg);color:var(--amber);}
+  .st.later{background:var(--code);color:var(--muted);}
+  footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--border);font-size:12.5px;color:var(--muted);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <span class="tag">DLP · Detection Engine · Design Document</span>
+  <h1>Content Detection Engine — Fingerprinting, EDM &amp; the Protected Content Repository</h1>
+  <p class="lead">Architecture and build plan for the <b>"know the actual data"</b> layer of the DLP:
+  document fingerprinting (IDM), exact data matching (EDM), the server-side Protected Content
+  Repository that admins feed, and the compiled index that ships to every Windows agent so
+  verdicts work <b>offline, on the endpoint, inside the air gap</b>.</p>
+  <div class="summary">
+    <div class="stat"><div class="n">Winnowing</div><div class="l">shingles + rolling hash (SIGMOD '03, same family as MOSS / commercial DLP)</div></div>
+    <div class="stat"><div class="n">On-endpoint</div><div class="l">matching runs in the Rust agent — works with zero connectivity</div></div>
+    <div class="stat"><div class="n">Hashes only</div><div class="l">endpoints never hold protected plaintext — only salted / one-way fingerprints</div></div>
+    <div class="stat"><div class="n">No new infra</div><div class="l">PostgreSQL job queue, no Kafka — per the small-dependency rule</div></div>
+  </div>
+  <p style="margin-top:14px"><span class="pill plan">● Proposed — not yet implemented</span></p>
+</header>
+
+<h2>1. The one big adaptation: match on the endpoint, author on the server</h2>
+<p>Cloud DLPs (Purview et al.) can afford to do matching in their cloud. We cannot and should not:
+our enforcement point is a Windows agent that must keep working <b>fully offline</b> (fail secure),
+and customer data must never leave the premises. That single constraint shapes everything below:</p>
+<div class="diagram"><pre>
+  MANAGEMENT SERVER (authoring side)                 WINDOWS AGENT (verdict side)
+  ──────────────────────────────────                 ───────────────────────────
+  Admin registers protected content                  USB copy / (later: email, upload, print)
+        │                                                  │
+        ▼                                                  ▼
+  Extract → Normalize → Fingerprint                  Extract → Normalize → Fingerprint
+        │                                                  │
+        ▼                                                  ▼
+  Protected Content Repository            ┌──────►  Local index lookup (Bloom → hash table)
+        │                                 │                │
+        ▼                                 │                ▼
+  Index Compiler → signed, versioned  ────┘          Similarity score per protected doc
+  INDEX BUNDLE (hashes only)                               │
+  delivered via existing mTLS check-in                     ▼
+                                                     Policy verdict: allow / audit / block
+                                                           │
+                                                           ▼
+                                                     Incident (matched hashes) → server
+                                                     server resolves hash→page/paragraph
+                                                     for the analyst view (forensics)
+</pre></div>
+<p>Both sides run the <b>identical</b> normalize→shingle→hash algorithm — the server in Node
+(authoring, low volume), the agent in Rust (hot path). A shared <b>golden test-vector corpus</b>
+keeps the two implementations bit-for-bit compatible; this is the highest-risk integration point
+of the whole feature and gets its own test suite (§9).</p>
+
+<h2>2. Where each detector sits (the ladder) and when we build it</h2>
+<table>
+  <tr><th>Detector</th><th>Answers</th><th>Build</th><th>Notes</th></tr>
+  <tr><td>Exact file hash (SHA-256)</td><td>"Is this byte-identical to a protected file?"</td><td><span class="st p1">D1 — now</span></td><td>Nearly free; rides on USB v0 audit which already hashes copied files.</td></tr>
+  <tr><td>Regex / keyword patterns</td><td>"Does this look like a PAN / passport no. / 'SECRET' marking?"</td><td><span class="st p1">D1 — now</span></td><td>Simple rule table in policy; noisy alone, cheap to add.</td></tr>
+  <tr><td><b>Document fingerprinting (IDM)</b></td><td>"Does this contain substantial portions of a protected document, despite rename / convert / re-format / partial copy?"</td><td><span class="st p2">D2 — this doc</span></td><td>Shingling + winnowing. The core of this design.</td></tr>
+  <tr><td><b>Exact Data Match (EDM)</b></td><td>"Does this contain actual rows from an authoritative database (personnel, payroll, assets)?"</td><td><span class="st p2">D2 — this doc</span></td><td>Salted hashes of normalized cell values + same-row proximity rule.</td></tr>
+  <tr><td>OCR (scans, screenshots, print→scan)</td><td>feeds text into all of the above</td><td><span class="st p3">D3</span></td><td>Tesseract-class engine; big dependency — deliberately deferred, slot reserved in the pipeline.</td></tr>
+  <tr><td>ML classification (Secret / Confidential…)</td><td>"What sensitivity tier does this content read as?"</td><td><span class="st later">D4</span></td><td>Local ONNX model — feasible air-gapped, but a later phase.</td></tr>
+  <tr><td>Semantic similarity (embeddings)</td><td>"Same meaning, rewritten words?"</td><td><span class="st later">D4</span></td><td>Catches full paraphrase, the one case IDM misses. Local embedding model; never a cloud API.</td></tr>
+</table>
+<div class="blue"><b>Design rule:</b> every detector is a plug-in behind one interface —
+<code>detect(extracted_text, file_meta) → findings[]</code> — and the policy engine consumes findings,
+never raw detector internals. That's what lets OCR / ML / semantic slot in later without
+touching channels or policy.</div>
+
+<h2>3. The fingerprinting algorithm (IDM) — exact specification</h2>
+
+<h3>3.1 Normalization (must be byte-identical in Node and Rust)</h3>
+<pre>
+1. Decode to UTF-8 text (from the format extractor, §6)
+2. Unicode NFKC normalize
+3. Lowercase (Unicode-aware)
+4. Replace every run of non-alphanumeric chars with a single space
+5. Collapse whitespace; trim
+6. Tokenize on single spaces → word stream
+</pre>
+
+<h3>3.2 Shingle → hash → winnow</h3>
+<pre>
+k-gram      : k = 8 consecutive words per shingle (sliding, overlap 7)
+hash        : 64-bit FNV-1a over the joined shingle ("w1 w2 … w8")
+winnowing   : window w = 8 hashes; keep the minimum hash per window
+              (rightmost on ties) — the standard winnowing algorithm
+guarantee   : any shared run of ≥ t = k + w − 1 = 15 words is detected
+density     : ~2/(w+1) ≈ 22% of hashes kept → ~5.5× index compression
+</pre>
+<p>These are starting parameters, stored <b>in the index bundle header</b> (never hard-coded on the
+agent) so they can be tuned per deployment without an agent release. Raising <code>w</code> shrinks the
+index; raising <code>k</code> reduces coincidental matches on boilerplate.</p>
+
+<h3>3.3 Scoring — containment, not Jaccard</h3>
+<p>We ask an asymmetric question: <i>how much of the <b>protected</b> document appears in the outbound
+file?</i> A 3-page excerpt from a 100-page war plan must score high even though the outbound file is
+tiny relative to the source.</p>
+<pre>
+similarity(doc D, outbound F) = |fingerprints(F) ∩ fingerprints(D)| / |fingerprints(D)|
+
+report both:
+  containment  — % of D present in F      (drives block decisions)
+  coverage     — % of F that came from D  (context for the analyst)
+</pre>
+
+<h3>3.4 What survives, what doesn't (sets customer expectations honestly)</h3>
+<div class="grid2">
+  <div class="card"><b>Detected</b>
+    <ul class="check">
+      <li>Rename, PDF→DOCX conversion, font/margin/layout changes</li>
+      <li>Copy-paste into another document or email body</li>
+      <li>Partial copies (pages, sections, tables) down to ~15 shared words</li>
+      <li>Added logos, headers, blank lines, reordered sections</li>
+      <li>Print→scan and screenshots — <b>once OCR lands (D3)</b>, not before</li>
+    </ul>
+  </div>
+  <div class="card"><b>Not detected (by IDM — by design)</b>
+    <ul class="cross">
+      <li>Full paraphrase / rewrite (→ semantic layer, D4)</li>
+      <li>Content inside encrypted or password-protected containers (→ policy: unreadable + removable destination = <b>block</b>, fail secure)</li>
+      <li>Photos of screens taken with a phone (out of scope for an endpoint agent)</li>
+    </ul>
+  </div>
+</div>
+
+<h2>4. Exact Data Match (EDM) — specification</h2>
+<pre>
+Authoring (server, air-gapped):
+  1. sysadmin/policy_author registers an EDM source: a CSV/TSV export of an
+     authoritative table + a schema (field names, types, which are "primary")
+  2. per-field normalization by declared type
+       text   → same pipeline as §3.1
+       id     → strip separators/spaces, uppercase
+       number → canonical digits, no grouping
+       date   → ISO-8601
+  3. hash = SHA-256(deployment_salt ‖ field_id ‖ normalized_value), truncated to 64 bits
+  4. store hashes grouped by row → EDM index (plaintext export is NOT retained)
+
+Matching (agent):
+  tokenize outbound text → candidate values (words + typed patterns like id-shaped
+  tokens) → normalize per type → hash with the same salt → look up
+  RULE: fire only when ≥ N fields (default 2, at least one "primary")
+        from the SAME row co-occur within a window of 300 normalized chars
+</pre>
+<div class="danger"><b>Threat honesty — the salt lives on endpoints too.</b> The agent must hash
+candidate tokens, so the deployment salt is present on every PC (DPAPI-protected, inside the
+encrypted index). An attacker who extracts it can dictionary-test <i>guessed</i> values against the
+index — a real risk for low-entropy fields (dates, 6-digit IDs). Mitigations: per-deployment random
+salt, index encrypted at rest, primary-field requirement (high-entropy fields like service numbers),
+and shipping <b>only the collections an agent group actually enforces</b> (§7). Residual risk is
+documented, not hidden — this matches how Purview EDM frames its salted-hash model.</div>
+
+<h2>5. Server side — the Protected Content Repository</h2>
+<p>Admins never see "generate fingerprint". They see <b>collections of protected content</b>:</p>
+<div class="diagram"><pre>
+  Collections                          Registration sources (v1 → v2)
+  ───────────                          ──────────────────────────────
+  Army Operations                      v1: file upload (single/multi) via console
+   ├─ Deployment Orders               v1: server-local folder path (one-shot scan)
+   ├─ Mission Briefings               v2: watched network share (SMB/UNC crawler,
+   └─ Logistics Plans                      re-scan on interval, auto-register new files)
+  DRDO Research                        never: SharePoint/S3/GDrive connectors —
+   └─ Missile Designs                        air-gapped customers don't have them;
+  Personnel (EDM source)                     the fileshare crawler covers the real case
+</pre></div>
+
+<h3>5.1 Registration flow (async — uploads return immediately)</h3>
+<div class="diagram"><pre>
+  POST /api/protected/documents  (multipart)         [authn session + authz: protect:write]
+     │  store original → encrypted blob store (AES-256-GCM, per-file key,
+     │  outside the DB — same design the Phase-4 evidence store will use)
+     │  insert protected_documents row (status: pending)  + audit entry
+     │  insert processing job
+     ▼
+  bin/fingerprint-worker.js  — separate Node process, polls jobs table
+     │  SELECT … FOR UPDATE SKIP LOCKED   ← PostgreSQL IS the queue.
+     │                                       No Kafka/RabbitMQ: unjustifiable
+     │                                       supply-chain + ops surface for an
+     │                                       air-gapped appliance. Postgres queues
+     │                                       comfortably handle this volume.
+     ▼
+  extract text → normalize → shingle/winnow → store fingerprints
+     │  status: pending → extracting → fingerprinting → ready | failed(reason)
+     ▼
+  mark collection dirty → index compiler picks it up (§7)
+</pre></div>
+
+<h3>5.2 Schema (new migration set)</h3>
+<pre>
+protected_collections   id, name, classification, description, created_by, created_at
+protected_documents     id, collection_id, title, status, current_version, created_by, created_at
+document_versions       id, document_id, version_no, blob_ref, sha256, size_bytes, mime,
+                        page_count, registered_by, registered_at, retired_at NULL
+document_fingerprints   version_id, hash BIGINT, seq INT      -- seq = position, server-side
+                        PRIMARY KEY (version_id, seq), INDEX ON (hash)
+edm_sources             id, name, schema_json, salt_id, row_count, status, created_by, created_at
+edm_hashes              source_id, row_id INT, field_id SMALLINT, hash BIGINT, INDEX ON (hash)
+processing_jobs         id, kind, ref_id, state, attempts, last_error, run_after, created_at
+index_bundles           id, version, scope_json, params_json, sha256, signature, size_bytes,
+                        built_at
+</pre>
+<ul class="check">
+  <li><b>Versioning:</b> re-uploading a document creates a new <code>document_versions</code> row; old
+      versions stay matchable until explicitly retired — a leak of last month's v1 is still a leak.</li>
+  <li><b>Positions (<code>seq</code>) stay server-side only.</b> The agent reports <i>which hashes</i> matched;
+      the server maps them back to page/paragraph for the analyst ("pages 17–19 of
+      ArmyDeploymentOrder.pdf, 231 fingerprints"). Keeps the endpoint index small and the
+      forensic story strong.</li>
+  <li><b>Originals kept, encrypted, access-gated:</b> enables re-fingerprinting when algorithms
+      improve and side-by-side comparison during investigations. <code>sysadmin</code> <b>cannot</b> read
+      originals (separation of duties — same rule as evidence); every access is audited.</li>
+</ul>
+
+<h3>5.3 RBAC additions</h3>
+<table>
+  <tr><th>Permission</th><th>policy_author</th><th>incident_reviewer</th><th>auditor</th><th>sysadmin</th></tr>
+  <tr><td><code>protect:write</code> — register/retire documents, manage collections, EDM sources</td><td>✓</td><td>—</td><td>—</td><td>—</td></tr>
+  <tr><td><code>protect:read</code> — list collections/documents, statuses (metadata only)</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+  <tr><td><code>protect:read_original</code> — open stored original (audited, like evidence)</td><td>—</td><td>✓</td><td>—</td><td>—</td></tr>
+</table>
+<p class="muted">Whoever holds <code>protect:write</code> decides what the whole fleet screens for — flag
+(don't block) if combined with roles that break separation of duties, per the project rule.</p>
+
+<h2>6. Text extraction — the bounded-format decision</h2>
+<p>Extraction is the largest dependency surface in this feature, and it exists <b>twice</b> (Node
+worker + Rust agent). We bound it hard:</p>
+<table>
+  <tr><th>Format</th><th>v1</th><th>How</th></tr>
+  <tr><td>txt / md / csv / log / source code</td><td>✓</td><td>direct read + encoding sniff</td></tr>
+  <tr><td>docx / xlsx / pptx</td><td>✓</td><td>zip + XML text nodes — Node: <code>yauzl</code>-class lib; Rust: <code>zip</code> + <code>quick-xml</code>. No full Office parser.</td></tr>
+  <tr><td>pdf (text layer)</td><td>✓</td><td>Node: <code>pdfjs-dist</code> (text only); Rust: <code>pdf-extract</code>/<code>lopdf</code></td></tr>
+  <tr><td>pdf (scanned) / images</td><td>D3</td><td>OCR slot in the pipeline, engine deferred</td></tr>
+  <tr><td>zip archives (plain)</td><td>✓</td><td>recurse into members, depth/size-capped</td></tr>
+  <tr><td>encrypted/unknown containers</td><td>—</td><td><b>not parsed — policy decides</b>: unreadable + removable destination ⇒ block (fail secure)</td></tr>
+  <tr><td>legacy .doc/.xls, odt, rtf…</td><td>—</td><td>declared unsupported v1; treated as "unreadable" by policy</td></tr>
+</table>
+
+<h2>7. The index bundle — compile, sign, distribute</h2>
+<div class="diagram"><pre>
+  BUNDLE LAYOUT (binary, little-endian)
+  ┌───────────────────────────────────────────────────────────────┐
+  │ header    magic, format_ver, bundle_ver, params {k, w, hashbits},
+  │           salt_id, scope (collection ids), built_at            │
+  │ bloom     Bloom filter over all IDM+EDM hashes (~10 bits/entry,
+  │           <1% FP) — the fast-reject path for 99.9% of files     │
+  │ idm       sorted u64 hash → (doc_version_id, collection_id)    │
+  │ edm       sorted u64 hash → (source_id, row_id, field_id)      │
+  │ docs      doc_version_id → {title-hash, collection, fp_count}  │
+  │ sig       Ed25519/RSA signature by the management CA — agent   │
+  │           verifies before load; unsigned bundle = rejected     │
+  └───────────────────────────────────────────────────────────────┘
+
+  DISTRIBUTION — rides the existing mTLS check-in, no new channel:
+  agent check-in payload  += { index_version: N }
+  server response         += { index: { latest: M, download: /agent/index } }
+  agent: if M > N → GET /agent/index (mTLS) → verify sig → swap atomically
+         → store encrypted at rest (DPAPI/TPM-bound key)
+  offline: agent keeps enforcing with the last good bundle — fail secure.
+</pre></div>
+<p><b>Size budget:</b> a 200-page document yields roughly 10–15k winnowed fingerprints ≈ 120 KB.
+A 10,000-document estate lands around 1–2 GB fleet-wide — too big to ship wholesale. Two levers,
+both designed in from day one: <b>scoping</b> (bundles are compiled per agent-policy-group; an agent
+only receives collections its policies reference) and <b>winnowing density</b> (raise <code>w</code> for very
+large corpora). Delta updates (v2) reduce steady-state traffic; v1 ships full bundles per version
+bump, which is fine at pilot scale.</p>
+
+<h2>8. Agent side — the detection engine crate</h2>
+<pre>
+dlp-agent/src/detect/
+  mod.rs        pub fn verdict(path) -> Verdict        ← the ONE entry point channels call
+  extract.rs    bounded-format text extraction (§6)
+  normalize.rs  §3.1 — byte-identical to server
+  shingle.rs    k-grams, FNV-1a, winnowing
+  index.rs      bundle load, signature verify, Bloom + binary-search lookup, atomic swap
+  edm.rs        token candidates, typed normalize, salted lookup, proximity rule
+  score.rs      containment/coverage per doc, EDM row grouping
+
+Verdict {
+  file_hash_match:  Option&lt;doc&gt;,                    // exact SHA-256 (D1)
+  idm:  Vec&lt;{ doc_version, collection, containment, coverage, matched_hashes }&gt;,
+  edm:  Vec&lt;{ source, rows_hit, fields }&gt;,
+  regex: Vec&lt;{ rule, count }&gt;,
+  extraction: Ok | Unreadable(reason),               // Unreadable → policy decides
+}
+</pre>
+<ul class="check">
+  <li><b>Performance budget:</b> Bloom-negative (the overwhelmingly common case) &lt; 1 ms for a 10 MB
+      file; full match on a positive &lt; 50 ms. Matching is pure CPU + one mmap'd index — no I/O waits.</li>
+  <li><b>Callers:</b> USB v0/v1 call it <i>post-copy</i> for audit incidents (value ships before any
+      driver exists); the v2 minifilter calls it <i>pre-completion</i> for true blocking; future
+      channels (email, upload, print) call the same function.</li>
+  <li><b>Incidents</b> carry the matched hash list + scores → server resolves to pages/paragraphs
+      via <code>document_fingerprints.seq</code> → analyst sees "97% of ArmyDeploymentOrder.pdf v2,
+      pages 17–19" — deterministic, evidence-grade attribution.</li>
+</ul>
+
+<h2>9. Policy integration</h2>
+<pre>
+rule "army-ops-usb" {
+  channel:      usb                       # later: email, upload, print
+  collections:  ["Army Operations"]
+  idm:          { block_at: 0.90, warn_at: 0.70, audit_at: 0.40 }   # containment
+  edm:          { source: "Personnel", min_fields: 2, action: block }
+  unreadable:   block                     # encrypted container to USB ⇒ deny
+  file_hash:    block
+}
+</pre>
+<p>Thresholds are per-rule, not global — an NDA template and a war plan deserve different
+sensitivity. Every triggered rule writes an incident <i>and</i> an audit entry; <b>every block is
+explainable</b> from stored evidence (which doc, which version, how much, where).</p>
+
+<h2>10. What we consciously rejected from the "standard" enterprise blueprint</h2>
+<table>
+  <tr><th>Common blueprint says</th><th>We do instead</th><th>Why</th></tr>
+  <tr><td>Kafka / RabbitMQ job pipeline</td><td>PostgreSQL <code>processing_jobs</code> + <code>SKIP LOCKED</code> workers</td><td>Air-gapped appliance: every service is ops + supply-chain surface. Postgres handles this volume with rows to spare.</td></tr>
+  <tr><td>SharePoint / S3 / GDrive crawlers</td><td>Upload + server folder now; SMB share crawler v2</td><td>Defence sites are on-prem fileshares; cloud connectors are dead weight here.</td></tr>
+  <tr><td>Cloud-side matching service</td><td>Matching on the endpoint, index shipped to agents</td><td>USB enforcement must work offline; fail secure means the verdict engine lives where the data moves.</td></tr>
+  <tr><td>Semantic embeddings + ML from day one</td><td>Plug-in slots reserved; ship IDM/EDM first</td><td>IDM+EDM deliver the low-false-positive core that makes <i>blocking</i> viable; ML/semantic are additive, need local models, and must not delay the foundation.</td></tr>
+  <tr><td>OCR in the first release</td><td>Pipeline slot at D3</td><td>Tesseract-class engines are a huge dependency; the text-layer world comes first.</td></tr>
+</table>
+
+<h2>11. Build plan — concrete coding order</h2>
+<table>
+  <tr><th>Step</th><th>Deliverable</th><th>Proves</th></tr>
+  <tr><td class="st p1">1</td><td><b>Shared algorithm + golden vectors.</b> Implement normalize/shingle/winnow in Node (<code>lib/fingerprint.js</code>) with a checked-in test-vector file (input text → expected hash sets, including Unicode edge cases). Unit tests: the 11 evasion attempts (rename, convert, font, whitespace, logo, add/remove paragraph, partial copy, word swaps) as fixtures asserting expected similarity bands.</td><td>The algorithm, before any plumbing.</td></tr>
+  <tr><td class="st p1">2</td><td><b>Repository + pipeline.</b> Migrations (§5.2), encrypted blob store, registration API with two-gate auth + audit, <code>bin/fingerprint-worker.js</code>, extraction for the v1 format list, status endpoints.</td><td>Admin registers a folder of PDFs → all rows reach <code>ready</code>.</td></tr>
+  <tr><td class="st p1">3</td><td><b>EDM authoring.</b> Source registration, schema, typed normalization, salted hashing, plaintext discarded.</td><td>Personnel CSV → queryable EDM index.</td></tr>
+  <tr><td class="st p2">4</td><td><b>Index compiler + distribution.</b> Bundle format, signing with the existing CA, check-in field + download route, bundle-version bookkeeping.</td><td>Server emits a signed bundle; a script verifies + parses it.</td></tr>
+  <tr><td class="st p2">5</td><td><b>Rust <code>detect</code> module.</b> Port normalize/shingle/winnow against the same golden vectors (the cross-language gate: hash sets must be identical), bundle loader, matcher, EDM.</td><td>Agent scores a mutated document identically to the server.</td></tr>
+  <tr><td class="st p2">6</td><td><b>Wire into USB audit path.</b> File copied to removable media → <code>verdict()</code> → incident with match evidence → server resolves positions → console shows "which doc, which pages, how much".</td><td>The end-to-end story, still detect-only.</td></tr>
+  <tr><td class="st p3">7</td><td><b>Console UI.</b> Collections tree, registration with progress states (pending → extracting → fingerprinting → ready/failed), document versions, incident match detail.</td><td>The admin experience.</td></tr>
+  <tr><td class="st p3">8</td><td><b>Blocking.</b> When the USB v2 minifilter lands, the same <code>verdict()</code> moves pre-completion; policy thresholds begin to <i>enforce</i>.</td><td>Detection → prevention.</td></tr>
+</table>
+
+<h2>12. Open decisions</h2>
+<ul>
+  <li><b>Shingle unit:</b> word-level k=8 (proposed, robust to layout) vs character-level k≈50
+      (better for CJK/no-whitespace text). Parameterized either way; pick after corpus testing.</li>
+  <li><b>Fuzzy hashing (ssdeep/TLSH) as a cheap secondary detector:</b> nice for binaries/CAD where
+      text extraction fails — proposed <i>skip</i> in v1 (another dependency, overlaps with IDM on text).</li>
+  <li><b>Bundle scoping granularity:</b> per agent-policy-group (proposed) vs per-agent. Group-level
+      is simpler and matches how policies will be assigned.</li>
+  <li><b>Where the salt is provisioned:</b> generated at EDM-source creation, delivered inside the
+      encrypted bundle (proposed) vs per-agent-group salts (stronger, multiplies index builds).</li>
+</ul>
+
+<footer>
+  DLP Management Server &amp; Agent · Content Detection Engine design ·
+  Algorithm basis: Schleimer, Wilkerson &amp; Aiken, “Winnowing: Local Algorithms for Document
+  Fingerprinting” (SIGMOD 2003) · EDM salting model consistent with Microsoft Purview EDM
+  public documentation · Status: proposed for review.
+</footer>
+
+</div>
+</body>
+</html>

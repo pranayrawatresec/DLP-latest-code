@@ -1,0 +1,149 @@
+{
+  "note": "Golden fixture for the Rust bundle loader (docs/index-bundle-format.md). Hashes are signed-i64 decimal strings. absentBloomNegative hashes are not in the bundle AND the bloom filter answers false; absentBloomPositive hashes are not in the bundle but the bloom filter answers true (false positives — the loader must fall through to the sorted sections and find nothing).",
+  "header": {
+    "bundleVersion": 1,
+    "params": {
+      "k": 8,
+      "w": 8,
+      "hashBits": 64
+    },
+    "edmSalts": {
+      "66666666-6666-4666-8666-666666666666": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    "scope": [
+      "11111111-1111-4111-8111-111111111111"
+    ],
+    "counts": {
+      "idm": 111,
+      "edm": 9,
+      "docs": 2
+    },
+    "docs": [
+      {
+        "versionId": "33333333-3333-4333-8333-333333333333",
+        "documentId": "22222222-2222-4222-8222-222222222222",
+        "collectionId": "11111111-1111-4111-8111-111111111111",
+        "title": "Fixture Plan Alpha",
+        "fpCount": 64
+      },
+      {
+        "versionId": "55555555-5555-4555-8555-555555555555",
+        "documentId": "44444444-4444-4444-8444-444444444444",
+        "collectionId": "11111111-1111-4111-8111-111111111111",
+        "title": "Fixture Plan Bravo",
+        "fpCount": 47
+      }
+    ],
+    "edmSources": [
+      {
+        "sourceId": "66666666-6666-4666-8666-666666666666",
+        "name": "fixture personnel",
+        "fields": [
+          {
+            "fieldId": 0,
+            "name": "full_name",
+            "type": "text",
+            "primary": true
+          },
+          {
+            "fieldId": 1,
+            "name": "service_no",
+            "type": "id",
+            "primary": true
+          },
+          {
+            "fieldId": 2,
+            "name": "dob",
+            "type": "date",
+            "primary": false
+          }
+        ]
+      }
+    ]
+  },
+  "bloom": {
+    "mBits": 1216,
+    "kHashes": 7
+  },
+  "present": [
+    {
+      "hash": "6321381948495909521",
+      "section": "idm",
+      "matches": [
+        {
+          "docIndex": 0,
+          "versionId": "33333333-3333-4333-8333-333333333333",
+          "title": "Fixture Plan Alpha"
+        }
+      ]
+    },
+    {
+      "hash": "8205287774994285325",
+      "section": "idm",
+      "matches": [
+        {
+          "docIndex": 0,
+          "versionId": "33333333-3333-4333-8333-333333333333",
+          "title": "Fixture Plan Alpha"
+        }
+      ]
+    },
+    {
+      "hash": "5387763429665733624",
+      "section": "idm",
+      "matches": [
+        {
+          "docIndex": 1,
+          "versionId": "55555555-5555-4555-8555-555555555555",
+          "title": "Fixture Plan Bravo"
+        }
+      ]
+    },
+    {
+      "hash": "468947892733580619",
+      "section": "edm",
+      "matches": [
+        {
+          "sourceIndex": 0,
+          "sourceId": "66666666-6666-4666-8666-666666666666",
+          "rowId": 1,
+          "fieldId": 0
+        }
+      ]
+    },
+    {
+      "hash": "-4434837536836695614",
+      "section": "edm",
+      "matches": [
+        {
+          "sourceIndex": 0,
+          "sourceId": "66666666-6666-4666-8666-666666666666",
+          "rowId": 2,
+          "fieldId": 1
+        }
+      ]
+    },
+    {
+      "hash": "3594911419671087558",
+      "section": "edm",
+      "matches": [
+        {
+          "sourceIndex": 0,
+          "sourceId": "66666666-6666-4666-8666-666666666666",
+          "rowId": 3,
+          "fieldId": 2
+        }
+      ]
+    }
+  ],
+  "absentBloomNegative": [
+    "-7995527694508729151",
+    "-7541218347953203506",
+    "2092789425003139053",
+    "7958955049054603978"
+  ],
+  "absentBloomPositive": [
+    "-327054986932344948",
+    "-4969341721976607280"
+  ]
+}

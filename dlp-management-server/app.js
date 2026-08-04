@@ -8,6 +8,11 @@ var indexRouter = require('./routes/index');
 var usersRouter = require('./routes/users');
 var authRouter = require('./routes/auth');
 var sessionsRouter = require('./routes/sessions');
+var enrollmentTokensRouter = require('./routes/enrollmentTokens');
+var agentsRouter = require('./routes/agents');
+var auditRouter = require('./routes/audit');
+var protectedRouter = require('./routes/protected');
+var incidentsRouter = require('./routes/incidents');
 var { attachUser } = require('./middleware/auth');
 
 var app = express();
@@ -30,6 +35,11 @@ app.use('/', indexRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/users', usersRouter);
 app.use('/api/sessions', sessionsRouter);
+app.use('/api/enrollment-tokens', enrollmentTokensRouter);
+app.use('/api/agents', agentsRouter);
+app.use('/api/audit', auditRouter);
+app.use('/api/protected', protectedRouter);
+app.use('/api/incidents', incidentsRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

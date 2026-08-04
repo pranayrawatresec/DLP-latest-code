@@ -15,6 +15,9 @@ function canonicalJson(value) {
   if (Array.isArray(value)) {
     return '[' + value.map(canonicalJson).join(',') + ']';
   }
+  if (value instanceof Date) {
+    return JSON.stringify(value.toISOString());
+  }
   if (value !== null && typeof value === 'object') {
     const keys = Object.keys(value).sort();
     return (
@@ -24,6 +27,14 @@ function canonicalJson(value) {
     );
   }
   return JSON.stringify(value);
+}
+
+// Normalize detail through the exact JSON round-trip that jsonb storage
+// performs (Date -> ISO string, undefined dropped, etc.). The hash MUST be
+// computed over the same structure verifyChain later reads back from jsonb,
+// or a Date/toJSON value in detail would silently break the chain.
+function normalizeDetail(detail) {
+  return JSON.parse(JSON.stringify(detail == null ? {} : detail));
 }
 
 function entryString(ts, actor, action, target, detail) {
@@ -40,7 +51,9 @@ async function audit(actor, action, target = null, detail = {}) {
     );
     const prevHash = rows.length ? rows[0].hash : 'genesis';
     const ts = new Date().toISOString();
-    const entry = entryString(ts, actor, action, target, detail);
+    // Hash and store the SAME normalized structure so verification matches.
+    const normalized = normalizeDetail(detail);
+    const entry = entryString(ts, actor, action, target, normalized);
     const hash = crypto
       .createHash('sha256')
       .update(prevHash + entry)
@@ -48,7 +61,7 @@ async function audit(actor, action, target = null, detail = {}) {
     await client.query(
       `insert into audit_log (ts, actor, action, target, detail, prev_hash, hash)
        values ($1, $2, $3, $4, $5, $6, $7)`,
-      [ts, actor, action, target, JSON.stringify(detail), prevHash, hash]
+      [ts, actor, action, target, JSON.stringify(normalized), prevHash, hash]
     );
     await client.query('commit');
   } catch (err) {

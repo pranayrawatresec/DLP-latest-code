@@ -8,12 +8,22 @@ const ROLE_PERMISSIONS = {
     'users.manage',
     'sessions.manage',
     'system.config',
+    'enrollment.manage', // mint/revoke agent enrollment tokens (Plane 2 provisioning)
+    'agents.read', // view the enrolled agent fleet
+    'agents.manage', // retire (de-enroll) agents
     'license.manage',
     'license.read',
+    'protect:read', // view protected-document registry (metadata, never content)
   ],
-  policy_author: ['policies.read', 'policies.write'],
-  incident_reviewer: ['incidents.read', 'evidence.read', 'evidence.export'],
-  auditor: ['audit.read', 'incidents.read_metadata', 'license.read'],
+  policy_author: ['policies.read', 'policies.write', 'protect:write', 'protect:read'],
+  incident_reviewer: ['incidents.read', 'evidence.read', 'evidence.export', 'protect:read'],
+  auditor: [
+    'audit.read',
+    'agents.read',
+    'incidents.read_metadata',
+    'license.read',
+    'protect:read',
+  ],
 };
 
 function permissionsFor(roleNames) {
