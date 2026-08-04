@@ -1,0 +1,9 @@
+{
+  "name": "com.dlp.browser_host",
+  "description": "DLP Upload Guard native messaging host (dlp-agent browser-host).",
+  "path": "C:\\Program Files\\DLP\\dlp-browser-host.cmd",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://EXTENSION_ID_PLACEHOLDER/"
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "DLP Upload Guard",
+  "version": "0.1.0",
+  "description": "On-premise DLP web-upload hook. Scans files/text bound for web uploads (webmail, cloud web UI) through the local dlp-agent native host and blocks sensitive-data egress. Chrome/Edge only.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "nativeMessaging",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["inject.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

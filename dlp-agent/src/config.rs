@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use std::collections::HashMap;
+
+use crate::netfilter::remote_tools::ToolAction;
+use crate::netfilter::rules::{Cidr, NetMode, NetRule, RuleAction};
 use crate::usb::policy::{Action, DeviceRule, RuleMatch, UsbPolicy};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -48,6 +52,12 @@ pub struct Config {
     /// section yields safe audit-only defaults, so existing configs keep working.
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+
+    /// Optional network-egress (WFP) channel settings (Tier-2 plan §2). An absent
+    /// `[netfilter]` section yields the safe `monitor` default (NEVER default-deny),
+    /// so existing configs keep working unchanged.
+    #[serde(default)]
+    pub netfilter: NetfilterConfig,
 }
 
 fn default_checkin() -> u64 {
@@ -212,6 +222,88 @@ impl Default for ClipboardConfig {
     }
 }
 
+/// Network-egress (WFP) channel configuration (Tier-2 plan §2.4). Every field is
+/// defaulted so the whole `[netfilter]` section — and any individual field — may
+/// be omitted; an absent section is the safe `monitor` posture (NEVER default-deny).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NetfilterConfig {
+    /// Enforcement mode. Default `monitor` (log intended verdicts, block nothing).
+    /// `allowlist`/`blocklist` require the operator to pass `--enforce <mode>` on
+    /// the CLI (the CLI mode wins over this); this is the config-file default when
+    /// no `--enforce` is given. Kept `monitor` so a stray config can never brick a
+    /// machine.
+    pub mode: NetMode,
+    /// Incident channel label (plan §2.1). Default "network".
+    pub channel_label: String,
+    /// Default action for a matched remote-access tool (AnyDesk/TeamViewer/VNC/…).
+    /// Default `block_network` (cut the relay); `detect` = incident only; `kill` =
+    /// terminate (admin + `--enforce`, operator-manual).
+    pub remote_tool_action: ToolAction,
+    /// Per-tool overrides keyed by tool id (e.g. `rdp-out = "detect"`).
+    pub remote_tool_overrides: HashMap<String, ToolAction>,
+    /// Persist filters across reboot (BOOTTIME) vs a dynamic session that
+    /// auto-cleans on exit. Default false = dynamic (safer; this build installs a
+    /// dynamic session regardless — BOOTTIME persistence is a follow-on).
+    pub persist: bool,
+    /// Ordered egress rules (`[[netfilter.rules]]`). First match wins.
+    pub rules: Vec<NetRuleConfig>,
+}
+
+impl Default for NetfilterConfig {
+    fn default() -> Self {
+        NetfilterConfig {
+            mode: NetMode::Monitor, // NEVER default-deny (plan §2.4/§5)
+            channel_label: "network".into(),
+            remote_tool_action: ToolAction::BlockNetwork,
+            remote_tool_overrides: HashMap::new(),
+            persist: false,
+            rules: Vec::new(),
+        }
+    }
+}
+
+/// A single TOML network rule (`[[netfilter.rules]]`). At least one matcher (app,
+/// cidr, port) must be set; a rule with none is dropped (never a catch-all).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NetRuleConfig {
+    /// Process image path or base name (case-insensitive), e.g. `curl.exe`.
+    #[serde(default)]
+    pub app: Option<String>,
+    /// Remote address/prefix, e.g. `10.0.0.0/8` or `203.0.113.4`.
+    #[serde(default)]
+    pub cidr: Option<String>,
+    /// Remote port.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// `permit` or `block`.
+    pub action: RuleAction,
+    /// Optional note used as the WFP filter display name + incident reason.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl NetRuleConfig {
+    /// Convert to an evaluated `NetRule`. A rule with no matcher, or with an
+    /// unparseable CIDR, is dropped (returns None) — fail closed, never widen.
+    pub fn to_net_rule(&self) -> Option<NetRule> {
+        let match_cidr = match &self.cidr {
+            Some(s) => Some(Cidr::parse(s)?), // bad CIDR ⇒ drop the whole rule
+            None => None,
+        };
+        if self.app.is_none() && match_cidr.is_none() && self.port.is_none() {
+            return None;
+        }
+        Some(NetRule {
+            match_app: self.app.clone(),
+            match_cidr,
+            match_port: self.port,
+            action: self.action,
+            note: self.note.clone(),
+        })
+    }
+}
+
 /// A single TOML rule (`[[usb.rules]]`). Exactly one matcher should be set; the
 /// first present matcher (serial → vid/pid → bus type → any) is used.
 #[derive(Debug, Clone, Deserialize)]
@@ -269,6 +361,7 @@ impl Config {
                 usb: UsbConfig::default(),
                 kguard: KguardConfig::default(),
                 clipboard: ClipboardConfig::default(),
+                netfilter: NetfilterConfig::default(),
             }
         };
 

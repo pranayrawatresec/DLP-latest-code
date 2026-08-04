@@ -57,6 +57,14 @@ windows = { version = "0.58", features = [
     "Win32_System_DataExchange",       # clipboard read/write + format listener
     "Win32_System_Memory",             # GlobalLock/GlobalSize/GlobalAlloc on HGLOBAL
     "Win32_UI_WindowsAndMessaging",    # message-only window + WM_CLIPBOARDUPDATE pump
+    # Network egress control (src/netfilter): user-mode WFP BLOCK/PERMIT filters
+    # at ALE_AUTH_CONNECT_V4/V6, plus process enumeration for remote-tool detect.
+    "Win32_NetworkManagement_WindowsFilteringPlatform", # FwpmEngineOpen0/FilterAdd0/FWPM_FILTER0
+    "Win32_NetworkManagement_IpHelper", # owner-PID→conn table (follow-on conn enumeration)
+    "Win32_System_Rpc",                 # GUID/auth types referenced by the Fwpm* signatures
+    "Win32_Security",                   # PSECURITY_DESCRIPTOR + SID (Fwpm*Add0 are security-gated)
+    "Win32_System_Threading",           # OpenProcess/TerminateProcess/QueryFullProcessImageNameW
+    "Win32_System_ProcessStatus",       # EnumProcesses (remote-tool process enumeration)
 ] }
 windows-service = "0.7"
 

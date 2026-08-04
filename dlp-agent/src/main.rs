@@ -19,7 +19,7 @@ mod kguard;
 // integration tests and the binary share one set of types. Re-import the
 // modules at the crate root so the binary submodules keep addressing them as
 // `crate::config` / `crate::storage`.
-use dlp_agent::{clipboard, config, detect, storage, usb};
+use dlp_agent::{browser_host, clipboard, config, detect, netfilter, storage, usb};
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -71,6 +71,14 @@ fn run() -> Result<()> {
         print_clipboard_help();
         return Ok(());
     }
+    if mode == "net-monitor" && args.iter().any(|a| a == "-h" || a == "--help") {
+        print_net_help();
+        return Ok(());
+    }
+    if mode == "browser-host" && args.iter().any(|a| a == "-h" || a == "--help") {
+        print_browserhost_help();
+        return Ok(());
+    }
 
     let config_path =
         std::env::var("DLP_AGENT_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
@@ -99,6 +107,8 @@ fn run() -> Result<()> {
         "usb-monitor" => cmd_usb_monitor(&cfg, &storage, &args)?,
         "usb-guard" => cmd_usb_guard(&cfg, &storage, &args)?,
         "clipboard-monitor" => cmd_clipboard_monitor(&cfg, &storage, &args)?,
+        "net-monitor" => cmd_net_monitor(&cfg, &storage, &args)?,
+        "browser-host" => cmd_browser_host(&cfg, &storage, &args)?,
         other => {
             eprintln!("unknown mode: {other}");
             print_help();
@@ -513,6 +523,196 @@ fn cmd_clipboard_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Re
     Ok(())
 }
 
+/// Load + verify the cached index bundle with the trusted CA (mirrors the
+/// usb/kguard/clipboard `load_verified_bundle`). None → no-policy.
+fn load_verified_bundle(cfg: &Config, storage: &Storage) -> Option<detect::Bundle> {
+    let ca_pem = load_ca(cfg, storage).ok()?;
+    storage
+        .load_index_bundle()
+        .and_then(|bytes| detect::Bundle::load(&bytes, &ca_pem).ok())
+}
+
+/// net-monitor: run the user-mode WFP network-egress control loop. Audit-only by
+/// default (`monitor`); `--enforce <allowlist|blocklist>` turns on live WFP
+/// filter installation (admin required; allowlist can brick a machine). Reuses
+/// the exact incident sink + offline queue as usb-monitor. Network incidents are
+/// metadata-only (no verdict) so the sink LOGS them (channel = "network").
+fn cmd_net_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()> {
+    use netfilter::NetMode;
+
+    // Default to the config mode (which itself defaults to `monitor`); the CLI
+    // `--enforce <mode>` wins over the config.
+    let mut mode = cfg.netfilter.mode;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--enforce" => {
+                let val = it.next().map(|s| s.as_str()).unwrap_or("");
+                mode = match val {
+                    "monitor" => NetMode::Monitor,
+                    "allowlist" => NetMode::Allowlist,
+                    "blocklist" => NetMode::Blocklist,
+                    other => {
+                        eprintln!(
+                            "net-monitor --enforce expects monitor|allowlist|blocklist, got '{other}'"
+                        );
+                        print_net_help();
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "-h" | "--help" => {
+                print_net_help();
+                return Ok(());
+            }
+            other => {
+                eprintln!("unknown net-monitor option: {other}");
+                print_net_help();
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
+    if storage.has_identity() && !queue.is_empty() {
+        let flushed = queue.flush(|body| post_incident_body(cfg, storage, body).map(|_| ()));
+        if flushed > 0 {
+            tracing::info!(flushed, "flushed queued incidents");
+        }
+    }
+
+    // Same sink shape as cmd_usb_monitor. Network incidents carry no verdict, so
+    // usb_incident_body returns None → they are LOGGED locally (metadata only),
+    // never posted (a server-side network-incident schema is a follow-on).
+    let sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+        Some(body) => {
+            if storage.has_identity() {
+                match post_incident_body(cfg, storage, &body) {
+                    Ok(id) => tracing::info!(incident_id = %id, kind = ?inc.kind, "net incident reported"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "net incident post failed — queuing locally");
+                        let _ = queue.enqueue(&body);
+                    }
+                }
+            } else {
+                tracing::warn!(kind = ?inc.kind, "unenrolled — queuing net incident locally");
+                let _ = queue.enqueue(&body);
+            }
+        }
+        None => tracing::info!(
+            kind = ?inc.kind,
+            app = %inc.device.product_name,
+            note = inc.note.as_deref().unwrap_or(""),
+            "net metadata incident (no verdict; not posted)"
+        ),
+    };
+
+    netfilter::run_monitor(cfg, storage, mode, sink);
+    Ok(())
+}
+
+/// browser-host: the Chrome/Edge native-messaging host. Speaks the 4-byte-LE
+/// length-prefixed JSON protocol on stdio, scores each upload with the FROZEN
+/// `detect::verdict`/`verdict_text` against the cached bundle, replies
+/// allow/block/warn, and raises an incident on a match (channel = "web-upload").
+/// Reuses the exact incident sink + offline queue as usb-monitor.
+fn cmd_browser_host(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()> {
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_browserhost_help();
+                return Ok(());
+            }
+            other => {
+                eprintln!("unknown browser-host option: {other}");
+                print_browserhost_help();
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let channel = "web-upload";
+    // Reuse the shared block thresholds (mirror kguard::should_block).
+    let block_at = cfg.kguard.block_at;
+    let coverage_block_at = cfg.kguard.coverage_block_at;
+
+    let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
+    if storage.has_identity() && !queue.is_empty() {
+        let flushed = queue.flush(|body| post_incident_body(cfg, storage, body).map(|_| ()));
+        if flushed > 0 {
+            tracing::info!(flushed, "flushed queued incidents");
+        }
+    }
+
+    // Same sink shape as cmd_usb_monitor: web-upload incidents carry a verdict, so
+    // they POST over mTLS when enrolled, else queue locally (bounded).
+    let mut sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+        Some(body) => {
+            if storage.has_identity() {
+                match post_incident_body(cfg, storage, &body) {
+                    Ok(id) => tracing::info!(incident_id = %id, kind = ?inc.kind, "web-upload incident reported"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "web-upload incident post failed — queuing locally");
+                        let _ = queue.enqueue(&body);
+                    }
+                }
+            } else {
+                tracing::warn!(kind = ?inc.kind, "unenrolled — queuing web-upload incident locally");
+                let _ = queue.enqueue(&body);
+            }
+        }
+        None => tracing::info!(kind = ?inc.kind, "web-upload metadata incident (no verdict; not posted)"),
+    };
+
+    let bundle = load_verified_bundle(cfg, storage);
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+
+    match bundle {
+        Some(b) => {
+            tracing::info!("browser-host started (bundle cached) — reading native messages");
+            browser_host::serve(
+                &mut reader,
+                &mut writer,
+                block_at,
+                coverage_block_at,
+                channel,
+                |t| detect::verdict_text(t, &b),
+                |p| detect::verdict(p, &b),
+                &mut sink,
+            )?;
+        }
+        None => {
+            // No policy bundle: we cannot score. Fail-OPEN (allow) so the browser
+            // is never bricked — audit-only until a bundle is present. Honest,
+            // documented limitation (a fail-secure knob is a follow-on).
+            tracing::warn!(
+                "no verified index bundle cached — browser-host allows all uploads (audit-only)"
+            );
+            let clean = || detect::Verdict {
+                file_name: String::new(),
+                file_sha256: String::new(),
+                extraction: detect::Extraction::Ok { format: "none".into() },
+                idm: Vec::new(),
+                edm: Vec::new(),
+            };
+            browser_host::serve(
+                &mut reader,
+                &mut writer,
+                block_at,
+                coverage_block_at,
+                channel,
+                |_t| clean(),
+                |_p| Ok(clean()),
+                &mut sink,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn print_status(storage: &Storage) -> Result<()> {
     if !storage.has_identity() {
         println!("not enrolled");
@@ -554,11 +754,13 @@ fn extract_cert_pem(identity: &[u8]) -> Option<String> {
 }
 
 fn print_help() {
-    println!("dlp-agent <enroll|once|run|status|index-update|scan|usb-monitor|usb-guard|clipboard-monitor>");
+    println!("dlp-agent <enroll|once|run|status|index-update|scan|usb-monitor|usb-guard|clipboard-monitor|net-monitor|browser-host>");
     println!("  scan --bundle <path> --file <path> [--json] [--report --channel <name>]");
     println!("  usb-monitor [--enforce]   watch removable media; audit copies (see --help)");
     println!("  usb-guard                 answer the kernel minifilter's scan port (see --help)");
     println!("  clipboard-monitor [--enforce]  watch the clipboard; audit copies (see --help)");
+    println!("  net-monitor [--enforce <monitor|allowlist|blocklist>]  WFP network egress (see --help)");
+    println!("  browser-host              Chrome/Edge native-messaging upload host (see --help)");
     println!("  config: $DLP_AGENT_CONFIG or {DEFAULT_CONFIG}");
     println!("  env overrides: DLP_AGENT_SERVER_URL, DLP_AGENT_TOKEN, DLP_AGENT_CA_CERT, DLP_AGENT_STATE_DIR");
 }
@@ -613,6 +815,52 @@ fn print_usbguard_help() {
     println!("  Incidents post over mTLS when enrolled, else queue locally (bounded).");
     println!("  Config: optional [kguard] section (block_at, coverage_block_at, fail_block,");
     println!("  channel_label).");
+}
+
+fn print_net_help() {
+    println!("dlp-agent net-monitor [--enforce <monitor|allowlist|blocklist>]");
+    println!("  User-mode WFP network-egress control (Tier-2 plan §2). Judges outbound");
+    println!("  connections by app-id / remote IP-CIDR / remote port and a built-in");
+    println!("  remote-access-tool set (AnyDesk, TeamViewer, VNC, Chrome Remote Desktop,");
+    println!("  RDP-out, Splashtop, LogMeIn) — matched PRIMARILY by process image name.");
+    println!("  Modes:");
+    println!("    monitor   (DEFAULT, audit-only) add NO blocking filters; enumerate and");
+    println!("              log the verdict we WOULD apply. Never blocks — cannot brick.");
+    println!("    blocklist default-PERMIT; BLOCK only matched dests/apps/remote-tools.");
+    println!("    allowlist default-DENY; PERMIT only approved dests/apps, BLOCK the rest.");
+    println!("  --enforce <mode>  install LIVE WFP BLOCK/PERMIT filters (FwpmFilterAdd0).");
+    println!("              REQUIRES administrator/SYSTEM. A DYNAMIC session is used so all");
+    println!("              our filters auto-remove when this process exits.");
+    println!("  !! DoS WARNING: 'allowlist' is default-DENY. An incomplete allowlist WILL");
+    println!("     break connectivity (a self-inflicted denial of service). Ship 'monitor',");
+    println!("     move to 'allowlist' only with a vetted permit set. This is why the");
+    println!("     default is audit-only and enforcement must be explicitly requested.");
+    println!("  HONEST LIMITS (plan §0): this blocks a process's socket connect. It does");
+    println!("     NOT stop a screen already being VIEWED over VNC/AnyDesk (the analog");
+    println!("     hole), a privileged/SYSTEM payload that unhooks the agent, or encrypted");
+    println!("     exfil to an ALLOWED destination (content-blind). Live filter add + live");
+    println!("     process kill are operator-manual (admin/VM); only the pure rule engine,");
+    println!("     remote-tool matcher, and WFP filter-spec dry-run are verified in tests.");
+    println!("  Incidents are metadata only (app/ip/port/tool) — never packet contents.");
+    println!("  Config: the optional [netfilter] section (mode, channel_label,");
+    println!("  remote_tool_action, remote_tool_overrides, persist, [[netfilter.rules]]).");
+}
+
+fn print_browserhost_help() {
+    println!("dlp-agent browser-host");
+    println!("  Chrome/Edge native-messaging host for the web-upload channel (Tier-2");
+    println!("  plan §3). Speaks the native-messaging protocol on stdio: a 4-byte");
+    println!("  little-endian length prefix + UTF-8 JSON. The force-installed MV3");
+    println!("  extension intercepts file/drag-drop/fetch uploads and sends them here;");
+    println!("  this host scores them with detect::verdict/verdict_text against the cached");
+    println!("  bundle and replies allow/block/warn. A block cancels the upload.");
+    println!("  Launched by the browser (not run interactively). Register the native-host");
+    println!("  manifest per the extension's install docs.");
+    println!("  Incidents carry hashes/verdict + url/origin metadata ONLY — never the");
+    println!("  uploaded content — and post over mTLS when enrolled (channel=\"web-upload\").");
+    println!("  With no cached bundle the host allows all uploads (audit-only) so the");
+    println!("  browser is never bricked. True end-to-end needs a real browser (MANUAL).");
+    println!("  Thresholds: [kguard] block_at / coverage_block_at.");
 }
 
 fn print_scan_help() {

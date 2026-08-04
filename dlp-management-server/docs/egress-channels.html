@@ -66,10 +66,18 @@
     <div class="stat"><div class="n">Breadth &gt; depth</div><div class="l">a perfect USB blocker beside an open upload path stops nothing determined</div></div>
     <div class="stat"><div class="n">Honest scope</div><div class="l">4 channel classes are named as out-of-scope, not hidden</div></div>
   </div>
-  <p style="margin-top:14px"><span class="pill plan">● Design &amp; roadmap — Tier 1 built (except print)</span></p>
+  <p style="margin-top:14px"><span class="pill plan">● Tier 1 built (except print) · Tier 2 core built</span></p>
 </header>
 
-<div class="blue"><b>Build status — 2026-08-04.</b> <b>Tier 1 is built except print (⑥).</b>
+<div class="blue"><b>Build status — 2026-08-05.</b> <b>Tier 2 core built (③ network egress control
+via user-mode WFP, ⑧ remote-access-tool block/kill for AnyDesk/TeamViewer/VNC/RDP, B4 fail-secure,
+④ browser upload hook — extension + native host).</b> All compile/test-verified; live WFP enforce,
+process kill, and browser end-to-end are operator-manual (admin/VM/real browser). <b>Honest limit:</b>
+this contains most exfil but does NOT make it impossible — screen-view (analog hole), privileged
+payloads (EDR's job), and encrypted-to-allowed-destination remain. WFP content callout + Outlook +
+TLS proxy are design-only follow-ons. Details: <code>DONE-2026-08-05.md</code>,
+<code>dlp-agent/docs/tier2-plan.md</code>.<br><br>
+<b>Tier 1 is built except print (⑥).</b>
 ① <b>Minifilter</b>: compiles/links/analyzes to a valid <code>dlpflt.sys</code>; covers removable +
 SMB + fixed/sync volumes (fixed only when a watch-set is configured). ② <b>Device control</b>:
 USB allow/read-only/block + MTP/WPD block + USB-tethering block (build-verified). ⑤ <b>Clipboard</b>:

@@ -7,8 +7,10 @@
 //! with non-Windows stubs, so the library still builds and its pure logic still
 //! runs cross-platform (the golden-vector tests are cross-platform).
 
+pub mod browser_host;
 pub mod clipboard;
 pub mod config;
 pub mod detect;
+pub mod netfilter;
 pub mod storage;
 pub mod usb;
