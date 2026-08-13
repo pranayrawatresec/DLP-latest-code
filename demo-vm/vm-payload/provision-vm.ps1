@@ -133,38 +133,33 @@ Write-Host "driver: loaded -> $alt"
 & "$Base\dlp-agent.exe" index-update  ; if ($LASTEXITCODE -ne 0) { throw "index-update failed" }
 & "$Base\dlp-agent.exe" status
 
-# --- 5. usb-guard as a hidden SYSTEM task, at boot, with restart loop ----------
-# (Stand-in for the future real Windows service.) The wrapper loop restarts the
-# guard if it ever exits; while it is down the driver's FailMode=1 denies all
-# removable writes, so a crash can never become an exfil window.
-$loop = "while(`$true){ & '$Base\dlp-agent.exe' usb-guard; Start-Sleep -Seconds 5 }"
-$action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-           -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$loop`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-           -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName "DLP Agent Guard" -Action $action -Trigger $trigger `
-    -Settings $settings -User "SYSTEM" -RunLevel Highest -Force | Out-Null
-Start-ScheduledTask -TaskName "DLP Agent Guard"
-Write-Host "usb-guard: registered as SYSTEM startup task and started"
-
-# Also keep the check-in heartbeat + bundle refresh alive (product behaviour:
-# agent stays current with new policy bundles without anyone touching the PC).
-$hb = "while(`$true){ & '$Base\dlp-agent.exe' index-update; Start-Sleep -Seconds 300 }"
-$hbAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-            -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$hb`""
-Register-ScheduledTask -TaskName "DLP Agent Heartbeat" -Action $hbAction -Trigger $trigger `
-    -Settings $settings -User "SYSTEM" -RunLevel Highest -Force | Out-Null
-Start-ScheduledTask -TaskName "DLP Agent Heartbeat"
+# --- 5. install the unified DLPAgent Windows service ---------------------------
+# ONE supervised LocalSystem service (run-endpoint) that hosts the kernel guard +
+# user-mode sealer + check-in + whitelist re-sync as coordinated threads sharing
+# one whitelist view and one sealer-liveness signal. Replaces the old two
+# scheduled tasks (guard + heartbeat) and the separate usb-monitor. The guard
+# stands aside for the in-process sealer only while the sealer is healthy;
+# otherwise a seal-eligible write is BLOCKED (fail secure). Depends on FltMgr.
+# Remove any prior task-based install so the two approaches never both run.
+foreach ($t in @("DLP Agent Guard", "DLP Agent Heartbeat")) {
+    try { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+}
+# Re-install cleanly (ignore "not present" on first run).
+try { & "$Base\dlp-agent.exe" uninstall-service | Out-Null } catch {}
+& "$Base\dlp-agent.exe" install-service ; if ($LASTEXITCODE -ne 0) { throw "install-service failed" }
+sc.exe start DLPAgent | Out-Null
+Write-Host "service: DLPAgent installed (auto-start, LocalSystem) and started"
 
 # --- 6. verify ------------------------------------------------------------------
-Start-Sleep -Seconds 3
-$guardProc = Get-CimInstance Win32_Process -Filter "Name='dlp-agent.exe'" |
-             Where-Object { $_.CommandLine -match 'usb-guard' }
-if ($guardProc) {
+Start-Sleep -Seconds 4
+$svc = Get-Service -Name DLPAgent -ErrorAction SilentlyContinue
+if ($svc -and $svc.Status -eq 'Running') {
     Write-Host ""
-    Write-Host "PROVISIONED OK - usb-guard running as PID $($guardProc.ProcessId) (SYSTEM)."
-    Write-Host "Reboot survives. Demo: log in as any user, plug USB, copy the OPORD -> BLOCKED + toast."
+    Write-Host "PROVISIONED OK - DLPAgent service Running (guard + sealer + check-in + re-sync)."
+    Write-Host "Reboot survives. Logs: $Base\logs\dlp-agent.log"
+    Write-Host "Whitelist a stick in the console (Trusted USB devices); the service syncs it live."
 } else {
-    Write-Warning "usb-guard process not found - check Task Scheduler > 'DLP Agent Guard' last run result."
+    $st = if ($svc) { $svc.Status } else { "not installed" }
+    Write-Warning "DLPAgent service is '$st' - check '$Base\logs\dlp-agent.log' and 'sc query DLPAgent'."
 }

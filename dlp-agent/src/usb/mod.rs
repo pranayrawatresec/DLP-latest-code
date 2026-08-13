@@ -41,12 +41,14 @@ pub use watch::{diff_volumes, VolumeEvent, VolumeWatcher};
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::detect::{self, Bundle, Verdict};
 use crate::storage::Storage;
+use crate::supervise::{snapshot_config, SealerHealth};
 use crate::trustdest::{BlockBandPolicy, EncryptMode};
 
 /// Number of bounded scan workers for bulk copies (spec §3.5: 2–4, never one
@@ -91,28 +93,45 @@ struct VolumeAuditor {
 /// real `seal_file_in_place` with the dev keyring (main.rs); on any sealer
 /// error the plaintext is kept and an `EnforcementFailed` incident is raised
 /// (fail secure — see `scan_and_seal_to_incident`).
-pub fn run_monitor<R, S>(cfg: &Config, storage: &Storage, enforce: bool, sealer: S, mut report: R)
-where
+///
+/// `shared_cfg` is read fresh at the top of each poll so a live whitelist
+/// re-sync (run-endpoint) takes effect without a restart; the standalone
+/// `usb-monitor` wraps its fixed merged config the same way. `health` (Some only
+/// under run-endpoint) is marked alive on EVERY poll — including an idle poll
+/// that seals nothing — so the guard can fail secure when this thread dies;
+/// `stop` (Some only under run-endpoint) requests a graceful exit between polls.
+#[allow(clippy::too_many_arguments)]
+pub fn run_monitor<R, S>(
+    shared_cfg: &Arc<RwLock<Config>>,
+    storage: &Storage,
+    enforce: bool,
+    health: Option<&Arc<SealerHealth>>,
+    stop: Option<&Arc<AtomicBool>>,
+    sealer: S,
+    mut report: R,
+) where
     R: FnMut(UsbIncident),
     S: Fn(&Path, &str) -> anyhow::Result<audit::SealOutcome>,
 {
-    let usb = &cfg.usb;
-    if !usb.enabled {
+    let mode = if enforce { Mode::Live } else { Mode::DryRun };
+
+    // One-time startup: bundle load + logging use an initial snapshot; per-poll
+    // config below is re-snapshotted so a live re-sync is picked up.
+    let initial = snapshot_config(shared_cfg);
+    if !initial.usb.enabled {
         tracing::warn!("usb channel disabled in config ([usb] enabled=false) — monitor idle");
     }
-    let policy = usb.to_policy();
-    let mode = if enforce { Mode::Live } else { Mode::DryRun };
     tracing::info!(
         enforce,
-        default_action = ?policy.default_action,
-        rules = policy.rules.len(),
-        poll_secs = usb.poll_interval_secs,
+        default_action = ?initial.usb.default_action,
+        rules = initial.usb.rules.len(),
+        poll_secs = initial.usb.poll_interval_secs,
         "usb monitor starting"
     );
 
     // Load the cached, verified bundle once. None → audit logs "no-policy" and
     // scans are skipped; enforce mode still fails secure via the default action.
-    let bundle = load_verified_bundle(cfg, storage);
+    let bundle = load_verified_bundle(&initial, storage);
     if bundle.is_none() {
         tracing::warn!("no verified index bundle cached — usb audit runs in no-policy mode");
     }
@@ -120,15 +139,29 @@ where
 
     let mut watcher = VolumeWatcher::new();
     let mut auditors: HashMap<String, VolumeAuditor> = HashMap::new();
-    // EncryptSensitive verdict bands: encrypt_at from [crypto], block band from
-    // [kguard] (one source of truth — the whitelist never weakens blocking).
-    let bands = cfg.encrypt_bands();
     let start = Instant::now();
-    let poll = Duration::from_secs(usb.poll_interval_secs.max(1));
-    let settle_ms = usb.settle_ms;
-    let settle_timeout_ms = usb.settle_timeout_secs.saturating_mul(1000);
 
     loop {
+        // Graceful shutdown between polls (run-endpoint stop signal).
+        if let Some(s) = stop {
+            if s.load(Ordering::Relaxed) {
+                tracing::info!("usb sealer stop signalled — ending monitor loop");
+                return;
+            }
+        }
+
+        // Fresh effective-config snapshot each poll so a live whitelist re-sync
+        // takes effect without a restart. `cfg` shadows for this iteration.
+        let cfg = snapshot_config(shared_cfg);
+        let usb = &cfg.usb;
+        let policy = usb.to_policy();
+        // EncryptSensitive verdict bands: encrypt_at from [crypto], block band
+        // from [kguard] (one source of truth — the whitelist never weakens
+        // blocking).
+        let bands = cfg.encrypt_bands();
+        let poll = Duration::from_secs(usb.poll_interval_secs.max(1));
+        let settle_ms = usb.settle_ms;
+        let settle_timeout_ms = usb.settle_timeout_secs.saturating_mul(1000);
         let now_ms = start.elapsed().as_millis() as u64;
 
         // 1. Detect arrivals/removals.
@@ -268,6 +301,12 @@ where
             }
             // No-policy mode on a non-encrypt volume: the poll above already
             // drained the settle state; nothing to match against, no scan.
+        }
+
+        // 3. Liveness: this poll completed, so the sealer is alive — even if it
+        // sealed nothing. The guard reads this to fail secure when we die.
+        if let Some(h) = health {
+            h.mark_alive();
         }
 
         std::thread::sleep(poll);

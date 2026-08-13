@@ -15,6 +15,7 @@ mod client;
 mod enroll;
 mod identity;
 mod kguard;
+mod service;
 
 // Config, Storage, detection and the USB channel live in the library crate so
 // integration tests and the binary share one set of types. Re-import the
@@ -22,12 +23,13 @@ mod kguard;
 // `crate::config` / `crate::storage`.
 use dlp_agent::{
     browser_host, clipboard, config, crypto, decrypt, detect, exfil, netfilter, notify, storage,
-    trustdest, trustsync, usb,
+    supervise, trustdest, trustsync, usb,
 };
 
 use anyhow::{Context, Result};
 use config::Config;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use storage::Storage;
 use usb::{ActionTaken, UsbIncident};
@@ -39,6 +41,21 @@ const DEFAULT_CONFIG: &str = r"C:\ProgramData\DLPAgent\agent.toml";
 const RETRY_SECONDS: u64 = 30;
 
 fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+
+    // The SCM launches `dlp-agent service-run` with NO console attached. Do not
+    // init console logging on that path — the service dispatcher sets up rolling
+    // FILE logging under C:\ProgramData\DLPAgent\logs instead. Every interactive
+    // subcommand keeps console logging (below).
+    #[cfg(windows)]
+    if mode == "service-run" {
+        if let Err(e) = service::run_dispatcher() {
+            eprintln!("service dispatcher failed: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     tracing_subscriber::fmt()
         .with_target(false)
         .with_max_level(tracing::Level::INFO)
@@ -125,6 +142,14 @@ fn run() -> Result<()> {
         "net-monitor" => cmd_net_monitor(&cfg, &storage, &args)?,
         "browser-host" => cmd_browser_host(&cfg, &storage, &args)?,
         "decrypt" => cmd_decrypt(&cfg, &storage, &args)?,
+        "run-endpoint" => cmd_run_endpoint(&cfg, &storage)?,
+        "install-service" => service::install()?,
+        "uninstall-service" => service::uninstall()?,
+        "service-run" => {
+            // On Windows this is intercepted in main() and never reaches here; on
+            // other platforms it is meaningless.
+            anyhow::bail!("service-run is only invoked by the Windows Service Control Manager")
+        }
         other => {
             eprintln!("unknown mode: {other}");
             print_help();
@@ -175,6 +200,14 @@ fn load_ca(cfg: &Config, storage: &Storage) -> Result<Vec<u8>> {
 fn cmd_index_update(cfg: &Config, storage: &Storage) -> Result<()> {
     ensure_enrolled(cfg, storage)?;
     let outcome = checkin::checkin_full(cfg, storage)?;
+    update_index_bundle(cfg, storage, outcome.index_latest)
+}
+
+/// Fetch + verify + swap the index bundle if `index_latest` is newer than the
+/// cached one. Shared by `index-update` and the `run-endpoint` check-in worker.
+/// A bundle that fails signature/parse NEVER replaces the cached one (fail
+/// secure). Requires enrollment (loads the identity for the mTLS download).
+fn update_index_bundle(cfg: &Config, storage: &Storage, index_latest: u64) -> Result<()> {
     let (identity_pem, ca_pem) = storage.load_identity()?;
 
     // Current version = whatever the cached bundle verifiably says; a
@@ -185,16 +218,16 @@ fn cmd_index_update(cfg: &Config, storage: &Storage) -> Result<()> {
         .map(|b| b.version())
         .unwrap_or(0);
 
-    if outcome.index_latest == 0 {
+    if index_latest == 0 {
         tracing::info!("server has no index bundle yet");
         return Ok(());
     }
-    if outcome.index_latest <= current {
+    if index_latest <= current {
         tracing::info!(version = current, "index bundle already up to date");
         return Ok(());
     }
 
-    tracing::info!(have = current, latest = outcome.index_latest, "fetching index bundle");
+    tracing::info!(have = current, latest = index_latest, "fetching index bundle");
     let client = client::checkin_client(&ca_pem, &identity_pem)?;
     let resp = client
         .get(cfg.index_url())
@@ -505,49 +538,20 @@ fn cmd_usb_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Result<(
         ),
     };
 
-    // Trusted-destination sealer (encrypt-on-write M3/M6). PREFER the synced
-    // DPAPI keyring at rest (written by sync_trusted_config above) over the dev
-    // [crypto] keyfile; the keyfile is only a fallback for when no synced
-    // keyring exists yet. Fail secure: with no keyring the sealer errors on
-    // every call, so files on Encrypt volumes stay plaintext but every one
-    // raises an EnforcementFailed incident — never a silent pass. Decrypt/seal
-    // are offline: the cached keyring is the only key source on the hot path
-    // (project decision). Errors carry ids/lengths only — NEVER key material.
-    let keyring: Option<crypto::Keyring> = match storage.load_keyring() {
-        Ok(Some(bytes)) => {
-            let bytes = zeroize::Zeroizing::new(bytes);
-            match crypto::Keyring::from_dev_json(&bytes) {
-                Ok(ring) => Some(ring),
-                Err(e) => {
-                    tracing::warn!(error = %e, "synced keyring unusable — falling back to dev keyfile");
-                    load_dev_keyring(&cfg.crypto.keyfile)
-                }
-            }
-        }
-        Ok(None) => load_dev_keyring(&cfg.crypto.keyfile),
-        Err(e) => {
-            tracing::warn!(error = %e, "sealed keyring unreadable — falling back to dev keyfile");
-            load_dev_keyring(&cfg.crypto.keyfile)
-        }
-    };
-    // origin_agent = the enrolled agent id (never the hostname, spec §4).
-    let agent_id = storage
-        .load_meta()
-        .map(|m| m.agent_id)
-        .unwrap_or_else(|_| "unenrolled".to_string());
-    let sealer = move |path: &std::path::Path, key_id: &str| -> anyhow::Result<usb::SealOutcome> {
-        let ring = keyring
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no keyring loaded ([crypto] keyfile unset or unreadable)"))?;
-        let kek = ring.lookup(key_id).map_err(anyhow::Error::new)?;
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        usb::seal_file_in_place(path, kek, &agent_id, now_unix)
-    };
+    // Trusted-destination sealer (encrypt-on-write M3/M6). See
+    // `build_sealer_keyring` / `make_sealer` for the keyring resolution + seal
+    // closure (shared with `run-endpoint`). Fail secure: with no keyring the
+    // sealer errors on every call, so files on Encrypt volumes stay plaintext
+    // but every one raises an EnforcementFailed incident — never a silent pass.
+    let keyring = build_sealer_keyring(cfg, storage);
+    let sealer = make_sealer(keyring, agent_id_of(storage));
 
-    usb::run_monitor(cfg, storage, enforce, sealer, sink);
+    // Standalone usb-monitor: wrap the (fixed) merged config so it shares the
+    // same `run_monitor` code path as run-endpoint. No in-process guard reads
+    // this signal here, so no liveness signal and no stop signal are passed —
+    // today's foreground behaviour is preserved exactly.
+    let shared = Arc::new(RwLock::new(cfg.clone()));
+    usb::run_monitor(&shared, storage, enforce, None, None, sealer, sink);
     Ok(())
 }
 
@@ -616,7 +620,409 @@ fn cmd_usb_guard(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
         ),
     };
 
-    kguard::run(cfg, storage, sink)
+    // Standalone usb-guard: wrap the (fixed) merged config to share the guard
+    // code path with run-endpoint. It has NO in-process sealer, so it passes NO
+    // liveness signal — the guard then treats the sealer as "healthy" and keeps
+    // TODAY's allow-pending-seal behaviour for whitelisted Encrypt destinations
+    // (deliberately NOT regressed; a standalone guard without a sealer is the
+    // operator's debugging tool, and the kernel FailMode remains the backstop).
+    let shared = Arc::new(RwLock::new(cfg.clone()));
+    kguard::run(&shared, storage, None, None, sink)
+}
+
+/// The enrolled agent id used as `origin_agent` in sealed envelopes (never the
+/// hostname, spec §4). "unenrolled" until an identity exists.
+fn agent_id_of(storage: &Storage) -> String {
+    storage
+        .load_meta()
+        .map(|m| m.agent_id)
+        .unwrap_or_else(|_| "unenrolled".to_string())
+}
+
+/// Resolve the sealer keyring (encrypt-on-write M3/M6), shared by `usb-monitor`
+/// and `run-endpoint`. PREFERS the synced DPAPI keyring at rest (written by
+/// `sync_trusted_config`) over the dev `[crypto] keyfile`; the keyfile is only a
+/// fallback for when no synced keyring exists yet. `None` ⇒ no usable keyring
+/// (sealing then fails secure per call). Errors carry ids/lengths only — NEVER
+/// key material.
+fn build_sealer_keyring(cfg: &Config, storage: &Storage) -> Option<crypto::Keyring> {
+    match storage.load_keyring() {
+        Ok(Some(bytes)) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            match crypto::Keyring::from_dev_json(&bytes) {
+                Ok(ring) => Some(ring),
+                Err(e) => {
+                    tracing::warn!(error = %e, "synced keyring unusable — falling back to dev keyfile");
+                    load_dev_keyring(&cfg.crypto.keyfile)
+                }
+            }
+        }
+        Ok(None) => load_dev_keyring(&cfg.crypto.keyfile),
+        Err(e) => {
+            tracing::warn!(error = %e, "sealed keyring unreadable — falling back to dev keyfile");
+            load_dev_keyring(&cfg.crypto.keyfile)
+        }
+    }
+}
+
+/// Build the injected seal-in-place closure for `usb::run_monitor`
+/// (`(path, key_id) → SealOutcome`). `None` keyring ⇒ every call errors (fail
+/// secure — the copy auditor keeps the plaintext and raises EnforcementFailed).
+fn make_sealer(
+    keyring: Option<crypto::Keyring>,
+    agent_id: String,
+) -> impl Fn(&Path, &str) -> anyhow::Result<usb::SealOutcome> {
+    move |path: &Path, key_id: &str| -> anyhow::Result<usb::SealOutcome> {
+        let ring = keyring
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no keyring loaded ([crypto] keyfile unset or unreadable)"))?;
+        let kek = ring.lookup(key_id).map_err(anyhow::Error::new)?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        usb::seal_file_in_place(path, kek, &agent_id, now_unix)
+    }
+}
+
+/// Deliver one incident through the shared funnel: fire the endpoint toast (gated
+/// internally on an actual block), then POST over mTLS when enrolled, else queue
+/// on disk (bounded). Metadata-only incidents (no verdict) are logged. Used by
+/// the `run-endpoint` worker sinks (the standalone commands keep their inline
+/// sinks). `cfg` is a fresh snapshot so live config (notify verbosity, channel)
+/// applies.
+fn deliver_incident(
+    cfg: &Config,
+    storage: &Storage,
+    queue: &usb::queue::IncidentQueue,
+    inc: &UsbIncident,
+) {
+    match incident_wire_body(cfg, inc) {
+        Some(body) => {
+            if storage.has_identity() {
+                match post_incident_body(cfg, storage, &body) {
+                    Ok(id) => {
+                        tracing::info!(incident_id = %id, kind = ?inc.kind, "incident reported")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "incident post failed — queuing locally");
+                        let _ = queue.enqueue(&body);
+                    }
+                }
+            } else {
+                tracing::warn!(kind = ?inc.kind, "unenrolled — queuing incident locally");
+                let _ = queue.enqueue(&body);
+            }
+        }
+        None => tracing::info!(
+            kind = ?inc.kind,
+            note = inc.note.as_deref().unwrap_or(""),
+            "metadata incident (no verdict; not posted)"
+        ),
+    }
+}
+
+/// Load the effective config + storage the way `run()` does — used by the
+/// Windows service dispatcher, which has no `run()` context of its own.
+fn load_cfg_and_storage() -> Result<(Config, Storage)> {
+    let config_path =
+        std::env::var("DLP_AGENT_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+    let cfg = Config::load(&PathBuf::from(config_path)).context("loading config")?;
+    let storage = Storage::new(cfg.state_dir.clone());
+    Ok((cfg, storage))
+}
+
+/// run-endpoint: the unified, supervised deployable unit (Windows-only). Runs
+/// the kernel guard, the user-mode sealer, the check-in heartbeat, and a
+/// periodic whitelist re-sync as coordinated threads in ONE process, sharing ONE
+/// live merged-config view and the sealer-liveness signal. Foreground use is for
+/// debugging; the Windows service (`install-service` / SCM) runs the same code.
+fn cmd_run_endpoint(cfg: &Config, storage: &Storage) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // No console Ctrl-C handler is wired (avoids a new dependency): in the
+        // foreground this runs until the process is killed; as a service the SCM
+        // supplies the stop signal (see `service.rs`).
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        run_endpoint(cfg, storage, stop)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cfg, storage);
+        anyhow::bail!("run-endpoint (kernel guard + sealer) is only available on Windows")
+    }
+}
+
+/// The run-endpoint supervisor (Windows). Spawns and supervises the four worker
+/// threads and blocks until `stop` is set (by the SCM control handler, or never
+/// in the foreground). A panic in any worker is caught and the worker restarted;
+/// a dead sealer thread stops marking itself alive, so the guard fails secure
+/// automatically after `sealer_health_timeout_secs`.
+#[cfg(windows)]
+fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use supervise::SealerHealth;
+
+    // Best-effort enrollment; workers queue incidents offline and check-in
+    // retries, so an unreachable server here never blocks startup (fail secure).
+    if let Err(e) = ensure_enrolled(cfg, storage) {
+        tracing::warn!(error = %e, "run-endpoint: enrollment not complete — starting anyway (workers will retry/queue)");
+    }
+
+    // Initial merged config from a sync (fail-soft to the last-persisted
+    // whitelist), shared live with the guard + sealer and swapped by the resync
+    // worker so UI whitelist changes propagate WITHOUT a restart.
+    let _ = checkin::sync_trusted_config(cfg, storage);
+    let synced = checkin::load_synced_destinations(storage);
+    let effective = cfg.with_synced_destinations(&synced);
+    let shared: Arc<RwLock<Config>> = Arc::new(RwLock::new(effective));
+
+    // Sealer liveness: keyring presence is the strong startup signal; liveness is
+    // marked by the sealer on every poll. Guard reads both to fail secure.
+    let keyring_present = build_sealer_keyring(cfg, storage).is_some();
+    let health = Arc::new(SealerHealth::new(keyring_present));
+
+    let base_cfg = cfg.clone();
+    let state_dir = cfg.state_dir.clone();
+
+    tracing::info!(keyring_present, "run-endpoint: starting guard + sealer + check-in + resync");
+
+    let mut handles = Vec::new();
+
+    // (a) GUARD — one \DlpFltPort connection (this process is the skip-self PID).
+    {
+        let shared = shared.clone();
+        let health = health.clone();
+        let stop_w = stop.clone();
+        let state_dir = state_dir.clone();
+        // Guard blocks in FilterGetMessage, so it is NOT joined at stop; the
+        // process exit on service stop tears it down. It IS restarted on panic /
+        // port close by the supervisor.
+        let _guard = supervised_thread("guard", stop.clone(), Duration::from_secs(3), move || {
+            let storage = Storage::new(state_dir.clone());
+            let queue = usb::queue::IncidentQueue::new(&state_dir);
+            let shared_s = shared.clone();
+            let mut sink = |inc: UsbIncident| {
+                let snap = supervise::snapshot_config(&shared_s);
+                deliver_incident(&snap, &storage, &queue, &inc);
+            };
+            if let Err(e) = kguard::run(&shared, &storage, Some(&health), Some(&stop_w), &mut sink) {
+                tracing::warn!(error = %e, "guard ended (driver not loaded?) — supervisor will retry");
+            }
+        });
+    }
+
+    // (b) SEALER — usb volume poll+seal loop; marks liveness each poll.
+    {
+        let shared = shared.clone();
+        let health = health.clone();
+        let stop_w = stop.clone();
+        let state_dir = state_dir.clone();
+        handles.push(supervised_thread("sealer", stop.clone(), Duration::from_secs(3), move || {
+            let storage = Storage::new(state_dir.clone());
+            let queue = usb::queue::IncidentQueue::new(&state_dir);
+            // Rebuild the keyring each attempt (a resync may have refreshed keys)
+            // and refresh the presence signal accordingly.
+            let snap = supervise::snapshot_config(&shared);
+            let keyring = build_sealer_keyring(&snap, &storage);
+            health.set_keyring_present(keyring.is_some());
+            let sealer = make_sealer(keyring, agent_id_of(&storage));
+            let shared_s = shared.clone();
+            let mut sink = |inc: UsbIncident| {
+                let snap = supervise::snapshot_config(&shared_s);
+                deliver_incident(&snap, &storage, &queue, &inc);
+            };
+            // enforce = FALSE — deliberate. The required behaviour is PER-FILE,
+            // content-based: on a non-whitelisted stick a clean file must still
+            // copy and only sensitive files are blocked (by the kernel guard),
+            // and on a whitelisted stick sensitive files are sealed. Device-level
+            // enforcement (enforce = true) would apply `default_action` (default
+            // ReadOnly) to a whole non-whitelisted device, blocking even clean
+            // copies — violating that matrix. Sealing does NOT depend on this flag
+            // (the encrypt auditor is created regardless), so run-endpoint keeps
+            // device control OFF and lets the guard do the per-file blocking.
+            // NOTE: this also leaves the user-mode MTP/USB-tethering device blocks
+            // (which live behind `enforce`) OFF — out of scope of the content
+            // matrix; revisit if phone/tethering device-control is wanted.
+            usb::run_monitor(&shared, &storage, false, Some(&health), Some(&stop_w), sealer, &mut sink);
+        }));
+    }
+
+    // (c) CHECK-IN — heartbeat + index-update (folds in the old heartbeat task).
+    {
+        let shared = shared.clone();
+        let stop_w = stop.clone();
+        let state_dir = state_dir.clone();
+        handles.push(supervised_thread("checkin", stop.clone(), Duration::from_secs(5), move || {
+            let storage = Storage::new(state_dir.clone());
+            loop {
+                if stop_w.load(Ordering::Relaxed) {
+                    break;
+                }
+                let snap = supervise::snapshot_config(&shared);
+                let interval = match checkin::checkin_full(&snap, &storage) {
+                    Ok(outcome) => {
+                        if let Err(e) = update_index_bundle(&snap, &storage, outcome.index_latest) {
+                            tracing::warn!(error = %e, "index-update failed (will retry next check-in)");
+                        }
+                        outcome.interval_seconds.max(5)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "check-in failed; enforcing cached policy, will retry");
+                        RETRY_SECONDS
+                    }
+                };
+                sleep_interruptible(interval, &stop_w);
+            }
+        }));
+    }
+
+    // (d) RESYNC — re-pull the whitelist/keys and swap the shared config so both
+    // guard and sealer pick up UI changes without a restart.
+    {
+        let shared = shared.clone();
+        let health = health.clone();
+        let stop_w = stop.clone();
+        let state_dir = state_dir.clone();
+        let resync_secs = base_cfg.checkin_interval_seconds.max(30);
+        handles.push(supervised_thread("resync", stop.clone(), Duration::from_secs(5), move || {
+            let storage = Storage::new(state_dir.clone());
+            loop {
+                if stop_w.load(Ordering::Relaxed) {
+                    break;
+                }
+                sleep_interruptible(resync_secs, &stop_w);
+                if stop_w.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = checkin::sync_trusted_config(&base_cfg, &storage);
+                let synced = checkin::load_synced_destinations(&storage);
+                let new_effective = base_cfg.with_synced_destinations(&synced);
+                health.set_keyring_present(build_sealer_keyring(&base_cfg, &storage).is_some());
+                match shared.write() {
+                    Ok(mut w) => *w = new_effective,
+                    Err(p) => *p.into_inner() = new_effective,
+                }
+                tracing::info!("resynced trusted config — guard + sealer will use it live");
+            }
+        }));
+    }
+
+    // Block until stop, then let the cooperative workers wind down.
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    tracing::info!("run-endpoint: stop signalled — waiting for workers");
+    for h in handles {
+        let _ = h.join();
+    }
+    tracing::info!("run-endpoint: stopped");
+    Ok(())
+}
+
+/// Spawn a supervised worker: run `body` in a loop, catching panics and
+/// restarting after `restart_delay`, until `stop` is set. `body` is a full
+/// attempt (it may itself loop); returning normally also triggers a restart
+/// (e.g. the guard reconnecting after a port close). Never lets a worker panic
+/// take down the process.
+#[cfg(windows)]
+fn supervised_thread<F>(
+    name: &'static str,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    restart_delay: Duration,
+    body: F,
+) -> std::thread::JoinHandle<()>
+where
+    F: Fn() + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+    std::thread::Builder::new()
+        .name(format!("dlp-{name}"))
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&body));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match res {
+                    Ok(()) => tracing::info!(worker = name, "worker returned — restarting"),
+                    Err(_) => tracing::error!(worker = name, "worker PANICKED — restarting (fail secure)"),
+                }
+                std::thread::sleep(restart_delay);
+            }
+            tracing::info!(worker = name, "worker exiting (stop signalled)");
+        })
+        .expect("spawn supervised worker thread")
+}
+
+/// Sleep up to `secs`, waking early (in 200ms steps) when `stop` is set, so a
+/// service stop is prompt without a per-worker timer.
+#[cfg(windows)]
+fn sleep_interruptible(secs: u64, stop: &std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::Ordering;
+    let steps = secs.saturating_mul(5); // 200ms per step
+    for _ in 0..steps {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Initialise rolling FILE logging under `C:\ProgramData\DLPAgent\logs` for the
+/// service (no console under the SCM). Called once by the service dispatcher.
+/// Size-rotates the current log on startup (a full continuous roller would need
+/// `tracing-appender`, a dependency we deliberately avoid). Never logs key
+/// material or content.
+#[cfg(windows)]
+pub fn init_file_logging() {
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    let dir = PathBuf::from(r"C:\ProgramData\DLPAgent\logs");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("dlp-agent.log");
+
+    // Rotate on startup if the current log is large (best-effort).
+    const MAX_BYTES: u64 = 5 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_BYTES {
+            let _ = std::fs::rename(&path, dir.join("dlp-agent.log.1"));
+        }
+    }
+
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => {
+            let file = Arc::new(Mutex::new(file));
+            // A `Fn() -> impl Write` is a `MakeWriter`; lock per write.
+            struct MutexWriter(Arc<Mutex<std::fs::File>>);
+            impl Write for MutexWriter {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap_or_else(|p| p.into_inner()).write(buf)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.0.lock().unwrap_or_else(|p| p.into_inner()).flush()
+                }
+            }
+            let make = move || MutexWriter(file.clone());
+            tracing_subscriber::fmt()
+                .with_target(false)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(make)
+                .init();
+            tracing::info!("service file logging initialised at {}", path.display());
+        }
+        Err(e) => {
+            // Fall back to a plain (likely discarded) console subscriber so the
+            // process still runs; never abort enforcement over a log file.
+            tracing_subscriber::fmt()
+                .with_target(false)
+                .with_max_level(tracing::Level::INFO)
+                .init();
+            tracing::warn!(error = %e, "could not open service log file — logging to stderr");
+        }
+    }
 }
 
 /// clipboard-monitor: watch the clipboard, inspect copied content against the
@@ -1102,11 +1508,14 @@ fn extract_cert_pem(identity: &[u8]) -> Option<String> {
 }
 
 fn print_help() {
-    println!("dlp-agent <enroll|once|run|status|index-update|scan|usb-monitor|usb-guard|clipboard-monitor|net-monitor|browser-host|decrypt>");
+    println!("dlp-agent <enroll|once|run|status|index-update|scan|usb-monitor|usb-guard|clipboard-monitor|net-monitor|browser-host|decrypt|run-endpoint|install-service|uninstall-service>");
     println!("  scan --bundle <path> --file <path> [--json] [--report --channel <name>]");
     println!("  decrypt <file.dlpenc> [-o <out>]   open a sealed envelope; audited (see --help)");
     println!("  usb-monitor [--enforce]   watch removable media; audit copies (see --help)");
     println!("  usb-guard                 answer the kernel minifilter's scan port (see --help)");
+    println!("  run-endpoint              unified supervised guard+sealer+check-in+resync (Windows)");
+    println!("  install-service           register the Windows service 'DLPAgent' (run-endpoint)");
+    println!("  uninstall-service         stop + remove the Windows service 'DLPAgent'");
     println!("  clipboard-monitor [--enforce]  watch the clipboard; audit copies (see --help)");
     println!("  net-monitor [--enforce <monitor|allowlist|blocklist>]  WFP network egress (see --help)");
     println!("  browser-host              Chrome/Edge native-messaging upload host (see --help)");

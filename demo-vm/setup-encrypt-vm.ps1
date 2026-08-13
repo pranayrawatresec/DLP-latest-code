@@ -1,3 +1,14 @@
+# ============================================================================
+# DEPRECATED (2026-08-13). Superseded by the unified DLPAgent service (M6).
+# Do NOT run this alongside the service-based provision-vm.ps1 - it re-adds the
+# old "DLP Agent Guard" task and writes LOCAL [usb]/[crypto] config, which now
+# conflict with the service and the server-synced whitelist.
+# New flow: provision-vm.ps1 installs the DLPAgent service; whitelist the stick
+# in the console UI (Trusted USB devices) - the agent syncs keys + whitelist
+# over mTLS. No local encrypt config or dev keyring is needed.
+# Kept only for the pre-M6 local-config path; remove once fully migrated.
+# ============================================================================
+
 # setup-encrypt-vm.ps1 - enable encrypt-on-write on the already-provisioned demo VM.
 # Run ONCE as Administrator on the VM, AFTER provision-vm.ps1 (driver + enrollment
 # + usb-guard task already in place).

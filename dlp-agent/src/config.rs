@@ -230,11 +230,29 @@ impl UsbConfig {
 #[serde(default)]
 pub struct KguardConfig {
     /// Block when a matched document's containment reaches this fraction
-    /// (`idm[].containment >= block_at`). Default 0.30.
+    /// (`idm[].containment >= block_at`). Default 0.30. Used by the read-taint
+    /// path (`should_block`) and mirrored into the trusted-side seal block band
+    /// (`Config::encrypt_bands`).
     pub block_at: f64,
     /// Block when a scanned file's coverage by protected material reaches this
     /// fraction (`idm[].coverage >= coverage_block_at`). Default 0.60.
     pub coverage_block_at: f64,
+    /// CONTAINMENT threshold for BLOCKING a sensitive file copied to a
+    /// NON-whitelisted removable device (the WRITE-reason, non-Encrypt
+    /// fall-through in `kguard::decide`). Deliberately LOWER than `block_at`
+    /// (0.30) — data leaving the machine on an untrusted stick is blocked at a
+    /// tighter containment than the read-taint band uses. Default 0.15. EDM hits
+    /// and `coverage >= coverage_block_at` also block (see
+    /// `should_block_removable_write`). Does NOT affect read-taint or the
+    /// trusted-side `decide_seal` bands.
+    pub removable_write_block_at: f64,
+    /// Staleness window (seconds) for the in-process sealer liveness signal used
+    /// by `run-endpoint`. The guard treats the sealer as healthy iff the keyring
+    /// is present AND the sealer marked itself alive within this window; when the
+    /// sealer is unhealthy a seal-eligible file is BLOCKED instead of allowed as
+    /// plaintext (fail secure). Default 10. Ignored by the standalone `usb-guard`
+    /// (no in-process sealer — it keeps today's allow-pending-seal behaviour).
+    pub sealer_health_timeout_secs: u64,
     /// What to answer the driver when NO verified bundle is cached, or a verdict
     /// cannot be produced (I/O error). `true` = block (fail-secure, classified
     /// sites); `false` = allow + audit (general use). Mirrors the driver's
@@ -289,6 +307,8 @@ impl Default for KguardConfig {
         KguardConfig {
             block_at: 0.30,
             coverage_block_at: 0.60,
+            removable_write_block_at: 0.15,
+            sealer_health_timeout_secs: 10,
             fail_block: false,
             channel_label: "usb-kguard".into(),
             scan_fixed: false,
@@ -841,6 +861,30 @@ trusted_origins = [
         // Absent mode ⇒ fail-secure banded default, NOT encrypt_all.
         assert_eq!(cfg.webupload.trusted_origins[1].mode, EncryptMode::EncryptSensitive);
         assert!(cfg.webupload.trusted_origins[1].key_id.is_none());
+    }
+
+    #[test]
+    fn kguard_new_defaults_present() {
+        // Absent [kguard] ⇒ the two new knobs take their fail-secure defaults.
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert_eq!(cfg.kguard.removable_write_block_at, 0.15);
+        assert_eq!(cfg.kguard.sealer_health_timeout_secs, 10);
+        // block_at is unchanged and distinct from the removable-write threshold.
+        assert_eq!(cfg.kguard.block_at, 0.30);
+    }
+
+    #[test]
+    fn kguard_new_fields_parse_when_set() {
+        let toml_str = format!(
+            "{BASE}
+[kguard]
+removable_write_block_at = 0.05
+sealer_health_timeout_secs = 30
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.kguard.removable_write_block_at, 0.05);
+        assert_eq!(cfg.kguard.sealer_health_timeout_secs, 30);
     }
 
     #[test]

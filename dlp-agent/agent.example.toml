@@ -30,6 +30,14 @@ checkin_interval_seconds = 300
 # fail_block = true    # fail-secure: block when no verified bundle is cached
 scan_fixed = true      # inspect fixed-volume (C:) reads/writes under watch_paths
 watch_paths = ["\\Users", "\\Data"]
+# removable_write_block_at = 0.15  # containment ceiling for BLOCKING a sensitive
+#   file copied to a NON-whitelisted removable device (WRITE path). Also blocks on
+#   any EDM hit or coverage >= coverage_block_at. DISTINCT from block_at (0.30),
+#   which still drives read-taint and the trusted-side decide_seal band. Default 0.15.
+# sealer_health_timeout_secs = 10  # run-endpoint: the guard stands aside for the
+#   in-process sealer only if the sealer marked itself alive within this window AND
+#   a keyring is present; otherwise a seal-eligible write is BLOCKED (fail secure).
+#   Default 10.
 #
 # Read-taint MASTER SWITCH + egress policy are NOT set here — they are driver
 # registry DWORDs under the service key (read in DriverEntry, like FailMode), so

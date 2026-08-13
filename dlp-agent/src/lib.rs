@@ -17,6 +17,7 @@ pub mod exfil;
 pub mod netfilter;
 pub mod notify;
 pub mod storage;
+pub mod supervise;
 pub mod trustdest;
 pub mod trustsync;
 pub mod usb;

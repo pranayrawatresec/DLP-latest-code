@@ -69,6 +69,8 @@ These were decided by the project owner during the build; keep them unless told 
 - `src/trustdest.rs` — **NEW** (M2). Pure decision logic: `EncryptMode`, `EncryptBands`, `SealDecision`, `BlockBandPolicy`, `decide_seal()`.
 - `src/trustsync.rs` — **NEW** (M6). Serde types for the server sync contract + `merge_into_usb()` (pure).
 - `src/decrypt.rs` — **NEW** (M4). `decrypt_envelope()` library core (audit-before-write).
+- `src/supervise.rs` — **NEW** (2026-08-13, §11a). `SealerHealth` liveness signal + `snapshot_config()` shared-config helper for the unified `run-endpoint`.
+- `src/service.rs` — **NEW** (2026-08-13, §11a). Windows service (`DLPAgent`) install/uninstall + SCM dispatcher for `run-endpoint`.
 - `src/usb/policy.rs` — `Action::Encrypt` variant + restrictiveness ordering.
 - `src/usb/audit.rs` — `scan_and_seal_to_incident()`, `seal_file_in_place()`, `baseline_existing()`, `is_sealed_envelope_path()`, `ActionTaken::Encrypted`, `IncidentKind::{Sealed, DecryptDenied}`, `UsbIncident.{key_id, sealed_sha256}`.
 - `src/usb/mod.rs` — `run_monitor` sealer wiring, `EncryptVolume`, baseline call, envelope-skip.
@@ -267,13 +269,41 @@ Combined behaviour on a write to an `encrypt` volume:
 
 ---
 
+## 11a. Unified endpoint service + full matrix (2026-08-13)
+
+The guard and sealer are no longer two things you run by hand. `dlp-agent run-endpoint` (Windows-only; the Windows service `DLPAgent` runs it under the SCM as LocalSystem) hosts **guard + sealer + check-in + periodic whitelist re-sync** as coordinated threads in ONE process, sharing one merged-config view (`Arc<RwLock<Config>>`, re-snapshotted each iteration) and one **sealer-liveness signal** (`supervise.rs::SealerHealth`). New files: `src/supervise.rs`, `src/service.rs`. Subcommands: `run-endpoint`, `install-service`, `uninstall-service` (SCM ImagePath = `<exe> service-run`). Logs go to `C:\ProgramData\DLPAgent\logs\dlp-agent.log` (rolling, 5 MB → `.1`) when run as the service; console when interactive. The old `usb-guard`/`usb-monitor` subcommands remain for debugging.
+
+**What unification fixes:** the two-guard port contention (one process = one `\DlpFltPort` connection), guard/sealer whitelist divergence (one shared view), whitelist changes needing a restart (the resync thread swaps the shared config live), and — the important one — the **fail-open**.
+
+**Fail-secure liveness gate.** `write_scan_override` takes a `sealer_healthy` bool. Healthy = keyring present AND the sealer marked itself alive within `sealer_health_timeout_secs` (default 10). On a `Seal` decision: healthy ⇒ ALLOW + `allowed-pending-seal`; **unhealthy ⇒ BLOCK + `seal-unavailable-blocked` (`ActionTaken::Blocked`)** — a seal-eligible file is never allowed to land as plaintext when nobody can seal it. Standalone `usb-guard` passes `healthy=true` (no in-process sealer) and keeps prior behaviour.
+
+**Two thresholds, by design (owner decision):**
+- `[kguard].removable_write_block_at` (default **0.15**) — blocks a sensitive file copied to a **non-whitelisted** removable device (WRITE path: `should_block_removable_write` = any EDM hit OR containment ≥ 0.15 OR coverage ≥ `coverage_block_at`).
+- `[crypto].encrypt_at` (0.05) still defines the **seal** band on a whitelisted stick; `block_at` (0.30) still drives read-taint and the trusted-side `on_block_band` band. **Accepted residual:** a file with containment in **0.05–0.15** seals on a trusted stick but copies on an untrusted one (below the 0.15 block line). Owner chose 0.15 as the middle ground; this is deliberate, not a bug.
+
+**`run-endpoint` runs the sealer with `enforce = false` (deliberate — `main.rs`).** The required behaviour is per-file and content-based; device-level enforcement (`enforce = true`) would apply `default_action` (default `ReadOnly`) to a whole non-whitelisted device and block even **clean** copies, violating the matrix. Sealing does not depend on `enforce`. **Tradeoff:** this also leaves the user-mode MTP/phone and USB-tethering device blocks OFF (they live behind `enforce`) — out of scope of the content matrix; revisit if phone/tethering device-control is wanted (would need enforcing those actions without imposing `default_action` read-only on storage).
+
+**The full behavior matrix as it now stands** (service running: guard + healthy in-process sealer):
+
+| Stick | File | Result |
+|---|---|---|
+| **whitelisted** | clean | copies plaintext |
+| whitelisted | sensitive, seal decision (encrypt band, or block band with `on_block_band=seal`, or EDM/unreadable) | **sealed** → `.dlpenc` |
+| whitelisted | block band with `on_block_band=block` | **blocked** (admin's UI choice) |
+| whitelisted | sensitive but sealer unhealthy | **blocked** (`seal-unavailable-blocked`) |
+| **not whitelisted** | clean | copies (allowed) |
+| not whitelisted | containment ≥ 0.15, or any EDM, or coverage ≥ 0.60 | **blocked** |
+| not whitelisted | containment 0.05–0.15 | copies (accepted residual) |
+
+---
+
 ## 12. Operational gotchas (found during VM/real-hardware testing — READ THIS)
 
 1. **`FailMode` must be reloaded to take effect.** The driver reads `FailMode` at `DriverEntry`. Setting `HKLM\SYSTEM\CurrentControlSet\Services\dlpflt\FailMode` does nothing until `fltmc unload dlpflt ; fltmc load dlpflt`. Product default should be `1` (fail-secure = deny removable writes when the guard isn't answering). The INF ships `0`.
-2. **Exactly ONE `usb-guard` may connect to `\DlpFltPort`.** The `provision-vm.ps1` "DLP Agent Guard" scheduled task runs one in a restart loop; running a second in the foreground causes the two to steal the port from each other → `FilterReplyMessage failed — No waiter is present (0x801F0020)` and dropped verdicts. Stop/disable the task before running a foreground guard.
-3. **Sync happens at process startup only.** A whitelist change made in the UI while `usb-monitor`/`usb-guard` are running is **not** picked up until they restart. Add the whitelist first, then start the agent — or restart after changing it. See Open Issues for the periodic-resync TODO.
+2. **Exactly ONE `usb-guard` may connect to `\DlpFltPort`.** ~~Two guards steal the port from each other → `No waiter is present (0x801F0020)`.~~ **Resolved by the unified `DLPAgent` service** (one process, one connection). Still relevant if you run a foreground `usb-guard` for debugging **while the service is running** — stop the service first (`sc stop DLPAgent`).
+3. **~~Sync happens at process startup only.~~** **Resolved:** `run-endpoint`'s resync thread re-fetches the whitelist every check-in interval and swaps the shared config live, so UI changes take effect without a restart. (Standalone `usb-monitor`/`usb-guard` are still startup-only.)
 4. **`on_block_band` defaults to `block`.** A fully-fingerprinted file (e.g. an exact OPORD match) is in the **block band**, so on an `encrypt_sensitive` destination with the default it is BLOCKED, not sealed. To seal even highly-sensitive files, the admin must choose "Encrypt it onto this device" (`seal`) when whitelisting.
-5. **Put the right exe where the guard task runs it.** The task launches `C:\ProgramData\DLPAgent\dlp-agent.exe`. Updating only a copy elsewhere (e.g. `C:\dlp\`) leaves the guard on the old binary.
+5. **Deploy via the service, not loose copies.** `provision-vm.ps1` now installs the `DLPAgent` service running `C:\ProgramData\DLPAgent\dlp-agent.exe service-run`. Update **that** exe (stop the service first) — a copy elsewhere (e.g. `C:\dlp\`) is not what the service runs. `setup-encrypt-vm.ps1` is **deprecated** (it re-adds the old task + local config that conflict with the service).
 6. **Detect-and-quarantine is "flash then vanish."** A kernel-blocked file briefly appears on the stick and is deleted on handle close — seeing it appear is not proof it wasn't blocked; re-check a moment later.
 7. **The dev keyfile holds plaintext key bytes.** DEV ONLY, git-ignored. On Windows the agent re-seals it at rest via DPAPI after first use, but the source keyfile is plaintext until server key sync (M6) removes the need for it. With M6 configured, prefer no keyfile at all.
 8. **`DLP_ORG_ROOT_KEY`** (64 hex chars) must be in the server `.env` or key creation / agent key delivery returns `503`. Never commit it.
@@ -303,12 +333,17 @@ No test requires hardware, a driver, or a live browser (those are runbook items)
 
 ## 15. Open issues / TODOs
 
-1. **Live re-sync (no restart).** Sync is startup-only (gotcha #3). Add periodic re-sync in the `usb-monitor`/`usb-guard` loops (e.g. per check-in interval) and re-merge so UI whitelist changes take effect without a restart. Contained change to the run loops.
-2. **No key-creation UI.** Keys are created via `POST /api/encryption/keys` only. For a fully self-service admin flow, add a "Create key" control to the console. (Whitelisting different sticks does NOT need new keys — keys are org-wide.)
-3. **UNDER INVESTIGATION — no-whitelist block not always taking on the VM.** After removing a whitelist, an exact-match sensitive file was observed copying instead of being kernel-blocked, alongside `No waiter is present` reply failures. Confirmed `FailMode=1` in the registry. Working theory: stale driver IPC/circuit-breaker state and/or the loaded driver not reflecting the registry `FailMode` without a reload, and/or residual two-guard contention. Repro/reset: kill all `dlp-agent`, `fltmc unload/load dlpflt`, run exactly one `usb-guard`, then capture the `kguard scan decide` line + post-copy `Get-ChildItem E:\` to determine (a) no up-call, (b) block-verdict-but-quarantine-failed, or (c) flash-then-vanish. Not yet root-caused.
-4. **Two-person key destruction** — deferred (owner decision #1); the request/effect split is in place to add it.
-5. **Server incident display** — `detection_incidents.key_id`/`sealed_sha256` columns exist and the agent endpoint persists them; verify the incidents UI surfaces seal/decrypt incidents (the console row may still look thin for `encrypted`).
-6. **M7 (web-upload/webmail)** and **M8 (kernel-assisted seal)** — not started; see spec §7 and §8.
+**Closed 2026-08-13 by the unified service (§11a):** the fail-open (sealer absent → plaintext leak) is now fail-secure (guard blocks when the sealer is unhealthy); guard/sealer no longer diverge; live re-sync means no restart on whitelist change; two-guard port contention is gone; the non-whitelisted mid-band leak is narrowed from 0.05–0.30 down to the accepted 0.05–0.15 via `removable_write_block_at=0.15`.
+
+Still open:
+1. **No key-creation UI.** Keys are created via `POST /api/encryption/keys` only. For a fully self-service admin flow, add a "Create key" control to the console. (Whitelisting different sticks does NOT need new keys — keys are org-wide.)
+2. **Accepted residual leak (0.05–0.15 containment).** A file sealable on a trusted stick (≥ `encrypt_at` 0.05) but below `removable_write_block_at` (0.15) still copies to a non-whitelisted stick. Deliberate owner choice (0.15 middle ground). To close entirely, set `removable_write_block_at = encrypt_at`.
+3. **MTP/phone + USB-tethering device blocks are OFF under `run-endpoint`** (they live behind `enforce`, which is `false` to preserve "clean copies on non-whitelisted sticks"). If wanted, enforce those specific device actions without imposing `default_action` read-only on storage.
+4. **VM block-not-taking investigation** — was traced to (a) the guard running the OLD exe / not restarted after a whitelist change, and (b) two-guard `No waiter` contention. Both are addressed by the unified service (one process, live re-sync, single port owner). Re-verify on the service before considering it fully closed; if it recurs, still check that `FailMode=1` is *loaded* (`fltmc unload/load dlpflt` after a registry change).
+5. **Two-person key destruction** — deferred (owner decision #1); the request/effect split is in place to add it.
+6. **Server incident display** — `detection_incidents.key_id`/`sealed_sha256` columns exist and the agent endpoint persists them; verify the incidents UI surfaces seal/decrypt incidents (the console row may still look thin for `encrypted`).
+7. **Graceful guard-thread shutdown** — `FilterGetMessage` blocks uninterruptibly, so the guard thread is detached and torn down by process exit on service stop (checks the stop flag between messages). Fine for a service; noted in case a cleaner teardown is wanted.
+8. **M7 (web-upload/webmail)** and **M8 (kernel-assisted seal, closes the settle-window plaintext gap)** — not started; see spec §7 and §8.
 7. **KEK delivery is plaintext-inside-mTLS** (owner decision, spec §10) — acceptable at current threat model; HSM/FIPS is Phase 6.
 
 ---

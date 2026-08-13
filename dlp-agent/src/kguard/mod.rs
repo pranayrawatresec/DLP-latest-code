@@ -48,8 +48,14 @@ use crate::config::{Config, KguardConfig, UsbConfig};
 use crate::crypto::envelope::MAGIC as DLPENC_MAGIC;
 use crate::detect::{self, Bundle, Verdict};
 use crate::storage::Storage;
+use crate::supervise::SealerHealth;
+#[cfg(windows)]
+use crate::supervise::snapshot_config;
 use crate::trustdest::{decide_seal, EncryptBands, SealDecision};
 use crate::usb::{Action, ActionTaken, DeviceIdentity, IncidentKind, UsbIncident};
+
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 
@@ -187,6 +193,25 @@ pub fn should_block(v: &Verdict, cfg: &KguardConfig) -> bool {
     v.idm
         .iter()
         .any(|m| m.containment >= cfg.block_at || m.coverage >= cfg.coverage_block_at)
+}
+
+/// Pure block decision for a WRITE to a NON-whitelisted removable device
+/// (encrypt-on-write containment). BLOCK if any EDM row hit, any matched
+/// document reaches `removable_write_block_at` containment, or any reaches the
+/// coverage threshold.
+///
+/// Distinct from [`should_block`]: this uses `removable_write_block_at`
+/// (default 0.15) — a TIGHTER containment ceiling for data leaving the machine
+/// on an untrusted stick — while `should_block` keeps `block_at` (0.30) for the
+/// read-taint path and the trusted-side seal band. Coverage and EDM behave the
+/// same in both.
+pub fn should_block_removable_write(v: &Verdict, cfg: &KguardConfig) -> bool {
+    if !v.edm.is_empty() {
+        return true;
+    }
+    v.idm.iter().any(|m| {
+        m.containment >= cfg.removable_write_block_at || m.coverage >= cfg.coverage_block_at
+    })
 }
 
 /// Human label for a scan reason, for structured logs. An unrecognised value
@@ -358,13 +383,21 @@ fn envelope_passthrough(content: &[u8], _reason: u32) -> Option<(bool, Option<Us
 /// Then `trustdest::decide_seal` (with the rule's mode + `on_block_band`):
 /// * `Block` ⇒ `None` — the kernel block path runs unchanged (whitelisting
 ///   never weakens the block band unless the rule opted in).
-/// * `Seal`  ⇒ ALLOW + an `allowed-pending-seal` incident: the audit trail
-///   must show the kernel deliberately stood aside for the sealer.
+/// * `Seal`  ⇒ depends on `sealer_healthy` (the in-process sealer's liveness):
+///   * `true`  ⇒ ALLOW + an `allowed-pending-seal` incident: the audit trail
+///     shows the kernel deliberately stood aside for the sealer.
+///   * `false` ⇒ BLOCK + a `seal-unavailable-blocked` incident (fail secure):
+///     if nobody can seal it, a seal-eligible file must NOT leave as plaintext.
 /// * `Plain` ⇒ ALLOW, no incident (today's clean behaviour).
+///
+/// `sealer_healthy` reflects the shared [`crate::supervise::SealerHealth`] in
+/// `run-endpoint`; the standalone `usb-guard` passes `true` (no in-process
+/// sealer to gate on — it keeps today's allow-pending-seal behaviour exactly).
 ///
 /// `verdict` is `None` when no verified bundle is cached — on an Encrypt
 /// destination that still resolves to `Seal` (the monitor seals fail-secure
 /// without a bundle), preferred over `fail_block`.
+#[allow(clippy::too_many_arguments)]
 fn write_scan_override(
     reason: u32,
     usb: &UsbConfig,
@@ -373,6 +406,7 @@ fn write_scan_override(
     verdict: Option<&Verdict>,
     display_path: &str,
     channel: &str,
+    sealer_healthy: bool,
 ) -> Option<(bool, Option<UsbIncident>)> {
     if reason == DLP_REASON_READ || !usb.enabled {
         return None;
@@ -386,26 +420,53 @@ fn write_scan_override(
     match decide_seal(mode, bands, on_block_band, verdict) {
         SealDecision::Block => None,
         SealDecision::Plain => Some((false, None)),
-        SealDecision::Seal => Some((
+        SealDecision::Seal if sealer_healthy => Some((
             false,
-            Some(pending_seal_incident(verdict.cloned(), dev.clone(), display_path, channel)),
+            Some(seal_incident(
+                verdict.cloned(),
+                dev.clone(),
+                display_path,
+                channel,
+                ActionTaken::Audited,
+                "allowed-pending-seal",
+            )),
+        )),
+        // Fail secure: the sealer can't seal (dead / no keyring), so a
+        // seal-eligible file is BLOCKED rather than allowed to land as plaintext.
+        SealDecision::Seal => Some((
+            true,
+            Some(seal_incident(
+                verdict.cloned(),
+                dev.clone(),
+                display_path,
+                channel,
+                ActionTaken::Blocked,
+                "seal-unavailable-blocked",
+            )),
         )),
     }
 }
 
-/// The audit record for a kernel ALLOW on an Encrypt destination: the guard
-/// deliberately stood aside so the `usb-monitor` sealer can armour the file
-/// (note `allowed-pending-seal`, action `Audited`). Metadata + verdict only —
-/// never content. Kinds mirror `incident_for`: `Match` for a scored file,
-/// `UnreadableOnRemovable` for unreadable content; `verdict: None` (no bundle)
-/// is recorded metadata-only as `Sealed` — the kind whose contract already
-/// covers "the fail-secure seal when no verdict could be produced" — with the
-/// note distinguishing it from the monitor's own post-seal incident.
-fn pending_seal_incident(
+/// The audit record for a seal-eligible write on an Encrypt destination. Two
+/// dispositions share this shape (only `action_taken` + `note` differ):
+/// * ALLOW (`Audited`, note `allowed-pending-seal`) — the guard stood aside so
+///   the `usb-monitor` sealer can armour the file (the healthy-sealer case).
+/// * BLOCK (`Blocked`, note `seal-unavailable-blocked`) — the sealer is
+///   unavailable, so the file is blocked instead of allowed as plaintext.
+///
+/// Metadata + verdict only — never content. Kinds mirror `incident_for`:
+/// `Match` for a scored file, `UnreadableOnRemovable` for unreadable content;
+/// `verdict: None` (no bundle) is recorded metadata-only as `Sealed` — the kind
+/// whose contract already covers "the fail-secure seal when no verdict could be
+/// produced" — with the note distinguishing it from the monitor's own post-seal
+/// incident.
+fn seal_incident(
     verdict: Option<Verdict>,
     device: DeviceIdentity,
     display_path: &str,
     channel: &str,
+    action_taken: ActionTaken,
+    note: &str,
 ) -> UsbIncident {
     let (kind, file_name, file_sha256) = match &verdict {
         Some(v) if matches!(v.extraction, detect::Extraction::Unreadable { .. }) => {
@@ -421,8 +482,8 @@ fn pending_seal_incident(
         file_sha256,
         verdict,
         device,
-        action_taken: ActionTaken::Audited,
-        note: Some("allowed-pending-seal".into()),
+        action_taken,
+        note: Some(note.into()),
         key_id: None,
         sealed_sha256: None,
     }
@@ -452,7 +513,13 @@ fn letter_for_nt_prefix(
 // Windows: the live port client.
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
-pub fn run<R>(cfg: &Config, storage: &Storage, mut report: R) -> Result<()>
+pub fn run<R>(
+    shared_cfg: &Arc<RwLock<Config>>,
+    storage: &Storage,
+    health: Option<&Arc<SealerHealth>>,
+    stop: Option<&Arc<AtomicBool>>,
+    mut report: R,
+) -> Result<()>
 where
     R: FnMut(UsbIncident),
 {
@@ -461,11 +528,15 @@ where
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::InstallableFileSystems::FilterConnectCommunicationPort;
 
-    let kg = &cfg.kguard;
+    // Startup values (bundle, CA, watch-set, exfil flag) come from an initial
+    // snapshot; per-scan decisions in `message_loop` re-snapshot so a live
+    // whitelist re-sync (run-endpoint) is picked up without a restart.
+    let initial = snapshot_config(shared_cfg);
+    let kg = &initial.kguard;
 
     // Load the verified bundle once. None → answer per fail_block until a
     // bundle is present (fail-secure knob, SPEC §3).
-    let bundle = load_verified_bundle(cfg, storage);
+    let bundle = load_verified_bundle(&initial, storage);
     if bundle.is_none() {
         tracing::warn!(
             fail_block = kg.fail_block,
@@ -486,29 +557,30 @@ where
     // Send the watch-set config (spec §3.0) so the driver knows whether to
     // inspect fixed/network volumes and which path prefixes to watch. An empty
     // watch-set leaves the driver in removable-only mode (backward compatible).
-    send_config(port, &cfg.kguard);
+    send_config(port, &initial.kguard);
 
     // Read-deny: run a background tracker that pushes the exfil-channel PID set so
     // the driver's DlpPreRead can DENY sensitive reads by exfil processes. Only
     // when [kguard] exfil_read_block is set; the driver still gates on its own
     // ExfilReadBlockEnabled registry knob, so this is best-effort. Joined before
-    // the port closes so the pusher never touches a closed handle.
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let pusher = if cfg.kguard.exfil_read_block {
-        let stop = stop.clone();
+    // the port closes so the pusher never touches a closed handle. (This local
+    // `pusher_stop` is distinct from the caller's `stop` shutdown signal.)
+    let pusher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pusher = if initial.kguard.exfil_read_block {
+        let pusher_stop = pusher_stop.clone();
         // The pusher opens its OWN push-only connection (below) — it never touches
         // this scanner handle, so FilterSendMessage cannot collide with the
         // scanner's FilterGetMessage.
-        Some(std::thread::spawn(move || exfil_push_loop(&stop)))
+        Some(std::thread::spawn(move || exfil_push_loop(&pusher_stop)))
     } else {
         None
     };
 
     let _ = storage; // identity/CA already consumed above; kept for symmetry
-    let result = message_loop(port, cfg, bundle.as_ref(), &mut report);
+    let result = message_loop(port, shared_cfg, bundle.as_ref(), health, stop, &mut report);
 
     // Stop + join the pusher BEFORE closing the port (no use of a closed handle).
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    pusher_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = pusher {
         let _ = h.join();
     }
@@ -620,14 +692,17 @@ fn send_config(port: windows::Win32::Foundation::HANDLE, kg: &KguardConfig) {
 #[cfg(windows)]
 fn message_loop<R>(
     port: windows::Win32::Foundation::HANDLE,
-    cfg: &Config,
+    shared_cfg: &Arc<RwLock<Config>>,
     bundle: Option<&Bundle>,
+    health: Option<&Arc<SealerHealth>>,
+    stop: Option<&Arc<AtomicBool>>,
     report: &mut R,
 ) -> Result<()>
 where
     R: FnMut(UsbIncident),
 {
     use std::mem::size_of;
+    use std::sync::atomic::Ordering;
     use windows::Win32::Storage::InstallableFileSystems::{
         FilterGetMessage, FilterReplyMessage, FILTER_MESSAGE_HEADER, FILTER_REPLY_HEADER,
     };
@@ -637,8 +712,6 @@ where
         header: FILTER_REPLY_HEADER,
         reply: DlpScanReply,
     }
-
-    let kg = &cfg.kguard;
 
     // Receive buffer sized for the filter-manager header + our fixed request
     // header + up to DLP_MAX_CONTENT (4 MiB) of trailing file content, since
@@ -655,6 +728,17 @@ where
     let buf_ptr = backing.as_mut_ptr() as *mut u8;
 
     loop {
+        // Graceful shutdown: checked after each handled message. Note this cannot
+        // interrupt a `FilterGetMessage` that is currently blocked waiting for the
+        // driver — that unblocks only on the next scan or on port close (which the
+        // process exit at service stop forces). Documented limitation.
+        if let Some(s) = stop {
+            if s.load(Ordering::Relaxed) {
+                tracing::info!("kguard stop signalled — ending message loop");
+                return Ok(());
+            }
+        }
+
         let recv = unsafe {
             FilterGetMessage(
                 port,
@@ -669,6 +753,17 @@ where
             tracing::warn!(error = %e, "FilterGetMessage returned error — ending kguard loop");
             return Ok(());
         }
+
+        // Fresh config snapshot per scan so a live whitelist re-sync (run-endpoint)
+        // takes effect without a restart; standalone usb-guard's config is fixed.
+        let cfg = snapshot_config(shared_cfg);
+        let kg = &cfg.kguard;
+        // Guard-side sealer-health gate: healthy iff a real signal says so;
+        // absent signal (standalone usb-guard has no in-process sealer) ⇒ treat as
+        // healthy to preserve today's allow-pending-seal behaviour exactly.
+        let sealer_healthy = health
+            .map(|h| h.is_healthy(kg.sealer_health_timeout_secs.saturating_mul(1000)))
+            .unwrap_or(true);
 
         // SAFETY: `buf_ptr` is 8-aligned and `total_size` bytes long; the header
         // occupies the first `header_size` bytes and the fixed request the next
@@ -702,7 +797,7 @@ where
             // Score the in-memory content (NO file re-open), or fall back to the
             // configured fail behavior. `req.reason` selects the write vs
             // read-taint incident labelling (verdict semantics are identical).
-            decide(cfg, kg, bundle, &device_path, content, truncated, req.reason)
+            decide(&cfg, kg, bundle, &device_path, content, truncated, req.reason, sealer_healthy)
         };
 
         // Reply to the driver.
@@ -775,6 +870,7 @@ fn basename_of(path: &str) -> String {
 /// verified bundle we honor `fail_block` (unless a whitelisted Encrypt
 /// destination stands aside first — see `write_scan_override`).
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn decide(
     cfg: &Config,
     kg: &KguardConfig,
@@ -783,6 +879,7 @@ fn decide(
     content: &[u8],
     _truncated: bool,
     reason: u32,
+    sealer_healthy: bool,
 ) -> (bool, Option<UsbIncident>) {
     // Sealer coexistence, defect 1: a `.dlpenc` envelope passes untouched —
     // both scan reasons, every volume, before any scoring (see the gate's doc).
@@ -832,6 +929,7 @@ fn decide(
             verdict.as_ref(),
             device_path,
             &kg.channel_label,
+            sealer_healthy,
         ) {
             return (block, incident);
         }
@@ -854,8 +952,13 @@ fn decide(
         // would cut a user's network for merely opening an image/binary/encrypted
         // file. Read-taint stays a genuine content match, not a fail-open guess.
         reason != DLP_REASON_READ && kg.fail_block
-    } else {
+    } else if reason == DLP_REASON_READ {
+        // Read-taint path is UNCHANGED: keep the `block_at` (0.30) band.
         should_block(&v, kg)
+    } else {
+        // WRITE (or forward-compat unknown) to a NON-whitelisted removable device:
+        // apply the tighter containment ceiling (`removable_write_block_at`, 0.15).
+        should_block_removable_write(&v, kg)
     };
     let inc = incident_for(device_path, v, block, &kg.channel_label, reason);
     (block, inc)
@@ -943,7 +1046,13 @@ mod ntvol {
 // Non-Windows stub so the crate still builds cross-platform (tests, CI).
 // ---------------------------------------------------------------------------
 #[cfg(not(windows))]
-pub fn run<R>(_cfg: &Config, _storage: &Storage, _report: R) -> Result<()>
+pub fn run<R>(
+    _shared_cfg: &Arc<RwLock<Config>>,
+    _storage: &Storage,
+    _health: Option<&Arc<SealerHealth>>,
+    _stop: Option<&Arc<AtomicBool>>,
+    _report: R,
+) -> Result<()>
 where
     R: FnMut(UsbIncident),
 {
@@ -1016,6 +1125,41 @@ mod tests {
     fn allows_clean_file() {
         let cfg = KguardConfig::default();
         assert!(!should_block(&clean_verdict(), &cfg));
+    }
+
+    // --- Removable-write containment threshold (removable_write_block_at) -----
+
+    #[test]
+    fn removable_write_blocks_at_tighter_containment() {
+        // Default removable_write_block_at = 0.15 — tighter than block_at (0.30).
+        let cfg = KguardConfig::default();
+        assert!(!should_block_removable_write(&verdict_with(0.14, 0.0), &cfg)); // below
+        assert!(should_block_removable_write(&verdict_with(0.15, 0.0), &cfg)); // at
+        assert!(should_block_removable_write(&verdict_with(0.20, 0.0), &cfg)); // above
+        // A row that would NOT trip the read-taint band (0.30) DOES trip the
+        // tighter removable-write band — the whole point of the new threshold.
+        assert!(!should_block(&verdict_with(0.20, 0.0), &cfg));
+    }
+
+    #[test]
+    fn removable_write_blocks_on_coverage_and_edm() {
+        let cfg = KguardConfig::default(); // coverage_block_at 0.60
+        assert!(should_block_removable_write(&verdict_with(0.0, 0.60), &cfg));
+        assert!(!should_block_removable_write(&verdict_with(0.0, 0.59), &cfg));
+        // Any EDM row hit blocks regardless of containment/coverage.
+        let mut v = clean_verdict();
+        v.edm.push(crate::detect::EdmSourceHit {
+            source_id: "s".into(),
+            name: "PII".into(),
+            rows_hit: vec![crate::detect::EdmRowHit { row_id: 1, fields: vec!["x".into()] }],
+        });
+        assert!(should_block_removable_write(&v, &cfg));
+    }
+
+    #[test]
+    fn removable_write_allows_clean_file() {
+        let cfg = KguardConfig::default();
+        assert!(!should_block_removable_write(&clean_verdict(), &cfg));
     }
 
     #[test]
@@ -1240,6 +1384,11 @@ mod tests {
     const NT_PATH: &str = "\\Device\\HarddiskVolume7\\out\\plan.docx";
     const CHANNEL: &str = "usb-kguard";
 
+    /// Sealer is HEALTHY for every legacy assertion below (`sealer_healthy =
+    /// true`) — the standalone-guard / healthy-run-endpoint behaviour. The
+    /// `sealer_healthy = false` fail-secure path has its own tests further down.
+    const HEALTHY: bool = true;
+
     #[test]
     fn block_band_with_rule_seal_opt_in_allows_pending_seal() {
         let usb = encrypt_usb_cfg(BlockBandPolicy::Seal, None);
@@ -1253,6 +1402,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .expect("seal opt-in must override the kernel block");
         assert!(!block, "the guard stands aside for the sealer");
@@ -1280,6 +1430,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .is_none());
     }
@@ -1299,6 +1450,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .expect("unreadable on an encrypt destination must defer to the sealer");
         assert!(!block);
@@ -1323,6 +1475,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .is_none());
     }
@@ -1341,6 +1494,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .expect("a resolved encrypt destination always yields a decision for non-block rows");
         assert!(!block);
@@ -1361,6 +1515,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .unwrap();
         assert!(!block);
@@ -1385,6 +1540,7 @@ mod tests {
                     v.as_ref(),
                     NT_PATH,
                     CHANNEL,
+                    HEALTHY,
                 )
                 .is_none(),
                 "usb.enabled=false must leave guard behaviour untouched"
@@ -1407,6 +1563,7 @@ mod tests {
                 v.as_ref(),
                 NT_PATH,
                 CHANNEL,
+                HEALTHY,
             )
             .is_none());
         }
@@ -1427,6 +1584,7 @@ mod tests {
             None,
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .expect("no-bundle on an encrypt destination must defer to the sealer");
         assert!(!block);
@@ -1453,6 +1611,7 @@ mod tests {
             None,
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .is_none());
         // Unresolved device ⇒ decline too — never guess a whitelist match.
@@ -1464,6 +1623,7 @@ mod tests {
             None,
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .is_none());
     }
@@ -1482,6 +1642,7 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .is_none());
     }
@@ -1501,10 +1662,88 @@ mod tests {
             Some(&v),
             NT_PATH,
             CHANNEL,
+            HEALTHY,
         )
         .unwrap();
         assert!(!block);
         assert_eq!(inc.unwrap().note.as_deref(), Some("allowed-pending-seal"));
+    }
+
+    // --- Sealer-health fail-secure gate (run-endpoint) ----------------------
+
+    #[test]
+    fn unhealthy_sealer_blocks_seal_eligible_write() {
+        // sealer_healthy = false: a Seal decision must BLOCK (not allow), so a
+        // seal-eligible file never lands as plaintext when nobody can seal it.
+        // Covers seal-band, block-band-opt-in, unreadable, and no-bundle inputs.
+        let usb = encrypt_usb_cfg(BlockBandPolicy::Seal, None);
+        let dev = dev_with_serial("COURIER");
+        let cases: Vec<(Option<Verdict>, IncidentKind)> = vec![
+            (Some(verdict_with(0.20, 0.0)), IncidentKind::Match), // seal band
+            (Some(verdict_with(1.0, 1.0)), IncidentKind::Match),  // block band, seal opt-in
+            (Some(unreadable_verdict()), IncidentKind::UnreadableOnRemovable),
+            (None, IncidentKind::Sealed), // no bundle
+        ];
+        for (v, expect_kind) in cases {
+            let (block, inc) = write_scan_override(
+                DLP_REASON_WRITE,
+                &usb,
+                &EncryptBands::default(),
+                Some(&dev),
+                v.as_ref(),
+                NT_PATH,
+                CHANNEL,
+                false, // sealer UNHEALTHY
+            )
+            .expect("a seal-eligible file must yield a decision even when the sealer is down");
+            assert!(block, "unhealthy sealer must BLOCK a seal-eligible write");
+            let inc = inc.expect("a fail-secure block must be audited");
+            assert_eq!(inc.kind, expect_kind);
+            assert_eq!(inc.action_taken, ActionTaken::Blocked);
+            assert_eq!(inc.note.as_deref(), Some("seal-unavailable-blocked"));
+        }
+    }
+
+    #[test]
+    fn unhealthy_sealer_still_plain_allows_clean_files() {
+        // A clean file resolves to Plain regardless of sealer health: nothing to
+        // seal, so ALLOW with no incident — health only gates the Seal arm.
+        let usb = encrypt_usb_cfg(BlockBandPolicy::Block, None);
+        let dev = dev_with_serial("COURIER");
+        let v = clean_verdict();
+        let (block, inc) = write_scan_override(
+            DLP_REASON_WRITE,
+            &usb,
+            &EncryptBands::default(),
+            Some(&dev),
+            Some(&v),
+            NT_PATH,
+            CHANNEL,
+            false, // sealer UNHEALTHY
+        )
+        .expect("a resolved encrypt destination always yields a decision for non-block rows");
+        assert!(!block, "a clean (Plain) file is never blocked by sealer health");
+        assert!(inc.is_none());
+    }
+
+    #[test]
+    fn unhealthy_sealer_still_defers_block_band_to_kernel() {
+        // Default on_block_band = Block: the override declines (returns None)
+        // regardless of sealer health — the kernel block path owns the block band.
+        let usb = encrypt_usb_cfg(BlockBandPolicy::Block, None);
+        let dev = dev_with_serial("COURIER");
+        let v = verdict_with(1.0, 1.0);
+        assert!(write_scan_override(
+            DLP_REASON_WRITE,
+            &usb,
+            &EncryptBands::default(),
+            Some(&dev),
+            Some(&v),
+            NT_PATH,
+            CHANNEL,
+            false,
+        )
+        .is_none());
     }
 
     // --- NT volume-prefix → drive-letter matching (pure part of the shim) ---
