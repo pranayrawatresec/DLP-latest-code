@@ -21,6 +21,7 @@
 // =====================================================================
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const pool = require('../db/pool');
 const { audit } = require('../lib/audit');
@@ -37,6 +38,29 @@ app.use(express.json({ limit: '64kb' }));
 
 function str(v, max = 255) {
   return v == null ? null : String(v).slice(0, max);
+}
+
+// --- Org Root Key + KEK unwrap (Node built-in crypto only) -------------
+// Mirror of routes/encryption.js so the agent surface can UNWRAP the KEKs it
+// wrapped there. Read the ORK at request time (not module load) so ops can fix
+// .env + restart without a stale capture; never logged. Absent/malformed ORK
+// => callers fail secure (503). Key material BYTES are never logged/returned in
+// any log — only key ids.
+function orgRootKey() {
+  const hex = process.env.DLP_ORG_ROOT_KEY || '';
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+  return Buffer.from(hex, 'hex');
+}
+
+// Inverse of routes/encryption.js wrapKek. Layout: nonce(12) || ct || tag(16).
+// Returns the 32-byte plaintext KEK; throws on auth failure (wrong ORK/tamper).
+function unwrapKek(wrapped, ork) {
+  const nonce = wrapped.subarray(0, 12);
+  const tag = wrapped.subarray(wrapped.length - 16);
+  const ct = wrapped.subarray(12, wrapped.length - 16);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', ork, nonce);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]);
 }
 
 // --- POST /agent/enroll ------------------------------------------------
@@ -246,6 +270,79 @@ app.get('/agent/index', async (req, res, next) => {
   }
 });
 
+// --- GET /agent/trusted-config -----------------------------------------
+// mTLS. Delivers the trusted-destination whitelist AND the UNWRAPPED KEK bytes
+// the agent needs to seal/open .dlpenc files, so agents stop relying on local
+// [crypto]/[usb] config (M6). The mTLS body is the protection — same trust
+// level as the policy/index bundle the agent already receives.
+//
+// keys[] = the UNWRAPPED KEK bytes for every key referenced by a destination
+// PLUS every key whose state='rotated' (so agents can still OPEN older files).
+// Destroyed keys are NEVER included. If the ORK is missing/malformed => 503
+// (fail secure). Key material BYTES never enter any log/audit — only key ids.
+app.get('/agent/trusted-config', async (req, res, next) => {
+  const keks = []; // plaintext buffers to zero in finally
+  try {
+    const agent = await requireKnownAgent(req, res, 'agent-keys');
+    if (!agent) return;
+
+    const ork = orgRootKey();
+    if (!ork) {
+      // Fail secure: no ORK => cannot unwrap anything, deliver nothing.
+      return res.status(503).json({ error: 'encryption not configured' });
+    }
+
+    const destRes = await pool.query(
+      `select channel, matcher, mode, key_id, on_block_band
+         from trusted_destinations
+        order by created_at desc, id desc`
+    );
+    const destinations = destRes.rows.map((row) => ({
+      channel: row.channel,
+      matcher: row.matcher,
+      mode: row.mode,
+      keyId: row.key_id,
+      onBlockBand: row.on_block_band,
+    }));
+
+    // Every key a destination references (active or rotated) PLUS every rotated
+    // key, minus anything destroyed. octet-length guard is defense in depth.
+    const keyRes = await pool.query(
+      `select id, wrapped_kek from encryption_keys
+        where state <> 'destroyed'
+          and (state = 'rotated' or id in (select key_id from trusted_destinations))
+        order by id`
+    );
+
+    let keys;
+    try {
+      keys = keyRes.rows.map((row) => {
+        const kek = unwrapKek(row.wrapped_kek, ork);
+        keks.push(kek);
+        const keyB64 = kek.toString('base64');
+        return { id: row.id, keyB64 };
+      });
+    } catch (_) {
+      // Unwrap failed (wrong ORK / tampered wrapped_kek). Fail secure: deliver
+      // nothing rather than a partial keyring. Never surface the byte error.
+      return res.status(503).json({ error: 'encryption not configured' });
+    }
+
+    // Audit ONE entry per successful delivery — IDS ONLY, never bytes.
+    await audit('agent-keys', 'agent.keys_delivered', agent.id, {
+      keyIds: keys.map((k) => k.id),
+      destinationCount: destinations.length,
+    });
+
+    return res.status(200).json({ destinations, keys });
+  } catch (err) {
+    next(err);
+  } finally {
+    // Zero the plaintext KEK buffers right after base64-encoding.
+    for (const k of keks) k.fill(0);
+  }
+});
+
 // --- POST /agent/incidents ---------------------------------------------
 // An agent reports a detection. The verdict carries hashes and ids ONLY —
 // never captured file content (evidence blobs are a later phase). Identity
@@ -265,10 +362,28 @@ app.post('/agent/incidents', async (req, res, next) => {
     const fileName = str(body.fileName);
     const fileSha256 = str(body.fileSha256, 64);
 
+    // Enrichment (all optional, all metadata — never content): what the agent
+    // did, the endpoint user, and the detection type derived from the verdict.
+    const ACTIONS = new Set(['blocked', 'audited', 'read_only', 'encrypted']);
+    const actionRaw = str(body.actionTaken, 16);
+    const actionTaken = ACTIONS.has(actionRaw) ? actionRaw : null;
+    const osUser = str(body.osUser, 128) || null;
+    // Seal metadata (additive, optional): the KEK id that sealed the file and
+    // the hash of the resulting envelope. IDs/hashes only, never key material.
+    const keyId = str(body.keyId, 128);
+    const sealedSha256 = str(body.sealedSha256, 64);
+    const idmN = Array.isArray(verdict.idm) ? verdict.idm.length : 0;
+    const edmN = Array.isArray(verdict.edm) ? verdict.edm.length : 0;
+    const detectionType =
+      idmN && edmN ? 'idm+edm' : edmN ? 'edm' : idmN ? 'idm' : null;
+
     const { rows } = await pool.query(
-      `insert into detection_incidents (agent_id, channel, verdict_json, file_name, file_sha256)
-       values ($1, $2, $3, $4, $5) returning id`,
-      [agent.id, channel, JSON.stringify(verdict), fileName, fileSha256]
+      `insert into detection_incidents
+         (agent_id, channel, verdict_json, file_name, file_sha256,
+          action_taken, os_user, detection_type, key_id, sealed_sha256)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning id`,
+      [agent.id, channel, JSON.stringify(verdict), fileName, fileSha256,
+       actionTaken, osUser, detectionType, keyId, sealedSha256]
     );
     const incidentId = rows[0].id;
     // Audited (a detection is a security event) — channel + ids only,

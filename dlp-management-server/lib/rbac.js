@@ -14,15 +14,31 @@ const ROLE_PERMISSIONS = {
     'license.manage',
     'license.read',
     'protect:read', // view protected-document registry (metadata, never content)
+    'encryption_keys:manage', // create/rotate/destroy KEKs (metadata only — never plaintext key material)
+    'trusted_destinations:read', // see which destinations reference which key
   ],
-  policy_author: ['policies.read', 'policies.write', 'protect:write', 'protect:read'],
-  incident_reviewer: ['incidents.read', 'evidence.read', 'evidence.export', 'protect:read'],
+  policy_author: [
+    'policies.read',
+    'policies.write',
+    'protect:write',
+    'protect:read',
+    'trusted_destinations:read', // encrypt-on-write whitelist is policy
+    'trusted_destinations:write',
+  ],
+  incident_reviewer: [
+    'incidents.read',
+    'incidents.read_metadata', // a reviewer can obviously see the metadata list too
+    'evidence.read',
+    'evidence.export',
+    'protect:read',
+  ],
   auditor: [
     'audit.read',
     'agents.read',
     'incidents.read_metadata',
     'license.read',
     'protect:read',
+    'trusted_destinations:read', // review the whitelist + key states (metadata only)
   ],
 };
 

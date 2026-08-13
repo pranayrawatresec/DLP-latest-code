@@ -91,6 +91,10 @@ pub enum ApplyOutcome {
 pub fn plan(action: Action, dev: &DeviceIdentity) -> PlannedAction {
     match action {
         Action::AllowAudited => PlannedAction::NoChange,
+        // Encrypt-on-write (spec §3.1/§5.1): at DEVICE level nothing changes —
+        // writes proceed. The per-file seal on the volume is the copy
+        // auditor's job (M3), not device enforcement.
+        Action::Encrypt => PlannedAction::NoChange,
         Action::ReadOnly => PlannedAction::SetWriteProtect {
             key: WRITE_PROTECT_KEY.to_string(),
             value_name: WRITE_PROTECT_VALUE.to_string(),
@@ -117,6 +121,11 @@ pub fn plan_revert_read_only() -> PlannedAction {
 pub fn plan_mtp(action: Action) -> PlannedAction {
     match action {
         Action::AllowAudited => PlannedAction::NoChange,
+        // MTP/WPD devices never mount a volume, so the copy auditor (which
+        // performs the file-level seal) can never run there — `Encrypt`
+        // cannot be honoured. Fail secure: deny writes (same as ReadOnly)
+        // rather than silently allowing unarmoured copies.
+        Action::Encrypt => PlannedAction::SetWpdDeny { read: false, write: true },
         Action::ReadOnly => PlannedAction::SetWpdDeny { read: false, write: true },
         Action::Block => PlannedAction::SetWpdDeny { read: true, write: true },
     }
@@ -132,7 +141,10 @@ pub fn plan_revert_mtp() -> PlannedAction {
 pub fn plan_tethering(action: Action) -> PlannedAction {
     match action {
         Action::Block => PlannedAction::BlockTethering,
-        _ => PlannedAction::NoChange,
+        // Tethering is allow/block only: ReadOnly has always been a no-op
+        // here, and there is no file stream to seal, so Encrypt is too.
+        // Explicit arms (no catch-all) so a future Action variant is flagged.
+        Action::AllowAudited | Action::Encrypt | Action::ReadOnly => PlannedAction::NoChange,
     }
 }
 
@@ -505,6 +517,30 @@ mod tests {
         let p = plan_mtp(Action::Block);
         let outcome = apply(&p, Mode::DryRun).expect("dry-run never fails");
         assert_eq!(outcome, ApplyOutcome::Planned(PlannedAction::SetWpdDeny { read: true, write: true }));
+    }
+
+    // --- Trusted-destination encryption (encrypt-on-write spec §3.1) --------
+
+    #[test]
+    fn encrypt_plans_no_change_at_device_level() {
+        // The seal is the copy auditor's job (M3); device enforcement does
+        // nothing for an Encrypt destination.
+        assert_eq!(plan(Action::Encrypt, &dev()), PlannedAction::NoChange);
+    }
+
+    #[test]
+    fn mtp_encrypt_fails_secure_to_write_deny() {
+        // No auditor ever runs on MTP (no drive letter), so Encrypt cannot be
+        // honoured there — it must NOT silently allow unarmoured writes.
+        assert_eq!(
+            plan_mtp(Action::Encrypt),
+            PlannedAction::SetWpdDeny { read: false, write: true }
+        );
+    }
+
+    #[test]
+    fn tethering_encrypt_is_no_change_like_read_only() {
+        assert_eq!(plan_tethering(Action::Encrypt), PlannedAction::NoChange);
     }
 
     #[test]

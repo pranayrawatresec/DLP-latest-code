@@ -1,0 +1,1 @@
+[7] run read-deny test AS rustdesk.exe (signature exfil - OPORD [deny] + innocent [allow])

@@ -17,6 +17,10 @@
 // Read at most this many bytes of a text-like file into the scan_text request.
 const MAX_TEXT_BYTES = 1024 * 1024; // 1 MiB
 
+// Read at most this many bytes of a BINARY file (PDF/DOCX/…) to send as content
+// for real content inspection (scan_bytes). Matches the host + kernel content cap.
+const MAX_SCAN_BYTES = 4 * 1024 * 1024; // 4 MiB
+
 // Extensions we treat as text and read inline. Everything else -> scan_file
 // (name only). This is deliberately conservative.
 const TEXT_EXTENSIONS = new Set([
@@ -70,15 +74,44 @@ function requestVerdict(req) {
   });
 }
 
+// Read up to MAX_SCAN_BYTES of a Blob/File and return base64 (WITHOUT the
+// "data:...;base64," prefix), or '' on failure. The browser gives us the file's
+// CONTENT (it only hides the disk *path*), so readAsDataURL yields the bytes as
+// base64 — the browser-native way to encode a Blob without stack-blowing on large
+// arrays.
+function readBytesBase64(file) {
+  return new Promise((resolve) => {
+    try {
+      const slice = file.slice(0, MAX_SCAN_BYTES);
+      const reader = new FileReader();
+      reader.onload = () => {
+        const s = String(reader.result || '');
+        const i = s.indexOf(',');
+        resolve(i >= 0 ? s.slice(i + 1) : '');
+      };
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(slice);
+    } catch (_e) {
+      resolve('');
+    }
+  });
+}
+
 // Scan a single File object. Returns a verdict object.
 async function scanFile(file, url, origin) {
   if (isTextLike(file)) {
     const text = await readTextPrefix(file);
     return requestVerdict({ kind: 'scan_text', text, url, origin });
   }
-  // Browsers sandbox the real filesystem path; we can only forward the name.
-  // The host scans by name (best effort). Honest limit — see README.
-  return requestVerdict({ kind: 'scan_file', path: file.name, url, origin });
+  // Binary file (PDF/DOCX/XLSX/…): send its BYTES so the host runs real content
+  // inspection (verdict_bytes) — not name-only. This is the endpoint-DLP / Purview
+  // equivalent for binary uploads.
+  const contentB64 = await readBytesBase64(file);
+  if (!contentB64) {
+    // Could not read the bytes → fall back to name-only (best effort).
+    return requestVerdict({ kind: 'scan_file', path: file.name, url, origin });
+  }
+  return requestVerdict({ kind: 'scan_bytes', path: file.name, content_b64: contentB64, url, origin });
 }
 
 // Scan raw text (paste / text form field). Returns a verdict object.
@@ -260,6 +293,14 @@ window.addEventListener('message', async (ev) => {
   let verdict;
   if (d.kind === 'scan_text') {
     verdict = await scanText(String(d.text || ''), pageUrl(), pageOrigin());
+  } else if (d.kind === 'scan_bytes') {
+    verdict = await requestVerdict({
+      kind: 'scan_bytes',
+      path: String(d.name || ''),
+      content_b64: String(d.content_b64 || ''),
+      url: pageUrl(),
+      origin: pageOrigin(),
+    });
   } else {
     verdict = await requestVerdict({
       kind: 'scan_file',

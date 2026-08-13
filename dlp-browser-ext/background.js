@@ -116,8 +116,13 @@ function scan(req) {
     };
     if (req.kind === 'scan_text') {
       wire.text = typeof req.text === 'string' ? req.text : '';
+    } else if (req.kind === 'scan_bytes') {
+      // Binary upload: forward the filename (format detection) + the file's
+      // base64 bytes so the host content-inspects it (verdict_bytes).
+      wire.path = typeof req.path === 'string' ? req.path : '';
+      wire.content_b64 = typeof req.content_b64 === 'string' ? req.content_b64 : '';
     } else {
-      // scan_file
+      // scan_file (legacy name-only)
       wire.path = typeof req.path === 'string' ? req.path : '';
     }
 

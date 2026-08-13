@@ -11,7 +11,10 @@ usb-guard) connects to. Provides:
 
 Security: the port is created with a default security descriptor granting
 FLT_PORT_ALL_ACCESS to Administrators and SYSTEM only, and a maximum of ONE
-connection (SPEC 2.3). No secrets cross the port; only a file path + metadata.
+connection (SPEC 2.3). The verdict request carries the file path, metadata, and
+(v2) up to DLP_MAX_CONTENT bytes of file content read in-kernel so the service
+can fingerprint without re-opening the file. Content is capped at 4 MiB and is
+NEVER logged; it exists only in the in-flight message buffer.
 
 --*/
 
@@ -29,6 +32,8 @@ static NTSTATUS FLTAPI DlpPortConnect(
 
 static VOID FLTAPI DlpPortDisconnect(_In_opt_ PVOID ConnectionCookie);
 
+static VOID DlpReadDword(_In_ HANDLE Key, _In_ PCWSTR Name, _Inout_ PULONG Out);
+
 static NTSTATUS FLTAPI DlpPortMessage(
     _In_opt_ PVOID PortCookie,
     _In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
@@ -43,6 +48,9 @@ static NTSTATUS FLTAPI DlpPortMessage(
 #pragma alloc_text(PAGE, DlpPortConnect)
 #pragma alloc_text(PAGE, DlpPortDisconnect)
 #pragma alloc_text(PAGE, DlpReadFailMode)
+#pragma alloc_text(PAGE, DlpReadDword)
+#pragma alloc_text(PAGE, DlpReadTaintPolicy)
+#pragma alloc_text(PAGE, DlpReadExfilPolicy)
 #endif
 
 
@@ -77,8 +85,8 @@ DlpCreateCommunicationPort(_In_ PFLT_FILTER Filter)
         NULL,                       /* server port cookie */
         DlpPortConnect,
         DlpPortDisconnect,
-        DlpPortMessage,             /* user->kernel: DLP_CONFIG scan scope */
-        1);                         /* max connections = 1 (SPEC 2.3) */
+        DlpPortMessage,             /* user->kernel: DLP_CONFIG + DLP_EXFIL_UPDATE */
+        2);                         /* scanner (receive/reply) + push-only exfil conn */
 
     FltFreeSecurityDescriptor(sd);
     return status;
@@ -102,6 +110,14 @@ DlpCloseCommunicationPort(VOID)
 /* ------------------------------------------------------------------------- *
  *  Connect / disconnect                                                     *
  * ------------------------------------------------------------------------- */
+/* Per-connection role cookies. The SCANNER connection (usb-guard's receive/reply
+ * loop) owns ClientPort + ServicePid; a second PUSH connection -- opened with the
+ * DLP_EXFIL_VERSION context so its FilterSendMessage(exfil-set) never shares a
+ * handle with the scanner's FilterGetMessage -- must NOT touch ClientPort on
+ * connect or disconnect. */
+#define DLP_CONN_SCAN  ((PVOID)(ULONG_PTR)1)
+#define DLP_CONN_PUSH  ((PVOID)(ULONG_PTR)2)
+
 static NTSTATUS FLTAPI
 DlpPortConnect(_In_ PFLT_PORT ClientPort,
                _In_opt_ PVOID ServerPortCookie,
@@ -109,29 +125,62 @@ DlpPortConnect(_In_ PFLT_PORT ClientPort,
                _In_ ULONG SizeOfContext,
                _Outptr_result_maybenull_ PVOID *ConnectionPortCookie)
 {
+    ULONG connCtx = 0;
+
     UNREFERENCED_PARAMETER(ServerPortCookie);
-    UNREFERENCED_PARAMETER(ConnectionContext);
-    UNREFERENCED_PARAMETER(SizeOfContext);
 
     PAGED_CODE();
 
-    /* Record the connected client port and its PID. ConnectNotify runs in the
-     * connecting process's context, so PsGetCurrentProcessId() is the service
-     * PID we self-skip on (SPEC 2.4). The service MUST be the connecting
-     * process (dlp-agent usb-guard). */
+    /* Read the connection context to detect the push-only connection. FltMgr
+     * copies the caller's context into a NONPAGED-POOL kernel buffer before it
+     * invokes this callback, so ConnectionContext is a KERNEL-mode pointer -- it
+     * must be read directly. (The previous ProbeForRead was wrong: ProbeForRead
+     * rejects any non-user address, so it ALWAYS faulted here, the SEH forced
+     * connCtx=0, and the push connection was misclassified as the scanner -- which
+     * clobbered ClientPort with the push port and made every up-call time out.)
+     * Keep an SEH guard purely as a belt-and-braces against a malformed buffer. */
+    if (ConnectionContext != NULL && SizeOfContext >= sizeof(ULONG)) {
+        __try {
+            connCtx = *(const volatile ULONG *)ConnectionContext;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            connCtx = 0;
+        }
+    }
+
+    if (connCtx == DLP_EXFIL_VERSION) {
+        /* Push-only connection: exists solely to deliver DLP_EXFIL_UPDATE via
+         * DlpPortMessage on its OWN handle. Do NOT become the ClientPort. */
+        *ConnectionPortCookie = DLP_CONN_PUSH;
+        return STATUS_SUCCESS;
+    }
+
+    /* Scanner connection. ConnectNotify runs in the connecting process's context,
+     * so PsGetCurrentProcessId() is the service PID we self-skip on (SPEC 2.4). */
     gDlpData.ClientPort = ClientPort;
     InterlockedExchange(&gDlpData.ServicePid,
                         (LONG)(ULONG_PTR)PsGetCurrentProcessId());
 
-    *ConnectionPortCookie = NULL;
+    /* Item 4 (H2): a fresh agent connection may carry fresh policy -- bump the
+     * epoch so any known-bad hash / cached verdict from a previous session is
+     * treated as a miss. Item 3 (H5): a new agent is healthy by definition, so
+     * reset the circuit breaker. */
+    InterlockedIncrement(&gDlpData.Epoch);
+    InterlockedExchange(&gDlpData.ConsecutiveTimeouts, 0);
+
+    *ConnectionPortCookie = DLP_CONN_SCAN;
     return STATUS_SUCCESS;
 }
 
 static VOID FLTAPI
 DlpPortDisconnect(_In_opt_ PVOID ConnectionCookie)
 {
-    UNREFERENCED_PARAMETER(ConnectionCookie);
     PAGED_CODE();
+
+    /* The push-only connection closing must NOT tear down the scanner's client
+     * state. Only the scanner connection clears ClientPort/ServicePid. */
+    if (ConnectionCookie == DLP_CONN_PUSH) {
+        return;
+    }
 
     /* Clear client state; new scans will now honor FailMode until a client
      * reconnects. FltMgr closes the client port after this returns. */
@@ -179,10 +228,59 @@ DlpPortMessage(_In_opt_ PVOID PortCookie,
     UNREFERENCED_PARAMETER(OutputBuffer);
     UNREFERENCED_PARAMETER(OutputBufferLength);
 
+    ULONG version = 0;
+
     *ReturnOutputBufferLength = 0;
 
-    /* Only a full DLP_CONFIG is accepted; nothing else. */
-    if (InputBuffer == NULL || InputBufferLength < sizeof(DLP_CONFIG)) {
+    /* Two user->kernel messages share this port: DLP_CONFIG (scan scope) and
+     * DLP_EXFIL_UPDATE (exfil-PID set). They are discriminated by the first ULONG:
+     * DLP_CONFIG_VERSION (1) vs the DLP_EXFIL_VERSION magic. Read it first (SEH). */
+    if (InputBuffer == NULL || InputBufferLength < sizeof(ULONG)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    __try {
+        ProbeForRead(InputBuffer, sizeof(ULONG), __alignof(ULONG));
+        version = *(volatile ULONG *)InputBuffer;
+    } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
+        return STATUS_INVALID_USER_BUFFER;
+    }
+
+    /* ---- DLP_EXFIL_UPDATE (read-deny exfil-PID full-replace) --------------- */
+    if (version == DLP_EXFIL_VERSION) {
+        ULONG count = 0;
+        ULONG *kbuf;
+
+        if (InputBufferLength < sizeof(DLP_EXFIL_UPDATE)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        /* DlpExfilReplace takes a spinlock and must not touch user memory, so copy
+         * the PID array into a kernel buffer under SEH first. Bounded. */
+#pragma warning(suppress: 4996)
+        kbuf = (ULONG *)ExAllocatePoolWithTag(NonPagedPoolNx,
+                                              DLP_EXFIL_MSG_MAX * sizeof(ULONG),
+                                              DLP_EXFIL_TAG);
+        if (kbuf == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        __try {
+            PDLP_EXFIL_UPDATE in = (PDLP_EXFIL_UPDATE)InputBuffer;
+            ProbeForRead(InputBuffer, sizeof(DLP_EXFIL_UPDATE), __alignof(ULONG));
+            count = in->Count;
+            if (count > DLP_EXFIL_MSG_MAX) {
+                count = DLP_EXFIL_MSG_MAX;
+            }
+            RtlCopyMemory(kbuf, in->Pids, count * sizeof(ULONG));
+        } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
+            ExFreePoolWithTag(kbuf, DLP_EXFIL_TAG);
+            return STATUS_INVALID_USER_BUFFER;
+        }
+        DlpExfilReplace(kbuf, count);
+        ExFreePoolWithTag(kbuf, DLP_EXFIL_TAG);
+        return STATUS_SUCCESS;
+    }
+
+    /* ---- DLP_CONFIG (scan scope) ------------------------------------------- */
+    if (version != DLP_CONFIG_VERSION || InputBufferLength < sizeof(DLP_CONFIG)) {
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -194,7 +292,7 @@ DlpPortMessage(_In_opt_ PVOID PortCookie,
 
         ProbeForRead(InputBuffer, sizeof(DLP_CONFIG), __alignof(ULONG));
 
-        if (in->Version != DLP_CONFIG_VERSION || in->WatchCount > DLP_MAX_WATCH) {
+        if (in->WatchCount > DLP_MAX_WATCH) {
             status = STATUS_INVALID_PARAMETER;
         } else {
             RtlCopyMemory(&gDlpData.Config, in, sizeof(DLP_CONFIG));
@@ -338,63 +436,176 @@ DlpConfigPathIsWatched(_In_ PCUNICODE_STRING Path)
 /* ------------------------------------------------------------------------- *
  *  Kernel -> user verdict request                                           *
  * ------------------------------------------------------------------------- */
+
+/* Item 6: build a relative (negative) 100ns timeout from a millisecond value,
+ * clamping the ms input to DLP_REPLY_TIMEOUT_MS_CEILING FIRST so the *10000
+ * multiply into a LONGLONG can never overflow and a wedged agent can never pin
+ * a file close longer than the ceiling. */
+static VOID
+DlpMakeTimeoutMs(_Out_ PLARGE_INTEGER Timeout, _In_ ULONG Milliseconds)
+{
+    if (Milliseconds > DLP_REPLY_TIMEOUT_MS_CEILING) {
+        Milliseconds = DLP_REPLY_TIMEOUT_MS_CEILING;
+    }
+    Timeout->QuadPart = -((LONGLONG)Milliseconds * 10000LL);
+}
+
 NTSTATUS
 DlpQueryVerdict(_In_ PUNICODE_STRING Path,
                 _In_ ULONGLONG FileId,
                 _In_ ULONG ProcessId,
+                _In_reads_bytes_opt_(ContentLength) PVOID Content,
+                _In_ ULONG ContentLength,
+                _In_ BOOLEAN Truncated,
+                _In_ ULONG Reason,
                 _Out_ PBOOLEAN Block)
 {
     NTSTATUS status;
-    DLP_SCAN_REQUEST request;
+    PDLP_SCAN_REQUEST request;
     DLP_SCAN_REPLY reply;
     ULONG replyLength = sizeof(DLP_SCAN_REPLY);
     LARGE_INTEGER timeout;
     USHORT copyBytes;
+    ULONG contentBytes;
+    ULONG senderLength;
 
-    /* Fail-safe default before any work. */
+    /* Fail-safe default before any work. Every early return below leaves *Block
+     * at this FailMode value -- fail-SECURE per registry policy (never a
+     * hardcoded allow), which is where ours deliberately differs from the old
+     * driver's fail-open. */
     *Block = (gDlpData.FailMode == DLP_FAILMODE_BLOCK);
+
+    /* A3: FltSendMessage waits -> PASSIVE_LEVEL only. The cleanup pre-op caller
+     * is at PASSIVE, but assert/guard here so any future higher-IRQL call site
+     * fails-secure loudly rather than stalling. */
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;   /* *Block already FailMode */
+    }
 
     if (gDlpData.ClientPort == NULL) {
         return STATUS_PORT_DISCONNECTED;   /* *Block already set from FailMode */
     }
 
-    /* Build the request. Path is copied inline, bounded to DLP_MAX_PATH_CHARS;
-     * over-long paths are truncated and the truncation is inherently visible to
-     * the service (PathLength < full name). Contents are NEVER sent. */
-    RtlZeroMemory(&request, sizeof(request));
-    request.Version = DLP_MSG_VERSION;
-    request.Reserved = 0;
-    request.FileId = FileId;
-    request.ProcessId = ProcessId;
+    /* Item 3 (H5): circuit breaker. After DLP_BREAKER_THRESHOLD consecutive IPC
+     * timeouts, stop up-calling and apply FailMode until a live reply (or an
+     * agent reconnect) clears the counter -- an agent stall must never add the
+     * IPC timeout to every single file close. */
+    if (InterlockedCompareExchange(&gDlpData.ConsecutiveTimeouts, 0, 0) >=
+        DLP_BREAKER_THRESHOLD) {
+        return STATUS_PORT_DISCONNECTED;   /* *Block already FailMode */
+    }
+
+    /* Bound the content to the wire cap. The caller already reads at most
+     * DLP_MAX_CONTENT bytes, but clamp defensively so the sender length can
+     * never exceed sizeof(header)+cap. */
+    contentBytes = ContentLength;
+    if (contentBytes > DLP_MAX_CONTENT) {
+        contentBytes = DLP_MAX_CONTENT;
+    }
+    if (Content == NULL) {
+        contentBytes = 0;
+    }
+
+    /* The v2 sender buffer is [DLP_SCAN_REQUEST header][content bytes]. It can
+     * be up to sizeof(header)+4 MiB, far too large for the stack -- allocate it
+     * from NonPagedPoolNx. On alloc failure, fail-safe from FailMode. */
+    senderLength = sizeof(DLP_SCAN_REQUEST) + contentBytes;
+    /* ExAllocatePool2 is unavailable at this NTDDI baseline (the proven build
+     * recipe pins the Win10 base); ExAllocatePoolWithTag(NonPagedPoolNx) is the
+     * correct tagged non-paged alloc here. Suppress only the C4996 nudge. */
+#pragma warning(suppress: 4996)
+    request = (PDLP_SCAN_REQUEST)ExAllocatePoolWithTag(
+        NonPagedPoolNx, senderLength, DLP_GENERAL_TAG);
+    if (request == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;  /* *Block already FailMode */
+    }
+
+    /* Build the request header. Path is copied inline, bounded to
+     * DLP_MAX_PATH_CHARS; over-long paths are truncated and the truncation is
+     * inherently visible to the service (PathLength < full name). The content
+     * (read in-kernel by the caller) is appended after the header. */
+    RtlZeroMemory(request, sizeof(DLP_SCAN_REQUEST));
+    request->Version = DLP_MSG_VERSION;
+    /* Repurposed Reserved field (offset 4): the scan reason. No wire size
+     * change; the Rust mirror renames the same u32 reserved->reason. */
+    request->Reserved = Reason;
+    request->FileId = FileId;
+    request->ProcessId = ProcessId;
 
     copyBytes = Path->Length;
-    if (copyBytes > sizeof(request.Path)) {
-        copyBytes = sizeof(request.Path);
+    if (copyBytes > sizeof(request->Path)) {
+        copyBytes = sizeof(request->Path);
     }
     if (Path->Buffer != NULL && copyBytes > 0) {
-        RtlCopyMemory(request.Path, Path->Buffer, copyBytes);
+        RtlCopyMemory(request->Path, Path->Buffer, copyBytes);
     }
-    request.PathLength = copyBytes;
+    request->PathLength = copyBytes;
+    request->Pad = 0;
+    request->ContentLength = contentBytes;
+    request->Truncated = Truncated ? 1 : 0;
+
+    if (contentBytes > 0) {
+        /* Append content immediately after the fixed header. */
+        RtlCopyMemory((PUCHAR)request + sizeof(DLP_SCAN_REQUEST),
+                      Content, contentBytes);
+    }
 
     RtlZeroMemory(&reply, sizeof(reply));
-    timeout.QuadPart = DLP_REPLY_TIMEOUT_100NS;
+    DlpMakeTimeoutMs(&timeout, DLP_REPLY_TIMEOUT_MS);   /* item 6: clamped */
+
+    /* Item 2 (A4): bracket the send in rundown protection so Unload can drain
+     * an in-flight FltSendMessage before it closes the ports / unregisters. If
+     * the acquire fails the driver is unloading -> fail-secure per FailMode.
+     * The send passes &gDlpData.ClientPort (the GLOBAL) so FltCloseClientPort's
+     * NULL-on-close deterministically unblocks a send waiting here. */
+    if (!ExAcquireRundownProtection(&gDlpData.SendRundown)) {
+        ExFreePoolWithTag(request, DLP_GENERAL_TAG);
+        return STATUS_PORT_DISCONNECTED;   /* *Block already FailMode */
+    }
 
     status = FltSendMessage(
         gDlpData.Filter,
         &gDlpData.ClientPort,
-        &request, sizeof(request),
+        request, senderLength,
         &reply, &replyLength,
         &timeout);
 
-    if (status == STATUS_SUCCESS && replyLength >= sizeof(DLP_SCAN_REPLY)) {
-        /* Honor the service's verdict. */
-        *Block = (reply.Verdict == DLP_VERDICT_BLOCK);
-        return STATUS_SUCCESS;
+    ExReleaseRundownProtection(&gDlpData.SendRundown);
+
+    ExFreePoolWithTag(request, DLP_GENERAL_TAG);
+
+    /* Item 3 (H5): STATUS_TIMEOUT is an NT_SUCCESS code -- branch on it
+     * explicitly and count it toward the breaker. FailMode already governs
+     * *Block, so a stalled agent fails-secure per policy. */
+    if (status == STATUS_TIMEOUT) {
+        InterlockedIncrement(&gDlpData.ConsecutiveTimeouts);
+        return STATUS_TIMEOUT;   /* *Block already FailMode */
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;           /* disconnect mid-flight etc.; *Block FailMode */
     }
 
-    /* STATUS_TIMEOUT, disconnect mid-flight, or a short/garbled reply: apply
-     * FailMode. *Block is already the FailMode default; keep it. */
-    return (status == STATUS_SUCCESS) ? STATUS_UNSUCCESSFUL : status;
+    /* A live reply proves the agent is healthy -- clear the breaker. */
+    InterlockedExchange(&gDlpData.ConsecutiveTimeouts, 0);
+
+    /* Item 5: validate the reply BEFORE trusting the verdict. The reply carries
+     * no version field (the frozen v2 protocol must not change), so validate
+     * exact length + the echoed FileId instead, and require a known verdict.
+     * Any mismatch falls back to FailMode (fail-secure). */
+    if (replyLength != sizeof(DLP_SCAN_REPLY)) {
+        return STATUS_INVALID_PARAMETER;   /* *Block already FailMode */
+    }
+    if (reply.FileId != FileId) {
+        return STATUS_INVALID_PARAMETER;   /* stale/misrouted reply */
+    }
+    if (reply.Verdict != DLP_VERDICT_ALLOW && reply.Verdict != DLP_VERDICT_BLOCK) {
+        return STATUS_INVALID_PARAMETER;   /* unknown verdict -> FailMode */
+    }
+
+    /* Honor the validated service verdict. */
+    *Block = (reply.Verdict == DLP_VERDICT_BLOCK);
+    return STATUS_SUCCESS;
 }
 
 
@@ -437,4 +648,139 @@ DlpReadFailMode(_In_ PUNICODE_STRING RegistryPath)
     }
 
     ZwClose(key);
+}
+
+/* Read one REG_DWORD from the open key into *Out; leaves *Out unchanged if the
+ * value is absent or not a DWORD. Helper for DlpReadTaintPolicy. */
+static VOID
+DlpReadDword(_In_ HANDLE Key, _In_ PCWSTR Name, _Inout_ PULONG Out)
+{
+    NTSTATUS status;
+    UNICODE_STRING valueName;
+    UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)] = { 0 };
+    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)buffer;
+    ULONG resultLength = 0;
+
+    RtlInitUnicodeString(&valueName, Name);
+    status = ZwQueryValueKey(Key, &valueName, KeyValuePartialInformation,
+                             buffer, sizeof(buffer), &resultLength);
+    if (NT_SUCCESS(status) &&
+        info->Type == REG_DWORD &&
+        info->DataLength == sizeof(ULONG)) {
+        *Out = *(PULONG)info->Data;
+    }
+}
+
+VOID
+DlpReadTaintPolicy(_In_ PUNICODE_STRING RegistryPath)
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    ULONG enabled = DLP_READTAINT_DISABLED;
+    ULONG policy = DLP_TEP_BLOCK_ALL;
+
+    PAGED_CODE();
+
+    /* Defaults already set by DriverEntry (disabled + block-all). Only override
+     * from explicit, valid REG_DWORD values -- an absent key keeps read-taint
+     * OFF (today's FS-only behavior; opt-in, fail-safe). */
+    InitializeObjectAttributes(&oa, RegistryPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+
+    status = ZwOpenKey(&key, KEY_READ, &oa);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    DlpReadDword(key, L"ReadTaintEnabled", &enabled);
+    DlpReadDword(key, L"TaintedEgressPolicy", &policy);
+
+    ZwClose(key);
+
+    gDlpData.ReadTaintEnabled =
+        (enabled == DLP_READTAINT_ENABLED) ? DLP_READTAINT_ENABLED
+                                           : DLP_READTAINT_DISABLED;
+    gDlpData.TaintedEgressPolicy =
+        (policy == DLP_TEP_BLOCK_NONLOCAL) ? DLP_TEP_BLOCK_NONLOCAL
+                                           : DLP_TEP_BLOCK_ALL;
+}
+
+VOID
+DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath)
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    ULONG enabled = DLP_EXFILREAD_DISABLED;
+    ULONG failBlock = 1;                    /* default: deny unverifiable content */
+
+    PAGED_CODE();
+
+    /* Defaults already set by DriverEntry (disabled + fail-block). Only override
+     * from explicit, valid REG_DWORD values -- an absent key keeps read-deny OFF. */
+    InitializeObjectAttributes(&oa, RegistryPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+
+    status = ZwOpenKey(&key, KEY_READ, &oa);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    DlpReadDword(key, L"ExfilReadBlockEnabled", &enabled);
+    DlpReadDword(key, L"ExfilReadFailBlock", &failBlock);
+
+    ZwClose(key);
+
+    gDlpData.ExfilReadBlockEnabled =
+        (enabled == DLP_EXFILREAD_ENABLED) ? DLP_EXFILREAD_ENABLED
+                                           : DLP_EXFILREAD_DISABLED;
+    gDlpData.ExfilReadFailBlock = (failBlock != 0) ? 1u : 0u;
+}
+
+/* TEMP-DIAGNOSTIC: write 3 named DWORDs + a seq to the saved service key. */
+static VOID
+DlpTraceWrite(_In_ PCWSTR N1, _In_ ULONG V1, _In_ PCWSTR N2, _In_ ULONG V2,
+              _In_ PCWSTR N3, _In_ ULONG V3, _In_ PCWSTR NSeq, _In_ volatile LONG *Seq)
+{
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING path, vn;
+    HANDLE key = NULL;
+    ULONG s;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL || !gDlpData.SvcRegPathValid) {
+        return;
+    }
+    path.Buffer = gDlpData.SvcRegPath;
+    path.Length = gDlpData.SvcRegPathBytes;
+    path.MaximumLength = gDlpData.SvcRegPathBytes;
+    InitializeObjectAttributes(&oa, &path,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_SET_VALUE, &oa))) {
+        return;
+    }
+    s = (ULONG)InterlockedIncrement(Seq);
+    RtlInitUnicodeString(&vn, N1);   (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &V1, sizeof(V1));
+    RtlInitUnicodeString(&vn, N2);   (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &V2, sizeof(V2));
+    RtlInitUnicodeString(&vn, N3);   (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &V3, sizeof(V3));
+    RtlInitUnicodeString(&vn, NSeq); (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &s, sizeof(s));
+    ZwClose(key);
+}
+
+VOID DlpTraceCre(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG Skip)
+{
+    DlpTraceWrite(L"CrePid", Pid, L"CreExfil", Exfil, L"CreSkip", Skip,
+                  L"CreSeq", &gDlpData.TrCreSeq);
+}
+VOID DlpTraceRd(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG Skip)
+{
+    DlpTraceWrite(L"RdPid", Pid, L"RdExfil", Exfil, L"RdSkip", Skip,
+                  L"RdSeq", &gDlpData.TrRdSeq);
+}
+VOID DlpTraceSec(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG SyncType)
+{
+    DlpTraceWrite(L"SecPid", Pid, L"SecExfil", Exfil, L"SecSync", SyncType,
+                  L"SecSeq", &gDlpData.TrSecSeq);
 }

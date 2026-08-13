@@ -10,7 +10,13 @@
 pub mod browser_host;
 pub mod clipboard;
 pub mod config;
+pub mod crypto;
+pub mod decrypt;
 pub mod detect;
+pub mod exfil;
 pub mod netfilter;
+pub mod notify;
 pub mod storage;
+pub mod trustdest;
+pub mod trustsync;
 pub mod usb;

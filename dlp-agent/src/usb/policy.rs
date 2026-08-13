@@ -20,23 +20,32 @@ use super::device::DeviceIdentity;
 /// volume read-only; `Block` prevents mounting/writing entirely.
 ///
 /// Deserializes from the snake_case strings used in the TOML `[usb]` section
-/// (`allow_audited` | `read_only` | `block`).
+/// (`allow_audited` | `encrypt` | `read_only` | `block`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     AllowAudited,
+    /// Trusted-destination encryption (encrypt-on-write spec §3.1): writes to
+    /// the device proceed but sensitive files land as sealed `.dlpenc`
+    /// envelopes (the encrypt mode/key live in the rule's config fields). At
+    /// device level this changes nothing; the file-level seal is the copy
+    /// auditor's job (M3).
+    Encrypt,
     ReadOnly,
     Block,
 }
 
 impl Action {
-    /// Ordering by restrictiveness (Allow < ReadOnly < Block). Used to pick the
-    /// safer of two actions when composing (e.g. no-bundle fail-secure).
+    /// Ordering by restrictiveness (AllowAudited < Encrypt < ReadOnly < Block).
+    /// Used to pick the safer of two actions when composing (e.g. no-bundle
+    /// fail-secure). `Encrypt` is LESS restrictive than `ReadOnly` — writes
+    /// still happen, transformed into sealed envelopes.
     pub fn restrictiveness(self) -> u8 {
         match self {
             Action::AllowAudited => 0,
-            Action::ReadOnly => 1,
-            Action::Block => 2,
+            Action::Encrypt => 1,
+            Action::ReadOnly => 2,
+            Action::Block => 3,
         }
     }
 
@@ -294,6 +303,31 @@ mod tests {
         assert_eq!(Action::AllowAudited.max_restrictive(Action::ReadOnly), Action::ReadOnly);
         assert_eq!(Action::ReadOnly.max_restrictive(Action::Block), Action::Block);
         assert_eq!(Action::Block.max_restrictive(Action::AllowAudited), Action::Block);
+    }
+
+    // --- Trusted-destination encryption (encrypt-on-write spec §3.1) --------
+
+    #[test]
+    fn encrypt_sits_between_allow_and_read_only() {
+        // AllowAudited=0 < Encrypt=1 < ReadOnly=2 < Block=3.
+        assert!(Action::AllowAudited.restrictiveness() < Action::Encrypt.restrictiveness());
+        assert!(Action::Encrypt.restrictiveness() < Action::ReadOnly.restrictiveness());
+        assert!(Action::ReadOnly.restrictiveness() < Action::Block.restrictiveness());
+        assert_eq!(Action::AllowAudited.max_restrictive(Action::Encrypt), Action::Encrypt);
+        assert_eq!(Action::Encrypt.max_restrictive(Action::ReadOnly), Action::ReadOnly);
+        assert_eq!(Action::Encrypt.max_restrictive(Action::Block), Action::Block);
+        assert_eq!(Action::Encrypt.max_restrictive(Action::AllowAudited), Action::Encrypt);
+    }
+
+    #[test]
+    fn encrypt_rule_wins_first_match_like_any_other_action() {
+        let policy = UsbPolicy {
+            default_action: Action::Block,
+            rules: vec![rule(RuleMatch::Serial("COURIER".into()), Action::Encrypt)],
+        };
+        let (action, matched) = decide(&policy, &dev("courier", "v", "p", "usb"));
+        assert_eq!(action, Action::Encrypt);
+        assert!(matched.is_some());
     }
 
     // --- Device-class extension (spec §2): MTP/WPD + USB tethering ----------

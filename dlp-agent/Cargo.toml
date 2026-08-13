@@ -18,8 +18,17 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Config, serialization, logging, errors
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Decode base64 file bytes the browser extension sends for binary uploads
+# (scan_bytes) so the host content-inspects PDFs/DOCX like an endpoint DLP.
+base64 = "0.22"
 toml = "0.8"
 anyhow = "1"
+
+# Encrypt-on-write envelope (src/crypto): AES-256-GCM `.dlpenc` sealing for
+# trusted destinations; zeroize scrubs DEKs/KEKs from memory on drop.
+# Approved additions per ENCRYPT-ON-WRITE-IMPLEMENTATION.md §2 — ONLY these two.
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
@@ -63,8 +72,16 @@ windows = { version = "0.58", features = [
     "Win32_NetworkManagement_IpHelper", # owner-PID→conn table (follow-on conn enumeration)
     "Win32_System_Rpc",                 # GUID/auth types referenced by the Fwpm* signatures
     "Win32_Security",                   # PSECURITY_DESCRIPTOR + SID (Fwpm*Add0 are security-gated)
-    "Win32_System_Threading",           # OpenProcess/TerminateProcess/QueryFullProcessImageNameW
+    "Win32_System_Threading",           # OpenProcess/TerminateProcess/QueryFullProcessImageNameW/CreateProcessAsUserW/ProcessIdToSessionId
     "Win32_System_ProcessStatus",       # EnumProcesses (remote-tool process enumeration)
+    # Endpoint "blocked by DLP" toast (src/notify): render a native Windows toast
+    # (WinRT) and, from the Session-0 service, spawn the toast into the interactive
+    # user session (WTSQueryUserToken + CreateProcessAsUserW + CreateEnvironmentBlock).
+    "UI_Notifications",                  # ToastNotificationManager / ToastNotification (WinRT)
+    "Data_Xml_Dom",                      # XmlDocument for the toast payload (WinRT)
+    "Win32_System_RemoteDesktop",        # WTSGetActiveConsoleSessionId/WTSQueryUserToken/WTSQuerySessionInformationW
+    "Win32_System_Environment",          # CreateEnvironmentBlock/DestroyEnvironmentBlock
+    "Win32_System_StationsAndDesktops",  # (lpDesktop "winsta0\\default" for CreateProcessAsUserW)
 ] }
 windows-service = "0.7"
 

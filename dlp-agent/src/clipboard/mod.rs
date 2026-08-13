@@ -78,6 +78,8 @@ fn verdict_incident(label: &str, verdict: Verdict, block: bool, channel: &str) -
             device: clipboard_device(),
             action_taken: action,
             note: Some(if block { "clipboard-blocked" } else { "clipboard-audited" }.into()),
+            key_id: None,
+            sealed_sha256: None,
         });
     }
 
@@ -91,6 +93,8 @@ fn verdict_incident(label: &str, verdict: Verdict, block: bool, channel: &str) -
             device: clipboard_device(),
             action_taken: action,
             note: Some("clipboard-unreadable".into()),
+            key_id: None,
+            sealed_sha256: None,
         });
     }
 
@@ -108,6 +112,8 @@ fn image_incident(block: bool, channel: &str) -> UsbIncident {
         device: clipboard_device(),
         action_taken: if block { ActionTaken::Blocked } else { ActionTaken::Audited },
         note: Some(if block { "image-clipboard-blocked" } else { "image-clipboard-uninspected" }.into()),
+        key_id: None,
+        sealed_sha256: None,
     }
 }
 
@@ -184,6 +190,8 @@ pub fn inspect(
                             device: clipboard_device(),
                             action_taken: if cfg.fail_block { ActionTaken::Blocked } else { ActionTaken::Audited },
                             note: Some("clipboard-file-unreadable".into()),
+                            key_id: None,
+                            sealed_sha256: None,
                         });
                     }
                 }

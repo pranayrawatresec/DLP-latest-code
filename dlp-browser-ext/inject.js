@@ -21,6 +21,7 @@
   window.__dlpHooked = true;
 
   const MAX_TEXT_BYTES = 1024 * 1024;
+  const MAX_SCAN_BYTES = 4 * 1024 * 1024; // binary content cap (host + kernel match)
   const VERDICT_TIMEOUT_MS = 8000;
 
   let seq = 1;
@@ -75,6 +76,25 @@
     }
   }
 
+  // base64 (no data: prefix) of up to MAX_SCAN_BYTES of a Blob, or '' on failure.
+  function readBytesBase64(blob) {
+    return new Promise((resolve) => {
+      try {
+        const slice = blob.slice(0, MAX_SCAN_BYTES);
+        const reader = new FileReader();
+        reader.onload = () => {
+          const s = String(reader.result || '');
+          const i = s.indexOf(',');
+          resolve(i >= 0 ? s.slice(i + 1) : '');
+        };
+        reader.onerror = () => resolve('');
+        reader.readAsDataURL(slice);
+      } catch (_e) {
+        resolve('');
+      }
+    });
+  }
+
   // Collect scannable parts (File/Blob) from a request body. Returns an array of
   // { blob, name }.
   function partsFromBody(body) {
@@ -101,7 +121,11 @@
       if (isTextLike(p.blob, p.name)) {
         payload = { kind: 'scan_text', text: await readTextPrefix(p.blob) };
       } else {
-        payload = { kind: 'scan_file', name: p.name };
+        // Binary body part: send the bytes for real content inspection.
+        const contentB64 = await readBytesBase64(p.blob);
+        payload = contentB64
+          ? { kind: 'scan_bytes', name: p.name, content_b64: contentB64 }
+          : { kind: 'scan_file', name: p.name };
       }
       const v = await askVerdict(payload);
       if (v && v.verdict === 'block') return v;

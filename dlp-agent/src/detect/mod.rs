@@ -23,7 +23,7 @@ pub use edm::{match_edm, EdmRowHit, EdmSourceHit};
 pub use extract::{extract_text, ExtractedText, Reason, Unreadable};
 pub use normalize::{normalize, Normalized};
 pub use shingle::{fnv1a64, shingles_of, winnow, Fingerprint, DEFAULT_K, DEFAULT_W};
-pub use verdict::{verdict, verdict_text, Extraction, IdmMatch, Verdict};
+pub use verdict::{verdict, verdict_bytes, verdict_text, Extraction, IdmMatch, Verdict};
 
 use std::collections::HashSet;
 

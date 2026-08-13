@@ -6,7 +6,9 @@ import EnrollmentTokens from './pages/EnrollmentTokens'
 import Administrators from './pages/Administrators'
 import Sessions from './pages/Sessions'
 import AuditLog from './pages/AuditLog'
+import Incidents from './pages/Incidents'
 import ProtectedDocuments from './pages/ProtectedDocuments'
+import TrustedDestinations from './pages/TrustedDestinations'
 import AppLayout from './components/layout/AppLayout'
 import ProtectedRoute from './components/ProtectedRoute'
 import RequirePermission from './components/RequirePermission'
@@ -37,8 +39,16 @@ function App() {
           element={<RequirePermission permission="users.manage"><Administrators /></RequirePermission>}
         />
         <Route
+          path="incidents"
+          element={<RequirePermission permission="incidents.read_metadata"><Incidents /></RequirePermission>}
+        />
+        <Route
           path="protected-documents"
           element={<RequirePermission permission="protect:read"><ProtectedDocuments /></RequirePermission>}
+        />
+        <Route
+          path="trusted-destinations"
+          element={<RequirePermission permission="trusted_destinations:read"><TrustedDestinations /></RequirePermission>}
         />
         <Route
           path="sessions"

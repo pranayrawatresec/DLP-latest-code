@@ -11,6 +11,8 @@ const CA_FILE: &str = "ca.pem"; // trust anchor confirmed at enrollment
 const META_FILE: &str = "agent.json";
 const POLICY_FILE: &str = "cached-policy.json";
 const INDEX_FILE: &str = "index.dlpx"; // latest VERIFIED detection index bundle
+const KEYRING_FILE: &str = "keyring.sealed"; // DPAPI-sealed (machine scope) KEK keyring
+const TRUSTED_DEST_FILE: &str = "trusted-destinations.json"; // METADATA ONLY — never key bytes
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentMeta {
@@ -94,6 +96,59 @@ impl Storage {
         }
         std::fs::rename(&tmp, &dest).context("swapping index bundle into place")?;
         Ok(())
+    }
+
+    /// Persist the agent's KEK keyring at rest (encrypt-on-write M4, spec
+    /// §4.1). `keyring_json` is the keyring serialization (the same JSON shape
+    /// `crypto::Keyring::from_dev_json` parses). On Windows the bytes are
+    /// sealed with DPAPI **machine scope** (`CryptProtectData` +
+    /// `CRYPTPROTECT_LOCAL_MACHINE`) — the same helpers that protect the mTLS
+    /// identity — so the blob only opens on this machine and revoking
+    /// enrollment cannot be dodged by copying the state dir elsewhere.
+    ///
+    /// ⚠ NON-WINDOWS / DEV BUILDS ONLY: `seal()` below is a PLAIN PASSTHROUGH
+    /// on non-Windows platforms — the file then contains RAW KEK material.
+    /// That fallback exists solely so dev/test hosts can run the pipeline; it
+    /// must never exist in a production deployment (the product target is
+    /// Windows, where DPAPI always applies).
+    pub fn store_keyring(&self, keyring_json: &[u8]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        let sealed = seal(keyring_json).context("sealing keyring")?;
+        write_private(&self.path(KEYRING_FILE), &sealed)
+    }
+
+    /// Load the DPAPI-sealed keyring from rest. `Ok(None)` when none was ever
+    /// stored; `Err` when the blob exists but cannot be read or unsealed
+    /// (surfaced, not swallowed — a corrupt ring is signal). The returned
+    /// bytes are keyring JSON containing key material: callers must wrap them
+    /// in `Zeroizing` and never log them (house rule 2).
+    pub fn load_keyring(&self) -> Result<Option<Vec<u8>>> {
+        let path = self.path(KEYRING_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let sealed = std::fs::read(&path).context("reading sealed keyring")?;
+        Ok(Some(unseal(&sealed).context("unsealing keyring")?))
+    }
+
+    /// Persist the synced trusted-destination whitelist (encrypt-on-write M6).
+    /// `json` is `trustsync::serialize_destinations` output: channel, matcher,
+    /// mode, key IDS, and block-band policy — **metadata only**. It carries key
+    /// *ids* (by design, and audited) but NEVER key material bytes, which live
+    /// solely in the DPAPI-sealed keyring. Stored in the clear like the cached
+    /// policy (there is no secret here to protect at rest).
+    pub fn store_trusted_destinations(&self, json: &[u8]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        std::fs::write(self.path(TRUSTED_DEST_FILE), json)
+            .context("writing trusted destinations")
+    }
+
+    /// Raw bytes of the last-persisted trusted-destinations file, or `None` when
+    /// the agent has never synced one. Parsed by `trustsync::parse_destinations`.
+    pub fn load_trusted_destinations(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.path(TRUSTED_DEST_FILE)).ok()
     }
 }
 

@@ -42,11 +42,16 @@ itself is done by the Rust `dlp-agent browser-host` subcommand (a separate task)
   defence-in-depth, layered with the WFP filter, remote-tool blocking, USB /
   clipboard / file controls, EDR, and least-privilege — **not** a guarantee that
   "nothing leaks."
-- **Real filesystem paths are sandboxed.** The browser never exposes a picked
-  file's disk path, so text-like files are read inline and scanned as text
-  (`scan_text`); other files are scanned **by name only** (`scan_file`). Deep
-  binary inspection of an arbitrary picked file needs the host to resolve real
-  bytes — a manual/enterprise concern, documented not claimed.
+- **Binary files ARE content-inspected (up to 4 MiB).** The browser sandboxes a
+  picked file's disk *path*, but not its *content* — so for binary uploads
+  (PDF/DOCX/XLSX/…) the extension reads the file's bytes and sends them
+  (`scan_bytes`, base64) to the host, which runs the full `verdict_bytes` engine
+  (extract → fingerprint). This is the endpoint-DLP / Purview-equivalent binary
+  path. Caps/limits, stated honestly: content is read up to **4 MiB** (matching
+  the host + kernel cap); a file larger than that is sent truncated (best-effort —
+  structured formats like DOCX may not extract from a prefix). **Images still need
+  OCR**, which is deferred, so an image upload is not content-matched. If the bytes
+  can't be read at all, it falls back to name-only (`scan_file`).
 
 ---
 
@@ -72,9 +77,11 @@ protocol (the Rust `browser-host` implements the other side; both must match):
   followed by UTF-8 JSON. `chrome.runtime.connectNative` handles the framing.
 - **Request** (extension → host):
   ```json
-  {"version":1,"kind":"scan_text"|"scan_file","text":"...","path":"...","url":"...","origin":"...","id":1}
+  {"version":1,"kind":"scan_text"|"scan_bytes"|"scan_file","text":"...","path":"...","content_b64":"...","url":"...","origin":"...","id":1}
   ```
-  `text` is present for `scan_text`; `path` for `scan_file`.
+  `text` for `scan_text`; `content_b64` (base64 file bytes) + `path` (filename) for
+  `scan_bytes` (real binary content inspection); `path` (name only) for the legacy
+  `scan_file`.
 - **Reply** (host → extension):
   ```json
   {"version":1,"id":1,"verdict":"allow"|"block"|"warn","reason":"...","match":{"title":"...","containment":0.42}}

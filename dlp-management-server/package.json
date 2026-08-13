@@ -18,6 +18,7 @@
     "test:idm": "node test/idm.test.js",
     "test:edm": "node test/edm.test.js",
     "test:bundle": "node test/bundle.test.js",
+    "test:encryption": "node test/encryption.test.js",
     "e2e:detection": "node scripts/detection-e2e.js"
   },
   "dependencies": {

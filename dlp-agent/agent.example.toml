@@ -20,3 +20,110 @@ state_dir = "C:\\ProgramData\\DLPAgent"
 
 # Fallback cadence; the server's response takes precedence.
 checkin_interval_seconds = 300
+
+# --- Kernel minifilter port client (usb-guard) + read-taint scope ------------
+# The driver reads file content in-kernel and asks usb-guard for a verdict. The
+# same watch-set doubles as the READ-TAINT scope: reads of files under these
+# prefixes trigger a taint scan (block sensitive data from leaving over ANY
+# network channel, encrypted included, by cutting the reading process's egress).
+[kguard]
+# fail_block = true    # fail-secure: block when no verified bundle is cached
+scan_fixed = true      # inspect fixed-volume (C:) reads/writes under watch_paths
+watch_paths = ["\\Users", "\\Data"]
+#
+# Read-taint MASTER SWITCH + egress policy are NOT set here — they are driver
+# registry DWORDs under the service key (read in DriverEntry, like FailMode), so
+# the frozen v2 wire protocol is untouched. The installer/INF sets:
+#   ReadTaintEnabled      = 1   (0 = filesystem/USB protection only)
+#   TaintedEgressPolicy   = 0   (0 = block ALL tainted egress, fail-secure;
+#                                1 = permit RFC1918/loopback, block the rest)
+
+# --- Network-egress default-deny (composes with read-taint) ------------------
+# Read-taint blocks a TAINTED process even to an approved dest; this allow-list
+# blocks ANY process to an unapproved dest. Under `--enforce allowlist` the
+# allow-list MUST permit the agent's own lifelines or the agent cuts itself off:
+# the management server host:port and the DNS resolver(s), at minimum. The
+# agent's own PIDs are never tainted, so read-taint never blocks agent traffic.
+[netfilter]
+mode = "monitor"        # NEVER default-deny by config; opt in via --enforce allowlist
+
+[[netfilter.rules]]
+cidr = "10.20.0.5/32"   # management server (adjust to your mTLS listener)
+port = 8443
+action = "permit"
+note = "mgmt-server mTLS"
+
+[[netfilter.rules]]
+cidr = "10.20.0.53/32"  # internal DNS resolver
+port = 53
+action = "permit"
+note = "DNS"
+
+# --- USB channel + trusted-destination encryption (encrypt-on-write §3.2) ----
+# Whitelisted destinations are not a policy hole: `action = "encrypt"` means
+# writes proceed but land as sealed `.dlpenc` envelopes (AES-256-GCM, org-held
+# keys) only enrolled endpoints can open. Per encrypt rule:
+#   mode   = "encrypt_all"        every file is sealed (courier-stick mode)
+#          | "encrypt_sensitive"  verdict-banded; DEFAULT when omitted
+#   key_id = KEK id (free-form string, e.g. "class-internal/v1");
+#            omitted ⇒ [crypto] default_key_id
+#   on_block_band = "block"       BLOCK-band verdicts keep blocking (DEFAULT —
+#                                 whitelisting never weakens the block threshold)
+#                 | "seal"        opt-in: block-band files leave this device
+#                                 armoured (.dlpenc) instead of blocked; they
+#                                 never leave in plaintext either way
+# The channel idles unless `enabled = true` (opt-in, like every channel).
+[usb]
+# enabled = true
+# default_action = "read_only"    # fail-secure default for unmatched devices
+
+[[usb.rules]]
+match_serial = "0401396FBBF0C89E"
+action = "encrypt"
+mode = "encrypt_all"
+note = "site-A courier stick"
+
+[[usb.rules]]
+match_vid = "0951"
+match_pid = "1666"
+action = "encrypt"              # mode defaults to encrypt_sensitive;
+                                # key_id defaults to [crypto] default_key_id
+# on_block_band = "seal"        # uncomment to seal (not block) even the most
+                                # sensitive files onto THIS device
+
+# --- Trusted-destination encryption keys (encrypt-on-write §3.2) -------------
+[crypto]
+default_key_id = "class-internal/v1"  # KEK id sealed files reference (free-form)
+encrypt_at = 0.05                     # lower edge of the seal band (encrypt_sensitive)
+# block_at / coverage_block_at are read from [kguard] — one source of truth;
+# whitelisting a destination NEVER weakens the block thresholds.
+# keyfile = "C:\\ProgramData\\DLPAgent\\dev-keyring.json"  # DEV ONLY until
+#                                 server key sync (M6); keep git-ignored.
+
+# --- Web-upload trusted origins (browser channel, M7) ------------------------
+# Uploads to these origins are sealed instead of blocked. Same mode/key_id
+# semantics as USB encrypt rules.
+[webupload]
+trusted_origins = [
+  { origin = "https://mail.internal.example", mode = "encrypt_sensitive" },
+]
+
+# --- Endpoint "blocked by DLP" toast -----------------------------------------
+# On any block (USB / clipboard / web-upload / network), the end user gets a
+# native Windows toast so they know THEIR machine's DLP stopped it. This is UX
+# only — enforcement already happened; the toast is best-effort and never gates a
+# block. Verbosity is a deliberate defence knob: `standard` shows file + channel
+# + a local reference but NEVER the detection internals (which document/score/
+# classifier — that is evasion intel for an insider); `minimal` drops file+ref;
+# `covert` suppresses the toast entirely (block + log only) for counter-insider
+# sites. For the toast to appear in the Action Center the `aumid` must be a
+# REGISTERED AppUserModelID — the installer drops a Start-Menu shortcut carrying
+# it. From the Session-0 service the agent spawns `dlp-agent toast ...` into the
+# interactive session (CreateProcessAsUserW) to render it.
+[notify]
+enabled = true              # false == covert (block + log, no toast)
+mode = "standard"           # standard | minimal | covert
+org_name = "Data Loss Prevention"
+aumid = "Resec.DLP.Agent"   # must match the installer-registered shortcut AUMID
+dedup_secs = 5              # suppress a repeat block of the same (channel,file) within N s
+max_per_minute = 20         # global storm cap (0 = unlimited)

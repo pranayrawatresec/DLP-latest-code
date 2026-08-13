@@ -1,0 +1,13 @@
+{
+  "watch": ["app.js", "bin", "routes", "lib", "db", "middleware", "agent"],
+  "ext": "js,json",
+  "ignore": [
+    "data/**",
+    "ca/**",
+    "docs/**",
+    "test/**",
+    "scripts/**",
+    "node_modules/**",
+    "*.dlpx"
+  ]
+}

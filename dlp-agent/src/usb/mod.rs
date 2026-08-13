@@ -25,7 +25,10 @@ pub mod policy;
 pub mod queue;
 pub mod watch;
 
-pub use audit::{scan_batch, scan_to_incident, ActionTaken, CopyAuditor, IncidentKind, Settled, UsbIncident};
+pub use audit::{
+    scan_and_seal_to_incident, scan_batch, scan_to_incident, seal_file_in_place, ActionTaken,
+    CopyAuditor, IncidentKind, SealOutcome, Settled, UsbIncident,
+};
 pub use device::{parse_storage_descriptor, DeviceIdentity};
 pub use enforce::{
     plan, plan_mtp, plan_revert_mtp, plan_revert_read_only, plan_tethering, ApplyOutcome, Mode,
@@ -37,22 +40,39 @@ pub use policy::{
 pub use watch::{diff_volumes, VolumeEvent, VolumeWatcher};
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::detect::{self, Bundle};
+use crate::detect::{self, Bundle, Verdict};
 use crate::storage::Storage;
+use crate::trustdest::{BlockBandPolicy, EncryptMode};
 
 /// Number of bounded scan workers for bulk copies (spec §3.5: 2–4, never one
 /// thread per file).
 const SCAN_WORKERS: usize = 4;
+
+/// Seal parameters for a mounted `Action::Encrypt` volume (encrypt-on-write
+/// spec §5.1/§5.2): resolved once at arrival from the matching `[[usb.rules]]`
+/// entry (mode default `encrypt_sensitive`, key id default from `[crypto]`).
+struct EncryptVolume {
+    mode: EncryptMode,
+    /// FREE-FORM key id — never parsed, only handed to the sealer.
+    key_id: String,
+    /// Block-band disposition for this destination (default: Block, spec §10;
+    /// Seal only when the rule opts in via `on_block_band = "seal"`).
+    on_block_band: BlockBandPolicy,
+}
 
 /// Per-volume auditor state held while a device is mounted.
 struct VolumeAuditor {
     device: DeviceIdentity,
     action: Action,
     auditor: CopyAuditor,
+    /// `Some` iff `action == Action::Encrypt` — the copy auditor then routes
+    /// settled files through the seal pipeline instead of plain audit.
+    encrypt: Option<EncryptVolume>,
 }
 
 /// Run the USB monitor loop (spec §3.6). Polls for removable-device
@@ -65,9 +85,16 @@ struct VolumeAuditor {
 /// — the same separation the check-in loop uses. This function runs its own
 /// loop and is independent of the check-in heartbeat (spec §7: do not block or
 /// be blocked by check-in).
-pub fn run_monitor<R>(cfg: &Config, storage: &Storage, enforce: bool, mut report: R)
+///
+/// `sealer` is the injected seal-in-place fn for `Action::Encrypt` volumes
+/// (encrypt-on-write M3): `(path, key_id) → SealOutcome`. The binary wires the
+/// real `seal_file_in_place` with the dev keyring (main.rs); on any sealer
+/// error the plaintext is kept and an `EnforcementFailed` incident is raised
+/// (fail secure — see `scan_and_seal_to_incident`).
+pub fn run_monitor<R, S>(cfg: &Config, storage: &Storage, enforce: bool, sealer: S, mut report: R)
 where
     R: FnMut(UsbIncident),
+    S: Fn(&Path, &str) -> anyhow::Result<audit::SealOutcome>,
 {
     let usb = &cfg.usb;
     if !usb.enabled {
@@ -93,6 +120,9 @@ where
 
     let mut watcher = VolumeWatcher::new();
     let mut auditors: HashMap<String, VolumeAuditor> = HashMap::new();
+    // EncryptSensitive verdict bands: encrypt_at from [crypto], block band from
+    // [kguard] (one source of truth — the whitelist never weakens blocking).
+    let bands = cfg.encrypt_bands();
     let start = Instant::now();
     let poll = Duration::from_secs(usb.poll_interval_secs.max(1));
     let settle_ms = usb.settle_ms;
@@ -128,13 +158,41 @@ where
                     // Start auditing unless the device was hard-blocked (and thus
                     // no longer mounted). Read-only/allow both still audit copies.
                     if action != Action::Block {
+                        // Encrypt destination: resolve mode + key id ONCE at
+                        // arrival from the matching rule (spec §5.2 — the rule
+                        // engine IS the whitelist; key id default from [crypto]).
+                        let encrypt = (action == Action::Encrypt).then(|| {
+                            let (mode, key_id, on_block_band) = usb.encrypt_params(&dev);
+                            EncryptVolume {
+                                mode,
+                                key_id: key_id
+                                    .unwrap_or_else(|| cfg.crypto.default_key_id.clone()),
+                                on_block_band,
+                            }
+                        });
                         let root = format!("{}\\", dev.drive_letter);
+                        let mut auditor = CopyAuditor::new(root, settle_ms, settle_timeout_ms);
+                        // Encrypt volumes: baseline the files already on the
+                        // stick at mount so we seal only what the user copies
+                        // AFTER plugging in — never the pre-existing content
+                        // (which on a large/full stick would grind serially and
+                        // re-seal data that is not this session's exfil). Matches
+                        // the block channel's "act on new writes" behaviour.
+                        if encrypt.is_some() {
+                            let n = auditor.baseline_existing();
+                            tracing::info!(
+                                drive = %dev.drive_letter,
+                                baselined = n,
+                                "encrypt volume: pre-existing files baselined; only new copies are sealed"
+                            );
+                        }
                         auditors.insert(
                             dev.drive_letter.clone(),
                             VolumeAuditor {
                                 device: dev.clone(),
                                 action,
-                                auditor: CopyAuditor::new(root, settle_ms, settle_timeout_ms),
+                                auditor,
+                                encrypt,
                             },
                         );
                     }
@@ -148,12 +206,52 @@ where
         }
 
         // 2. Audit settled files on each mounted volume.
-        if let Some(bundle) = &bundle {
-            for va in auditors.values_mut() {
-                let settled = va.auditor.poll(now_ms);
-                if settled.is_empty() {
-                    continue;
+        for va in auditors.values_mut() {
+            let settled = va.auditor.poll(now_ms);
+            if settled.is_empty() {
+                continue;
+            }
+            if let Some(ev) = &va.encrypt {
+                // Encrypt destination (M3, spec §5.1): route each settled file
+                // through scan → decide_seal → seal-in-place. Processed
+                // serially — sealing is I/O-bound on the destination volume
+                // and v1 keeps the ordering deterministic. This path runs
+                // WITH OR WITHOUT a bundle: no verdict fails secure to Seal
+                // (encrypt_all never needed one).
+                for s in &settled {
+                    let inc = match &bundle {
+                        Some(b) => audit::scan_and_seal_to_incident(
+                            s,
+                            usb.max_file_bytes,
+                            &|p: &Path| detect::verdict(p, b),
+                            &va.device,
+                            &usb.channel_label,
+                            ev.mode,
+                            &bands,
+                            ev.on_block_band,
+                            &ev.key_id,
+                            &sealer,
+                        ),
+                        None => audit::scan_and_seal_to_incident(
+                            s,
+                            usb.max_file_bytes,
+                            &|_p: &Path| -> anyhow::Result<Verdict> {
+                                anyhow::bail!("no verified bundle cached")
+                            },
+                            &va.device,
+                            &usb.channel_label,
+                            ev.mode,
+                            &bands,
+                            ev.on_block_band,
+                            &ev.key_id,
+                            &sealer,
+                        ),
+                    };
+                    if let Some(inc) = inc {
+                        report(inc);
+                    }
                 }
+            } else if let Some(bundle) = &bundle {
                 let bundle = Arc::clone(bundle);
                 let incidents = scan_batch(
                     settled,
@@ -168,12 +266,8 @@ where
                     report(inc);
                 }
             }
-        } else {
-            // No-policy mode: drain the settle state so files aren't tracked
-            // forever, but do not scan (nothing to match against).
-            for va in auditors.values_mut() {
-                let _ = va.auditor.poll(now_ms);
-            }
+            // No-policy mode on a non-encrypt volume: the poll above already
+            // drained the settle state; nothing to match against, no scan.
         }
 
         std::thread::sleep(poll);
@@ -200,6 +294,8 @@ where
                 device: dev.clone(),
                 action_taken: ActionTaken::from(action),
                 note: Some(format!("enforcement-failed: {e}")),
+                key_id: None,
+                sealed_sha256: None,
             });
         }
     }

@@ -24,10 +24,19 @@
 
 pub mod remote_tools;
 pub mod rules;
+pub mod tcpreset;
 pub mod wfp;
 
 pub use remote_tools::{RemoteToolPolicy, ToolAction};
 pub use rules::{Connection, Decision, Direction, NetMode, NetPolicy, NetRule};
+// Read-taint existing-connection teardown (LLD §7/§9.2): the pure row-selection +
+// tainted-egress mirror, and the operator-manual live TCP reset called by kguard
+// on a read-scan BLOCK. Re-exported so `crate::netfilter::reset_pid_connections`
+// resolves from the port client.
+pub use tcpreset::{
+    reset_pid_connections, select_pid_rows, tainted_egress_action, EgressAction, TcpFamily, TcpRow,
+    Tep,
+};
 
 use crate::config::{Config, NetfilterConfig};
 use crate::storage::Storage;
@@ -73,6 +82,8 @@ fn network_incident(app_path: &str, note: String, blocked: bool, channel: &str) 
         device: network_device(app_path),
         action_taken: if blocked { ActionTaken::Blocked } else { ActionTaken::Audited },
         note: Some(note),
+        key_id: None,
+        sealed_sha256: None,
     }
 }
 
@@ -196,7 +207,7 @@ where
 /// match a remote-access-tool signature. Windows-only. Best-effort: a process we
 /// cannot open (higher privilege) is skipped.
 #[cfg(windows)]
-fn list_remote_tool_processes() -> Vec<(u32, String)> {
+pub(crate) fn list_remote_tool_processes() -> Vec<(u32, String)> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::EnumProcesses;
@@ -287,7 +298,8 @@ mod tests {
         let nf = NetfilterConfig::default();
         let p = build_policy(&nf, NetMode::Blocklist);
         assert_eq!(p.mode, NetMode::Blocklist);
-        assert_eq!(p.remote_tools.default_action, ToolAction::BlockNetwork);
+        // Decoupled: remote-tool action defaults to detect-only (never blocks).
+        assert_eq!(p.remote_tools.default_action, ToolAction::Detect);
         assert!(p.rules.is_empty());
     }
 

@@ -26,7 +26,7 @@ rem system headers only (never our source): C28160/C6387 = inline
 rem ExAllocatePoolZero; C28252/C28253 = inconsistent SAL on
 rem MmGetSystemRoutineAddress declared twice in wdm.h; C28230/C28285 = a
 rem malformed SAL annotation on WheaErrorRecordBuilderAddPacket in ntddk.h.
-cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /wd28160 /wd6387 /wd28252 /wd28253 /wd28230 /wd28285 /Od /GF /Gy /GR- /GS /kernel /analyze ^
+cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /wd28160 /wd6387 /wd28252 /wd28253 /wd28230 /wd28285 /sdl /guard:cf /GS /Od /GF /Gy /GR- /kernel /analyze ^
   /D_WIN64 /D_AMD64_ /DAMD64 /DNTDDI_VERSION=0x0A000000 /D_WIN32_WINNT=0x0A00 ^
   /Fobuild\out\dlpflt.analyze.obj src\dlpflt.c
 if errorlevel 1 goto :fail
@@ -37,7 +37,7 @@ rem system headers only (never our source): C28160/C6387 = inline
 rem ExAllocatePoolZero; C28252/C28253 = inconsistent SAL on
 rem MmGetSystemRoutineAddress declared twice in wdm.h; C28230/C28285 = a
 rem malformed SAL annotation on WheaErrorRecordBuilderAddPacket in ntddk.h.
-cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /wd28160 /wd6387 /wd28252 /wd28253 /wd28230 /wd28285 /Od /GF /Gy /GR- /GS /kernel /analyze ^
+cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /wd28160 /wd6387 /wd28252 /wd28253 /wd28230 /wd28285 /sdl /guard:cf /GS /Od /GF /Gy /GR- /kernel /analyze ^
   /D_WIN64 /D_AMD64_ /DAMD64 /DNTDDI_VERSION=0x0A000000 /D_WIN32_WINNT=0x0A00 ^
   /Fobuild\out\comms.analyze.obj src\comms.c
 if errorlevel 1 goto :fail

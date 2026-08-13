@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 use crate::netfilter::remote_tools::ToolAction;
 use crate::netfilter::rules::{Cidr, NetMode, NetRule, RuleAction};
+use crate::trustdest::{BlockBandPolicy, EncryptBands, EncryptMode};
+use crate::trustsync::{merge_into_usb, SyncedDestination};
+use crate::usb::device::DeviceIdentity;
 use crate::usb::policy::{Action, DeviceRule, RuleMatch, UsbPolicy};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,10 +61,81 @@ pub struct Config {
     /// so existing configs keep working unchanged.
     #[serde(default)]
     pub netfilter: NetfilterConfig,
+
+    /// Optional endpoint-notification settings (`[notify]`). Controls the native
+    /// Windows "blocked by DLP" toast the agent shows the end user on any block.
+    /// An absent section yields the safe default: toasts ON, standard verbosity.
+    #[serde(default)]
+    pub notify: NotifyConfig,
+
+    /// Optional trusted-destination encryption settings (`[crypto]`,
+    /// encrypt-on-write spec §3.2). An absent section yields defaults, so
+    /// existing configs keep parsing unchanged.
+    #[serde(default)]
+    pub crypto: CryptoConfig,
+
+    /// Optional web-upload trusted-origin settings (`[webupload]`, consumed by
+    /// the browser-host channel in M7). Absent ⇒ no trusted origins.
+    #[serde(default)]
+    pub webupload: WebuploadConfig,
 }
 
 fn default_checkin() -> u64 {
     300
+}
+
+/// How much the endpoint "blocked by DLP" toast reveals to the user.
+///
+/// Defence trade-off: enough for a legitimate employee to understand and call
+/// security, but never the detection internals (which document matched, score,
+/// classifier) — that is evasion intel for an insider. `Covert` suppresses the
+/// toast entirely (block + log only) for counter-insider deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyMode {
+    /// "Blocked by <Org> DLP · File · Channel · Ref" — no detection internals.
+    Standard,
+    /// "An action was blocked by security policy." — no file, no ref.
+    Minimal,
+    /// No toast at all; the block is still enforced and logged.
+    Covert,
+}
+
+/// Endpoint-notification configuration (`[notify]`). Every field is defaulted so
+/// the whole section — and any individual field — may be omitted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Master switch. Default `true` = show a toast on every block. Setting this
+    /// `false` is equivalent to `mode = "covert"` (block + log, no toast).
+    pub enabled: bool,
+    /// Verbosity of the toast (see `NotifyMode`). Default `standard`.
+    pub mode: NotifyMode,
+    /// Organisation name shown in the toast title. Default "Data Loss Prevention".
+    pub org_name: String,
+    /// AppUserModelID the toast is shown under. For the toast to actually appear
+    /// in the Action Center it must be a REGISTERED AUMID — the installer drops a
+    /// Start-Menu shortcut carrying it. Default is the DLP agent's own AUMID.
+    pub aumid: String,
+    /// Coalescing window (seconds): a repeat block of the SAME (channel, file) is
+    /// suppressed within this window so a read-flood cannot spam toasts. Default 5.
+    pub dedup_secs: u64,
+    /// Hard rate cap: at most this many toasts per rolling minute (a global
+    /// backstop against notification storms). Default 20. 0 disables the cap.
+    pub max_per_minute: u32,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        NotifyConfig {
+            enabled: true,
+            mode: NotifyMode::Standard,
+            org_name: "Data Loss Prevention".into(),
+            aumid: "Resec.DLP.Agent".into(),
+            dedup_secs: 5,
+            max_per_minute: 20,
+        }
+    }
 }
 
 /// USB channel configuration (spec §6). Every field is defaulted so the whole
@@ -121,6 +195,33 @@ impl UsbConfig {
             rules: self.rules.iter().filter_map(UsbRule::to_device_rule).collect(),
         }
     }
+
+    /// Resolve the encrypt mode + key id for a device on an `Action::Encrypt`
+    /// destination (encrypt-on-write spec §3.2/§5.2, M3). Walks the SAME
+    /// first-match-wins rule order as `to_policy` (rules without a matcher are
+    /// dropped in both), so the rule that decided `Encrypt` is the rule whose
+    /// `mode`/`key_id` apply. Absent fields fall back to `encrypt_sensitive`
+    /// (fail-secure banded default) and `None` (caller substitutes
+    /// `[crypto] default_key_id` — the key id stays a FREE-FORM opaque string).
+    /// Returned tuple: (mode, key id, block-band policy). The policy defaults
+    /// to `Block` (spec §10) and is only `Seal` when the matching rule opts in.
+    pub fn encrypt_params(
+        &self,
+        dev: &DeviceIdentity,
+    ) -> (EncryptMode, Option<String>, BlockBandPolicy) {
+        for rule in &self.rules {
+            if let Some(dr) = rule.to_device_rule() {
+                if dr.match_on.matches(dev) {
+                    return (
+                        rule.mode.unwrap_or(EncryptMode::EncryptSensitive),
+                        rule.key_id.clone(),
+                        rule.on_block_band,
+                    );
+                }
+            }
+        }
+        (EncryptMode::EncryptSensitive, None, BlockBandPolicy::Block)
+    }
 }
 
 /// Kernel-minifilter port-client configuration (`usb-guard`, SPEC §3). Every
@@ -151,7 +252,36 @@ pub struct KguardConfig {
     /// (e.g. `\Users\*\OneDrive`, `\Dropbox`, staging dirs). Up to 16, each up
     /// to 260 wchars. Empty ⇒ the driver never attaches to fixed volumes
     /// (safety/back-compat invariant). Sent in `DLP_CONFIG`.
+    ///
+    /// # Read-taint scope (LLD §6/§9.3) — NO new wire field
+    /// The read-taint feature (block sensitive data leaving over ANY network
+    /// channel, including encrypted ones, by tainting the reading process and
+    /// cutting its egress) deliberately adds NO field here: its master switch
+    /// and egress policy travel OUT-OF-BAND as registry DWORDs under the driver
+    /// service key (read in `DriverEntry`, the same pattern as the driver's
+    /// `FailMode`), so neither `DLP_CONFIG_VERSION` nor `DLP_MSG_VERSION` is
+    /// bumped and the frozen v2 wire layout is untouched:
+    ///
+    /// * `ReadTaintEnabled` (DWORD, default 0) — master switch. `1` registers the
+    ///   IRP_MJ_READ trigger, the scan worker, the WFP callout and the
+    ///   process-exit untaint. `0` = filesystem/USB protection only.
+    /// * `TaintedEgressPolicy` (DWORD) — `0` = block ALL outbound from a tainted
+    ///   PID (default, fail-secure); `1` = permit RFC1918/loopback/link-local,
+    ///   block the rest (see `netfilter::Tep` / `tainted_egress_action`).
+    ///
+    /// Read *scope* (which files trigger a scan) REUSES this `watch_paths` set —
+    /// the driver's `DlpConfigPathIsWatched` gate — so no separate scope config
+    /// exists. `scan=watch` (the default) means "taint on reads under
+    /// `watch_paths`"; there is no wire change to enable it.
     pub watch_paths: Vec<String>,
+
+    /// Read-deny (content-aware exfil-tool read blocking): when `true`, `usb-guard`
+    /// runs a background tracker that computes the exfil-channel PID set (remote
+    /// tools by signature + processes holding a public/non-local TCP connection)
+    /// and pushes it to the driver so the kernel's `DlpPreRead` can DENY a
+    /// sensitive read by an exfil process. Default `false`. Pair with the driver
+    /// registry knob `ExfilReadBlockEnabled=1` (out-of-band) for kernel enforcement.
+    pub exfil_read_block: bool,
 }
 
 impl Default for KguardConfig {
@@ -164,6 +294,7 @@ impl Default for KguardConfig {
             scan_fixed: false,
             scan_network: false,
             watch_paths: Vec::new(),
+            exfil_read_block: false,
         }
     }
 }
@@ -225,6 +356,34 @@ impl Default for ClipboardConfig {
 /// Network-egress (WFP) channel configuration (Tier-2 plan §2.4). Every field is
 /// defaulted so the whole `[netfilter]` section — and any individual field — may
 /// be omitted; an absent section is the safe `monitor` posture (NEVER default-deny).
+///
+/// # Read-taint interaction (LLD §9.3) — allow-list MUST include agent lifelines
+/// Read-taint (kernel) and this user-mode default-deny COMPOSE: the kernel WFP
+/// callout blocks a *tainted* PID's egress even to an approved destination, while
+/// this allow-list blocks *any* PID's egress to an unapproved destination. To
+/// avoid the agent cutting ITSELF off when running `--enforce allowlist`, the
+/// `[[netfilter.rules]]` allow-list MUST permit, at minimum:
+///   * the management server `host:port` (mTLS check-in, incident upload),
+///   * the DNS resolver(s) (UDP/TCP 53) so name resolution keeps working,
+///   * any internal services the agent depends on.
+/// The agent's OWN processes are never tainted (the driver skips its service PID
+/// and PID 4/System), so read-taint never blocks agent traffic; the allow-list is
+/// the only thing that can, hence these entries. Example (illustrative):
+///
+/// ```toml
+/// [netfilter]
+/// mode = "monitor"                 # flip to allowlist only via --enforce
+/// [[netfilter.rules]]
+/// cidr = "10.20.0.5/32"            # management server
+/// port = 8443
+/// action = "permit"
+/// note = "mgmt-server mTLS"
+/// [[netfilter.rules]]
+/// cidr = "10.20.0.53/32"           # internal DNS resolver
+/// port = 53
+/// action = "permit"
+/// note = "DNS"
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct NetfilterConfig {
@@ -237,8 +396,11 @@ pub struct NetfilterConfig {
     /// Incident channel label (plan §2.1). Default "network".
     pub channel_label: String,
     /// Default action for a matched remote-access tool (AnyDesk/TeamViewer/VNC/…).
-    /// Default `block_network` (cut the relay); `detect` = incident only; `kill` =
-    /// terminate (admin + `--enforce`, operator-manual).
+    /// **Default `detect` (visibility only — never blocks/kills).** Remote-tool
+    /// blocking is NOT part of blocking agent-detected sensitive data (that is
+    /// read-taint + default-deny); it is optional, opt-in hygiene that only helps
+    /// the analog-hole/screen-view case. Set `block_network` (cut the relay) or
+    /// `kill` (terminate; admin + `--enforce`) to deliberately opt in.
     pub remote_tool_action: ToolAction,
     /// Per-tool overrides keyed by tool id (e.g. `rdp-out = "detect"`).
     pub remote_tool_overrides: HashMap<String, ToolAction>,
@@ -255,7 +417,9 @@ impl Default for NetfilterConfig {
         NetfilterConfig {
             mode: NetMode::Monitor, // NEVER default-deny (plan §2.4/§5)
             channel_label: "network".into(),
-            remote_tool_action: ToolAction::BlockNetwork,
+            // detect-only by default: remote-tool blocking is decoupled from the
+            // data-exfil layers (read-taint + default-deny) and is opt-in.
+            remote_tool_action: ToolAction::Detect,
             remote_tool_overrides: HashMap::new(),
             persist: false,
             rules: Vec::new(),
@@ -304,6 +468,68 @@ impl NetRuleConfig {
     }
 }
 
+/// Trusted-destination encryption configuration (`[crypto]`, encrypt-on-write
+/// spec §3.2). Every field is defaulted so the whole section may be omitted.
+///
+/// NOTE: `block_at` / `coverage_block_at` are deliberately NOT here — they are
+/// read from `[kguard]` (one source of truth for the block band); see
+/// `Config::encrypt_bands()`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CryptoConfig {
+    /// KEK id sealed files reference when a rule names none. FREE-FORM opaque
+    /// string (per-classification by convention, e.g. `"class-internal/v1"`)
+    /// — never parsed anywhere, only looked up in the keyring.
+    pub default_key_id: String,
+    /// Lower edge of the seal band for `encrypt_sensitive` destinations.
+    /// Default 0.05.
+    pub encrypt_at: f64,
+    /// DEV ONLY (until server key sync, M6): path to a local keyring file so
+    /// the feature runs end-to-end without a server. Keep it git-ignored;
+    /// never log its contents.
+    pub keyfile: Option<PathBuf>,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        CryptoConfig {
+            default_key_id: "class-internal/v1".into(),
+            encrypt_at: 0.05,
+            keyfile: None,
+        }
+    }
+}
+
+/// Web-upload trusted-origin configuration (`[webupload]`, spec §3.2).
+/// Consumed by the browser-host channel (M7). Absent ⇒ no trusted origins:
+/// every origin keeps today's behaviour.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WebuploadConfig {
+    /// Origins whose uploads are sealed instead of blocked. Matched by the
+    /// browser host: exact origin first, then registrable-domain suffix.
+    pub trusted_origins: Vec<TrustedOrigin>,
+}
+
+/// One trusted web-upload origin (spec §3.2 / §7.2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrustedOrigin {
+    /// Full origin, e.g. `"https://mail.internal.example"`.
+    pub origin: String,
+    /// How much gets sealed. Absent ⇒ `encrypt_sensitive` (fail-secure banded
+    /// default).
+    #[serde(default = "default_encrypt_sensitive")]
+    pub mode: EncryptMode,
+    /// KEK id override; FREE-FORM string, never parsed. Absent ⇒
+    /// `[crypto] default_key_id`.
+    #[serde(default)]
+    pub key_id: Option<String>,
+}
+
+fn default_encrypt_sensitive() -> EncryptMode {
+    EncryptMode::EncryptSensitive
+}
+
 /// A single TOML rule (`[[usb.rules]]`). Exactly one matcher should be set; the
 /// first present matcher (serial → vid/pid → bus type → any) is used.
 #[derive(Debug, Clone, Deserialize)]
@@ -321,6 +547,23 @@ pub struct UsbRule {
     pub action: Action,
     #[serde(default)]
     pub note: Option<String>,
+    /// Trusted-destination encryption fields (encrypt-on-write spec §3.2) —
+    /// only meaningful with `action = "encrypt"`. `mode` chooses how much is
+    /// sealed; absent ⇒ `encrypt_sensitive` (the fail-secure verdict-banded
+    /// default, resolved at use-site in the copy auditor, M3).
+    #[serde(default)]
+    pub mode: Option<EncryptMode>,
+    /// KEK id to seal with, e.g. `"class-internal/v1"`. FREE-FORM opaque
+    /// string — never parsed anywhere. Absent ⇒ `[crypto] default_key_id`.
+    #[serde(default)]
+    pub key_id: Option<String>,
+    /// What `encrypt_sensitive` does with BLOCK-band verdicts on this
+    /// destination: `"block"` (spec default — whitelisting never weakens the
+    /// block threshold) or `"seal"` (owner opt-in, 2026-08-12: sensitive files
+    /// leave this whitelisted device armoured instead of blocked). Explicit
+    /// per-rule; never a global default.
+    #[serde(default)]
+    pub on_block_band: BlockBandPolicy,
 }
 
 impl UsbRule {
@@ -362,6 +605,9 @@ impl Config {
                 kguard: KguardConfig::default(),
                 clipboard: ClipboardConfig::default(),
                 netfilter: NetfilterConfig::default(),
+                notify: NotifyConfig::default(),
+                crypto: CryptoConfig::default(),
+                webupload: WebuploadConfig::default(),
             }
         };
 
@@ -392,8 +638,229 @@ impl Config {
     pub fn incidents_url(&self) -> String {
         format!("{}/agent/incidents", self.server_url.trim_end_matches('/'))
     }
+    /// Agent-facing trusted-destination + key sync endpoint (encrypt-on-write
+    /// M6, PINNED contract). Served over the same mTLS listener as check-in.
+    pub fn trusted_config_url(&self) -> String {
+        format!("{}/agent/trusted-config", self.server_url.trim_end_matches('/'))
+    }
+
+    /// Produce an effective config whose `[usb]` section has the synced
+    /// trusted destinations merged in (encrypt-on-write M6). The
+    /// console-authored whitelist takes precedence (first-match-wins) and any
+    /// `usb` destination flips the channel on; the more-restrictive of
+    /// (synced, local) wins per device. Everything else (`[crypto]`,
+    /// `state_dir`, …) is unchanged. Pure — the merge itself is
+    /// [`crate::trustsync::merge_into_usb`].
+    pub fn with_synced_destinations(&self, dests: &[SyncedDestination]) -> Config {
+        let mut merged = self.clone();
+        merged.usb = merge_into_usb(&self.usb, dests);
+        merged
+    }
+
+    /// The `EncryptSensitive` verdict bands (encrypt-on-write spec §3.1):
+    /// `encrypt_at` comes from `[crypto]`; the block band is read from
+    /// `[kguard]` so there is ONE source of truth for block thresholds —
+    /// whitelisting a destination can never weaken them.
+    pub fn encrypt_bands(&self) -> EncryptBands {
+        EncryptBands {
+            encrypt_at: self.crypto.encrypt_at,
+            block_at: self.kguard.block_at,
+            coverage_block_at: self.kguard.coverage_block_at,
+        }
+    }
 }
 
 fn env_required(key: &str) -> Result<String> {
     std::env::var(key).with_context(|| format!("missing required env {key} (and no config file)"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#"
+server_url = "https://dlp-server.internal:8443"
+ca_cert_path = "C:\\ProgramData\\DLPAgent\\ca-cert.pem"
+state_dir = "C:\\ProgramData\\DLPAgent"
+"#;
+
+    #[test]
+    fn existing_toml_without_new_sections_still_parses() {
+        // Backward compatibility: a pre-encryption config (old-style [usb]
+        // rules, no [crypto]/[webupload]) must keep parsing with defaults.
+        let toml_str = format!(
+            "{BASE}
+[usb]
+enabled = true
+default_action = \"read_only\"
+
+[[usb.rules]]
+match_serial = \"ABC123\"
+action = \"allow_audited\"
+note = \"legacy rule\"
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.usb.rules.len(), 1);
+        assert_eq!(cfg.usb.rules[0].action, Action::AllowAudited);
+        assert!(cfg.usb.rules[0].mode.is_none());
+        assert!(cfg.usb.rules[0].key_id.is_none());
+        // Absent [crypto]/[webupload] ⇒ spec defaults.
+        assert_eq!(cfg.crypto.default_key_id, "class-internal/v1");
+        assert_eq!(cfg.crypto.encrypt_at, 0.05);
+        assert!(cfg.crypto.keyfile.is_none());
+        assert!(cfg.webupload.trusted_origins.is_empty());
+    }
+
+    #[test]
+    fn encrypt_rule_fields_parse() {
+        let toml_str = format!(
+            "{BASE}
+[crypto]
+default_key_id = \"class-secret/v3\"
+encrypt_at = 0.08
+
+[[usb.rules]]
+match_serial = \"0401396FBBF0C89E\"
+action = \"encrypt\"
+mode = \"encrypt_all\"
+key_id = \"class-secret/v3\"
+note = \"site-A courier stick\"
+
+[[usb.rules]]
+match_vid = \"0951\"
+match_pid = \"1666\"
+action = \"encrypt\"
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let r0 = &cfg.usb.rules[0];
+        assert_eq!(r0.action, Action::Encrypt);
+        assert_eq!(r0.mode, Some(EncryptMode::EncryptAll));
+        assert_eq!(r0.key_id.as_deref(), Some("class-secret/v3"));
+        // Second rule: mode/key_id absent ⇒ resolved at use-site (M3) to
+        // encrypt_sensitive / [crypto] default_key_id.
+        let r1 = &cfg.usb.rules[1];
+        assert_eq!(r1.action, Action::Encrypt);
+        assert!(r1.mode.is_none());
+        assert!(r1.key_id.is_none());
+        assert_eq!(cfg.crypto.default_key_id, "class-secret/v3");
+        // to_policy carries the encrypt action into the rule engine unchanged.
+        let policy = cfg.usb.to_policy();
+        assert_eq!(policy.rules[0].action, Action::Encrypt);
+    }
+
+    #[test]
+    fn encrypt_params_resolve_first_match_with_defaults() {
+        let toml_str = format!(
+            "{BASE}
+[crypto]
+default_key_id = \"class-secret/v3\"
+
+[[usb.rules]]
+match_serial = \"COURIER\"
+action = \"encrypt\"
+mode = \"encrypt_all\"
+key_id = \"class-courier/v1\"
+
+[[usb.rules]]
+match_vid = \"0951\"
+match_pid = \"1666\"
+action = \"encrypt\"
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let dev = |serial: &str, vid: &str, pid: &str| DeviceIdentity {
+            drive_letter: "E:".into(),
+            vendor_id: vid.into(),
+            product_id: pid.into(),
+            serial: serial.into(),
+            product_name: format!("{vid} {pid}"),
+            bus_type: "usb".into(),
+            removable: true,
+        };
+        // First rule: explicit mode + key id; block-band policy stays the
+        // spec default unless the rule opts in.
+        let (mode, key, obb) = cfg.usb.encrypt_params(&dev("courier", "x", "y"));
+        assert_eq!(mode, EncryptMode::EncryptAll);
+        assert_eq!(key.as_deref(), Some("class-courier/v1"));
+        assert_eq!(obb, BlockBandPolicy::Block);
+        // Second rule: absent fields ⇒ fail-secure banded mode, no key id
+        // (the caller substitutes [crypto] default_key_id).
+        let (mode, key, obb) = cfg.usb.encrypt_params(&dev("other", "0951", "1666"));
+        assert_eq!(mode, EncryptMode::EncryptSensitive);
+        assert!(key.is_none());
+        assert_eq!(obb, BlockBandPolicy::Block);
+        // No rule matches ⇒ same fail-secure defaults.
+        let (mode, key, obb) = cfg.usb.encrypt_params(&dev("z", "a", "b"));
+        assert_eq!(mode, EncryptMode::EncryptSensitive);
+        assert!(key.is_none());
+        assert_eq!(obb, BlockBandPolicy::Block);
+    }
+
+    #[test]
+    fn on_block_band_seal_opt_in_parses_and_resolves() {
+        let toml_str = format!(
+            "{BASE}
+[[usb.rules]]
+match_serial = \"FIELD-STICK\"
+action = \"encrypt\"
+on_block_band = \"seal\"
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let dev = DeviceIdentity {
+            drive_letter: "E:".into(),
+            vendor_id: "v".into(),
+            product_id: "p".into(),
+            serial: "field-stick".into(),
+            product_name: "x".into(),
+            bus_type: "usb".into(),
+            removable: true,
+        };
+        let (mode, key, obb) = cfg.usb.encrypt_params(&dev);
+        assert_eq!(mode, EncryptMode::EncryptSensitive);
+        assert!(key.is_none());
+        assert_eq!(obb, BlockBandPolicy::Seal);
+    }
+
+    #[test]
+    fn webupload_trusted_origins_parse_with_mode_default() {
+        let toml_str = format!(
+            "{BASE}
+[webupload]
+trusted_origins = [
+  {{ origin = \"https://mail.internal.example\", mode = \"encrypt_sensitive\" }},
+  {{ origin = \"https://drop.internal.example\" }},
+]
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.webupload.trusted_origins.len(), 2);
+        assert_eq!(cfg.webupload.trusted_origins[0].mode, EncryptMode::EncryptSensitive);
+        // Absent mode ⇒ fail-secure banded default, NOT encrypt_all.
+        assert_eq!(cfg.webupload.trusted_origins[1].mode, EncryptMode::EncryptSensitive);
+        assert!(cfg.webupload.trusted_origins[1].key_id.is_none());
+    }
+
+    #[test]
+    fn encrypt_bands_read_block_thresholds_from_kguard() {
+        // One source of truth: [crypto] owns only the seal band's lower edge;
+        // the block band always comes from [kguard].
+        let toml_str = format!(
+            "{BASE}
+[crypto]
+encrypt_at = 0.10
+
+[kguard]
+block_at = 0.40
+coverage_block_at = 0.70
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let bands = cfg.encrypt_bands();
+        assert_eq!(bands.encrypt_at, 0.10);
+        assert_eq!(bands.block_at, 0.40);
+        assert_eq!(bands.coverage_block_at, 0.70);
+    }
 }

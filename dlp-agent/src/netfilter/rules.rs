@@ -335,8 +335,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_tool_blocks_by_default() {
+    fn remote_tool_detect_by_default_does_not_block() {
+        // Decoupled from the data-exfil layers: the default policy DETECTS remote
+        // tools (visibility) but does not block them — a matched tool falls through
+        // to the mode decision (blocklist = default-permit here).
         let p = policy(NetMode::Blocklist, vec![]);
+        let d = decide(&p, &conn(r"C:\AnyDesk\AnyDesk.exe", "50.7.8.9", 443));
+        assert_eq!(d, Decision::Permit);
+    }
+
+    #[test]
+    fn remote_tool_blocks_when_opted_in() {
+        // Opt-in (block_network) still cuts the tool's relay.
+        let rt = RemoteToolPolicy { default_action: ToolAction::BlockNetwork, overrides: Default::default() };
+        let p = NetPolicy { mode: NetMode::Blocklist, rules: vec![], remote_tools: rt };
         let d = decide(&p, &conn(r"C:\AnyDesk\AnyDesk.exe", "50.7.8.9", 443));
         assert!(d.is_block());
         assert!(d.reason().contains("anydesk"));

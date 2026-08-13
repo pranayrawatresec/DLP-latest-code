@@ -19,7 +19,7 @@ const baseQuery = async (args, apiCtx, extra) => {
 export const apiSlice = createApi({
   reducerPath: 'api',
   baseQuery,
-  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus'],
+  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination'],
   endpoints: (b) => ({
     // Enrollment tokens
     getEnrollmentTokens: b.query({
@@ -122,6 +122,43 @@ export const apiSlice = createApi({
       query: () => '/audit/verify',
       providesTags: ['Audit'],
     }),
+
+    // Detection incidents (the "which file was blocked" console feed)
+    getIncidents: b.query({
+      // `params` may carry channel, status, agentId, q, limit, offset.
+      query: (params = {}) => ({ url: '/incidents', params }),
+      providesTags: ['Incident'],
+    }),
+    getIncident: b.query({
+      query: (id) => `/incidents/${id}`,
+      // Detail resolves match ranges + is audited server-side; keep it fresh.
+      providesTags: (result, error, id) => [{ type: 'Incident', id }],
+    }),
+    updateIncidentStatus: b.mutation({
+      query: ({ id, ...body }) => ({ url: `/incidents/${id}/status`, method: 'PATCH', body }),
+      invalidatesTags: (result, error, { id }) => [{ type: 'Incident', id }, 'Incident'],
+    }),
+
+    // Encrypt-on-write: trusted destinations (whitelisted USB devices) + org keys.
+    getTrustedDestinations: b.query({
+      query: () => '/encryption/trusted-destinations',
+      transformResponse: (res) => res?.destinations || [],
+      providesTags: ['TrustedDestination'],
+    }),
+    createTrustedDestination: b.mutation({
+      // body carries { channel, matcher, mode, onBlockBand, keyId, note } — the
+      // whole form body is forwarded, so onBlockBand ('block' | 'seal') rides along.
+      query: (body) => ({ url: '/encryption/trusted-destinations', method: 'POST', body }),
+      invalidatesTags: ['TrustedDestination'],
+    }),
+    deleteTrustedDestination: b.mutation({
+      query: (id) => ({ url: `/encryption/trusted-destinations/${id}`, method: 'DELETE' }),
+      invalidatesTags: ['TrustedDestination'],
+    }),
+    getEncryptionKeys: b.query({
+      query: () => '/encryption/keys',
+      transformResponse: (res) => res?.keys || [],
+    }),
   }),
 })
 
@@ -145,4 +182,11 @@ export const {
   useRegisterDocumentMutation,
   useCompileIndexMutation,
   useGetIndexStatusQuery,
+  useGetIncidentsQuery,
+  useGetIncidentQuery,
+  useUpdateIncidentStatusMutation,
+  useGetTrustedDestinationsQuery,
+  useCreateTrustedDestinationMutation,
+  useDeleteTrustedDestinationMutation,
+  useGetEncryptionKeysQuery,
 } = apiSlice

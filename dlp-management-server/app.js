@@ -13,6 +13,7 @@ var agentsRouter = require('./routes/agents');
 var auditRouter = require('./routes/audit');
 var protectedRouter = require('./routes/protected');
 var incidentsRouter = require('./routes/incidents');
+var encryptionRouter = require('./routes/encryption');
 var { attachUser } = require('./middleware/auth');
 
 var app = express();
@@ -40,6 +41,7 @@ app.use('/api/agents', agentsRouter);
 app.use('/api/audit', auditRouter);
 app.use('/api/protected', protectedRouter);
 app.use('/api/incidents', incidentsRouter);
+app.use('/api/encryption', encryptionRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

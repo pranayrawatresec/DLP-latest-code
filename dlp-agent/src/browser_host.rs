@@ -7,9 +7,16 @@
 //!
 //! PINNED protocol (extension ⇄ host — both sides must match):
 //!   Framing: 4-byte LITTLE-ENDIAN length prefix + UTF-8 JSON.
-//!   Request  (ext→host): {"version":1,"kind":"scan_text"|"scan_file",
-//!                          "text"?:string,"path"?:string,"url":string,
-//!                          "origin":string,"id":number}
+//!   Request  (ext→host): {"version":1,"kind":"scan_text"|"scan_file"|"scan_bytes",
+//!                          "text"?:string,"path"?:string,"content_b64"?:string,
+//!                          "url":string,"origin":string,"id":number}
+//!     - scan_text : `text` is the readable text (paste / text-like file prefix).
+//!     - scan_bytes: `content_b64` is base64 of the file's bytes and `path` is the
+//!                   filename (format detection); the host runs `verdict_bytes`,
+//!                   i.e. REAL content inspection of PDF/DOCX/XLSX like an endpoint
+//!                   DLP. This is the Purview-equivalent binary path.
+//!     - scan_file : legacy name-only (browsers sandbox the disk path); kept for
+//!                   compatibility but scan_bytes is preferred for binaries.
 //!   Reply    (host→ext): {"version":1,"id":number,
 //!                          "verdict":"allow"|"block"|"warn",
 //!                          "reason"?:string,
@@ -35,9 +42,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::Verdict;
 
-/// Max message the host will accept (Chrome caps native messages at 1 MB from the
-/// extension). A larger declared length is rejected rather than allocated.
-pub const MAX_MESSAGE_BYTES: u32 = 1024 * 1024;
+/// Max message the host will accept. Chrome's 1 MB cap is on messages the host
+/// SENDS to the extension; messages FROM the extension may be larger, and a
+/// `scan_bytes` upload carries base64 file content (≈1.33× the raw bytes). We
+/// accept up to 8 MiB so a ~4 MiB file (the extension's read cap, matching the
+/// kernel content cap) fits with room for the JSON envelope; a larger declared
+/// length is rejected rather than allocated.
+pub const MAX_MESSAGE_BYTES: u32 = 8 * 1024 * 1024;
+
+/// Max raw file bytes the host will content-inspect from a `scan_bytes` upload
+/// (mirrors the extension's read cap and the kernel's DLP_MAX_CONTENT).
+pub const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Default block thresholds (mirror `[kguard]` / `[clipboard]`).
 pub const DEFAULT_BLOCK_AT: f64 = 0.30;
@@ -49,6 +64,11 @@ pub const DEFAULT_COVERAGE_BLOCK_AT: f64 = 0.60;
 pub enum ScanKind {
     ScanText,
     ScanFile,
+    /// Binary upload (PDF/DOCX/XLSX/…): the extension read the file's bytes and
+    /// sent them base64 in `content_b64` (with `path` = the filename for format
+    /// detection). The host decodes and runs `verdict_bytes` — real content
+    /// inspection of a binary file, like an endpoint DLP.
+    ScanBytes,
 }
 
 /// A request from the extension.
@@ -61,6 +81,10 @@ pub struct Request {
     pub text: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    /// base64 of the file's bytes (for `scan_bytes`). Present only for binary
+    /// uploads; never logged.
+    #[serde(default)]
+    pub content_b64: Option<String>,
     #[serde(default)]
     pub url: String,
     #[serde(default)]
@@ -172,16 +196,18 @@ pub struct Handled {
 /// Handle one request with INJECTED scanners (so this is unit-testable without a
 /// real `Bundle`). `scan_text` scores raw text; `scan_file` scores a file path.
 /// Either may be absent from the request → an `allow` reply with a reason.
-pub fn handle_request<FT, FF>(
+pub fn handle_request<FT, FF, FB>(
     req: &Request,
     block_at: f64,
     coverage_block_at: f64,
     scan_text: FT,
     scan_file: FF,
+    scan_bytes: FB,
 ) -> Handled
 where
     FT: FnOnce(&str) -> Verdict,
     FF: FnOnce(&Path) -> anyhow::Result<Verdict>,
+    FB: FnOnce(&[u8], &str) -> Verdict,
 {
     let verdict = match req.kind {
         ScanKind::ScanText => match &req.text {
@@ -191,6 +217,29 @@ where
         ScanKind::ScanFile => match &req.path {
             Some(p) => scan_file(Path::new(p)).map_err(|e| format!("file scan failed: {e}")),
             None => Err("scan_file request without path".to_string()),
+        },
+        ScanKind::ScanBytes => match &req.content_b64 {
+            Some(b64) => {
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(b64) {
+                    Ok(mut bytes) => {
+                        // Bound what we score, matching the extension/kernel cap.
+                        if bytes.len() > MAX_SCAN_BYTES {
+                            bytes.truncate(MAX_SCAN_BYTES);
+                        }
+                        // Filename (from `path`) only drives extractor format
+                        // selection; content comes from the decoded bytes.
+                        let name = req
+                            .path
+                            .as_deref()
+                            .and_then(|p| Path::new(p).file_name().map(|s| s.to_string_lossy().into_owned()))
+                            .unwrap_or_else(|| "upload".to_string());
+                        Ok(scan_bytes(&bytes, &name))
+                    }
+                    Err(e) => Err(format!("scan_bytes base64 decode failed: {e}")),
+                }
+            }
+            None => Err("scan_bytes request without content_b64".to_string()),
         },
     };
 
@@ -205,7 +254,7 @@ where
             let incident = if disp != WebVerdict::Allow {
                 let label = match req.kind {
                     ScanKind::ScanText => "(web upload text)".to_string(),
-                    ScanKind::ScanFile => req
+                    ScanKind::ScanFile | ScanKind::ScanBytes => req
                         .path
                         .as_deref()
                         .map(|p| Path::new(p).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string()))
@@ -259,6 +308,8 @@ pub fn web_incident(
         action_taken: if blocked { ActionTaken::Blocked } else { ActionTaken::Audited },
         // Metadata only: url + origin. NEVER the uploaded content.
         note: Some(format!("url={url} origin={origin}")),
+        key_id: None,
+        sealed_sha256: None,
     }
 }
 
@@ -266,7 +317,7 @@ pub fn web_incident(
 /// request: score (injected scanners), reply, and hand any match to `incident`.
 /// Generic over I/O + scanners so the binary wires stdio + `detect`, and tests
 /// can drive it in-memory.
-pub fn serve<R, W, FT, FF, S>(
+pub fn serve<R, W, FT, FF, FB, S>(
     reader: &mut R,
     writer: &mut W,
     block_at: f64,
@@ -274,6 +325,7 @@ pub fn serve<R, W, FT, FF, S>(
     channel: &str,
     mut scan_text: FT,
     mut scan_file: FF,
+    mut scan_bytes: FB,
     mut incident: S,
 ) -> io::Result<()>
 where
@@ -281,6 +333,7 @@ where
     W: Write,
     FT: FnMut(&str) -> Verdict,
     FF: FnMut(&Path) -> anyhow::Result<Verdict>,
+    FB: FnMut(&[u8], &str) -> Verdict,
     S: FnMut(crate::usb::UsbIncident),
 {
     while let Some(body) = read_message(reader)? {
@@ -297,6 +350,7 @@ where
             coverage_block_at,
             |t| scan_text(t),
             |p| scan_file(p),
+            |b, n| scan_bytes(b, n),
         );
         let blocked = handled.reply.verdict == WebVerdict::Block;
         if let Some((verdict, label)) = handled.incident {
@@ -389,6 +443,7 @@ mod tests {
             kind: ScanKind::ScanText,
             text: Some("...".into()),
             path: None,
+            content_b64: None,
             url: "https://mail.example.com/upload".into(),
             origin: "https://mail.example.com".into(),
             id: 42,
@@ -399,6 +454,7 @@ mod tests {
             0.60,
             |_t| with_idm(0.9, 0.9),
             |_p| unreachable!("scan_file not called for scan_text"),
+            |_b, _n| unreachable!("scan_bytes not called for scan_text"),
         );
         assert_eq!(handled.reply.verdict, WebVerdict::Block);
         assert_eq!(handled.reply.id, 42);
@@ -414,14 +470,67 @@ mod tests {
             kind: ScanKind::ScanText,
             text: None,
             path: None,
+            content_b64: None,
             url: String::new(),
             origin: String::new(),
             id: 7,
         };
-        let handled = handle_request(&req, 0.30, 0.60, |_| clean(), |_| Ok(clean()));
+        let handled = handle_request(&req, 0.30, 0.60, |_| clean(), |_| Ok(clean()), |_, _| clean());
         assert_eq!(handled.reply.verdict, WebVerdict::Allow);
         assert!(handled.reply.reason.is_some());
         assert!(handled.incident.is_none());
+    }
+
+    #[test]
+    fn handle_scan_bytes_decodes_content_and_blocks() {
+        use base64::Engine;
+        let raw = b"pretend this is the OPORD pdf bytes";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let req = Request {
+            version: 1,
+            kind: ScanKind::ScanBytes,
+            text: None,
+            path: Some("OperationHimalayanShield_OPORD.pdf".into()),
+            content_b64: Some(b64),
+            url: "https://drive.example.com/upload".into(),
+            origin: "https://drive.example.com".into(),
+            id: 11,
+        };
+        let handled = handle_request(
+            &req,
+            0.30,
+            0.60,
+            |_t| unreachable!("scan_text not called for scan_bytes"),
+            |_p| unreachable!("scan_file not called for scan_bytes"),
+            |bytes, name| {
+                // The host must hand the decoded bytes + the filename (for
+                // extractor format selection) to the byte scanner.
+                assert_eq!(bytes, b"pretend this is the OPORD pdf bytes");
+                assert_eq!(name, "OperationHimalayanShield_OPORD.pdf");
+                with_idm(0.9, 0.9)
+            },
+        );
+        assert_eq!(handled.reply.verdict, WebVerdict::Block);
+        let (_v, label) = handled.incident.expect("a block raises an incident");
+        assert_eq!(label, "OperationHimalayanShield_OPORD.pdf");
+    }
+
+    #[test]
+    fn handle_scan_bytes_bad_base64_allows_with_reason() {
+        let req = Request {
+            version: 1,
+            kind: ScanKind::ScanBytes,
+            text: None,
+            path: Some("x.pdf".into()),
+            content_b64: Some("!!!not base64!!!".into()),
+            url: String::new(),
+            origin: String::new(),
+            id: 3,
+        };
+        let handled = handle_request(&req, 0.30, 0.60, |_| clean(), |_| Ok(clean()), |_, _| clean());
+        // Malformed content must not brick the browser → allow with a reason.
+        assert_eq!(handled.reply.verdict, WebVerdict::Allow);
+        assert!(handled.reply.reason.is_some());
     }
 
     #[test]
@@ -464,6 +573,7 @@ mod tests {
             "web-upload",
             |_t| with_idm(0.9, 0.9),
             |_p| Ok(clean()),
+            |_b, _n| clean(),
             |inc| incidents.push(inc),
         )
         .unwrap();

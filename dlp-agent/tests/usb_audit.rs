@@ -11,8 +11,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use dlp_agent::crypto::{envelope, Kek, Keyring};
 use dlp_agent::detect::{Extraction, IdmMatch, Verdict};
-use dlp_agent::usb::{scan_to_incident, ActionTaken, CopyAuditor, DeviceIdentity, IncidentKind};
+use dlp_agent::trustdest::{BlockBandPolicy, EncryptBands, EncryptMode};
+use dlp_agent::usb::{
+    scan_and_seal_to_incident, scan_to_incident, seal_file_in_place, ActionTaken, CopyAuditor,
+    DeviceIdentity, IncidentKind, SealOutcome,
+};
 
 const SETTLE_MS: u64 = 1500;
 const SETTLE_TIMEOUT_MS: u64 = 30_000;
@@ -202,6 +207,236 @@ fn oversized_file_is_skipped_with_a_metadata_incident() {
         .expect("too-large must raise a metadata incident");
     assert_eq!(incident.kind, IncidentKind::SkippedTooLarge);
     assert!(incident.verdict.is_none());
+
+    let _ = std::fs::remove_dir_all(&vol);
+}
+
+// ---------------------------------------------------------------------------
+// USB seal-in-place (encrypt-on-write M3, spec §5.1): the temp dir acts as an
+// `Action::Encrypt` volume. The REAL sealer (`seal_file_in_place` + the real
+// AES-256-GCM envelope) runs against it — no hardware, no driver.
+
+const KEY_ID: &str = "class-internal/v1";
+
+fn test_kek() -> Kek {
+    Kek::new(KEY_ID, [7u8; 32])
+}
+
+fn test_keyring() -> Keyring {
+    let mut ring = Keyring::new(KEY_ID);
+    ring.insert(test_kek());
+    ring
+}
+
+/// The production-shaped sealer closure the monitor wires in main.rs.
+fn real_sealer(path: &Path, key_id: &str) -> anyhow::Result<SealOutcome> {
+    let ring = test_keyring();
+    let kek = ring.lookup(key_id).map_err(anyhow::Error::new)?;
+    seal_file_in_place(path, kek, "agent-under-test", 1_754_000_000)
+}
+
+/// Verdict inside the seal band (0.05 ≤ containment < 0.30) — sealed, not blocked.
+fn seal_band_verdict(name: &str) -> Verdict {
+    let mut v = innocent_verdict(name);
+    v.idm.push(IdmMatch {
+        version_id: "33333333-3333-4333-8333-333333333333".into(),
+        document_id: "doc".into(),
+        collection_id: "col".into(),
+        title: "Fixture Plan Alpha".into(),
+        containment: 0.10,
+        coverage: 0.10,
+        matched_count: 4,
+        total_count: 64,
+        matched_hashes: vec!["1".into()],
+    });
+    v
+}
+
+#[test]
+fn sensitive_file_on_encrypt_volume_is_sealed_in_place() {
+    let vol = temp_volume("seal");
+    let path = vol.join("plan.docx");
+    let secret_body = b"the operations order body (sensitive)";
+    std::fs::write(&path, secret_body).expect("write file");
+
+    let mut auditor = CopyAuditor::new(&vol, SETTLE_MS, SETTLE_TIMEOUT_MS);
+    auditor.poll(0);
+    let settled = auditor.poll(2000);
+    assert_eq!(settled.len(), 1, "file must settle exactly once");
+
+    let src = |p: &Path| -> anyhow::Result<Verdict> { Ok(seal_band_verdict(&basename(p))) };
+    let incident = scan_and_seal_to_incident(
+        &settled[0],
+        MAX_BYTES,
+        &src,
+        &device(),
+        "usb",
+        EncryptMode::EncryptSensitive,
+        &EncryptBands::default(),
+        BlockBandPolicy::Block,
+        KEY_ID,
+        &real_sealer,
+    )
+    .expect("a sealed file must raise an incident");
+
+    // On-disk shape: sealed sibling present, plaintext + temp gone.
+    let sealed_path = vol.join("plan.docx.dlpenc");
+    assert!(sealed_path.exists(), ".dlpenc sibling must exist");
+    assert!(!path.exists(), "plaintext original must be gone");
+    assert!(!vol.join("plan.docx.dlpenc.tmp").exists(), "no temp file left behind");
+
+    // The envelope round-trips with the org keyring (offline, no server).
+    let sealed_bytes = std::fs::read(&sealed_path).expect("read envelope");
+    let (header, plaintext) =
+        envelope::open(&sealed_bytes, &test_keyring()).expect("envelope must open with the KEK");
+    assert_eq!(plaintext, secret_body, "seal→open is identity");
+    assert_eq!(header.key_id, KEY_ID);
+    assert_eq!(header.orig_name, "plan.docx", "original name survives inside the header");
+
+    // Incident shape: Encrypted + key id + BOTH hashes + the v1 limitation note.
+    assert_eq!(incident.kind, IncidentKind::Match);
+    assert_eq!(incident.action_taken, ActionTaken::Encrypted);
+    assert_eq!(incident.key_id.as_deref(), Some(KEY_ID));
+    assert_eq!(incident.file_sha256, "deadbeef", "plaintext hash from the verdict");
+    let sealed_sha = incident.sealed_sha256.as_deref().expect("sealed hash present");
+    assert_eq!(sealed_sha.len(), 64, "hex sha-256 of the envelope");
+    assert_eq!(header.plaintext_sha256.len(), 64);
+    assert_eq!(incident.note.as_deref(), Some("sealed-post-write"));
+
+    let _ = std::fs::remove_dir_all(&vol);
+}
+
+#[test]
+fn failing_sealer_keeps_plaintext_and_raises_enforcement_failed() {
+    let vol = temp_volume("sealfail");
+    let path = vol.join("plan.docx");
+    std::fs::write(&path, b"sensitive body").expect("write file");
+
+    let mut auditor = CopyAuditor::new(&vol, SETTLE_MS, SETTLE_TIMEOUT_MS);
+    auditor.poll(0);
+    let settled = auditor.poll(2000);
+    assert_eq!(settled.len(), 1);
+
+    // A sealer whose keyring does not hold the requested key — the same
+    // failure mode as an unsynced/unset [crypto] keyfile.
+    let bad_sealer = |p: &Path, _k: &str| -> anyhow::Result<SealOutcome> {
+        let ring = Keyring::new("other/v1");
+        let kek = ring.lookup("other/v1").map_err(anyhow::Error::new)?;
+        seal_file_in_place(p, kek, "agent-under-test", 0)
+    };
+    let src = |p: &Path| -> anyhow::Result<Verdict> { Ok(seal_band_verdict(&basename(p))) };
+    let incident = scan_and_seal_to_incident(
+        &settled[0],
+        MAX_BYTES,
+        &src,
+        &device(),
+        "usb",
+        EncryptMode::EncryptSensitive,
+        &EncryptBands::default(),
+        BlockBandPolicy::Block,
+        KEY_ID,
+        &bad_sealer,
+    )
+    .expect("a failed seal must be flagged");
+
+    // Fail secure: plaintext untouched, nothing sealed, copy flagged.
+    assert!(path.exists(), "plaintext must be KEPT on seal failure");
+    assert!(!vol.join("plan.docx.dlpenc").exists(), "no sealed sibling on failure");
+    assert_eq!(incident.kind, IncidentKind::EnforcementFailed);
+    assert_eq!(incident.action_taken, ActionTaken::Audited, "never claim Encrypted on failure");
+    assert!(incident.key_id.is_none());
+    assert!(incident.sealed_sha256.is_none());
+    assert!(incident.note.as_deref().unwrap().contains("seal-failed(plaintext-kept)"));
+
+    let _ = std::fs::remove_dir_all(&vol);
+}
+
+#[test]
+fn clean_file_on_encrypt_sensitive_volume_stays_plaintext() {
+    let vol = temp_volume("sealclean");
+    let path = vol.join("shopping-list.txt");
+    std::fs::write(&path, b"milk, eggs").expect("write file");
+
+    let mut auditor = CopyAuditor::new(&vol, SETTLE_MS, SETTLE_TIMEOUT_MS);
+    auditor.poll(0);
+    let settled = auditor.poll(2000);
+    assert_eq!(settled.len(), 1);
+
+    let calls = AtomicUsize::new(0);
+    let counting_sealer = |p: &Path, k: &str| -> anyhow::Result<SealOutcome> {
+        calls.fetch_add(1, Ordering::SeqCst);
+        real_sealer(p, k)
+    };
+    let src = |p: &Path| -> anyhow::Result<Verdict> { Ok(innocent_verdict(&basename(p))) };
+    let incident = scan_and_seal_to_incident(
+        &settled[0],
+        MAX_BYTES,
+        &src,
+        &device(),
+        "usb",
+        EncryptMode::EncryptSensitive,
+        &EncryptBands::default(),
+        BlockBandPolicy::Block,
+        KEY_ID,
+        &counting_sealer,
+    );
+
+    // decide-not-to-seal: today's behaviour exactly — plaintext, no incident.
+    assert!(incident.is_none(), "clean file on encrypt_sensitive raises nothing");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "the sealer must not be called");
+    assert!(path.exists(), "the file stays plaintext");
+    assert!(!vol.join("shopping-list.txt.dlpenc").exists());
+
+    let _ = std::fs::remove_dir_all(&vol);
+}
+
+#[test]
+fn sealed_envelopes_are_never_re_processed() {
+    // Regression: the sealer writes <name>.dlpenc, which must not be picked up
+    // as a new file and sealed again (recursing to .dlpenc.dlpenc...).
+    let vol = temp_volume("noresealenv");
+    std::fs::write(vol.join("plan.docx.dlpenc"), b"DLPE...pretend envelope").unwrap();
+    std::fs::write(vol.join("plan.docx.dlpenc.tmp"), b"in-flight").unwrap();
+    std::fs::write(vol.join("real.pdf"), b"a genuine new copy").unwrap();
+
+    let mut auditor = CopyAuditor::new(&vol, SETTLE_MS, SETTLE_TIMEOUT_MS);
+    auditor.poll(0);
+    let settled = auditor.poll(SETTLE_TIMEOUT_MS + 1);
+    let names: Vec<String> = settled
+        .iter()
+        .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(names, vec!["real.pdf"], "envelopes (.dlpenc / .dlpenc.tmp) are skipped");
+
+    let _ = std::fs::remove_dir_all(&vol);
+}
+
+#[test]
+fn baseline_existing_suppresses_pre_existing_files_only() {
+    // A stick that already has content when it is plugged in: baseline it, then
+    // only files copied AFTERWARD should settle and surface for sealing.
+    let vol = temp_volume("baseline");
+    std::fs::write(vol.join("already-there-1.pdf"), b"pre-existing sensitive body").unwrap();
+    std::fs::write(vol.join("already-there-2.txt"), b"pre-existing notes").unwrap();
+
+    let mut auditor = CopyAuditor::new(&vol, SETTLE_MS, SETTLE_TIMEOUT_MS);
+    let n = auditor.baseline_existing();
+    assert_eq!(n, 2, "both pre-existing files are baselined");
+
+    // Poll past the settle window: the baselined files must NOT surface.
+    auditor.poll(0);
+    let settled = auditor.poll(SETTLE_TIMEOUT_MS + 1);
+    assert!(settled.is_empty(), "pre-existing content is never re-processed after baseline");
+
+    // Now a genuine copy-to-stick AFTER mount.
+    std::fs::write(vol.join("freshly-copied.pdf"), b"the file the user just copied").unwrap();
+    auditor.poll(SETTLE_TIMEOUT_MS + 2);
+    let settled = auditor.poll(2 * SETTLE_TIMEOUT_MS + 4);
+    let names: Vec<String> = settled
+        .iter()
+        .filter_map(|s| s.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    assert_eq!(names, vec!["freshly-copied.pdf"], "only the new copy surfaces");
 
     let _ = std::fs::remove_dir_all(&vol);
 }

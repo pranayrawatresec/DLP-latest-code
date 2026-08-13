@@ -1,0 +1,105 @@
+;;;
+;;; dlpflt.inf -- DLP filesystem minifilter (SPEC section 5)
+;;;
+;;; Installs dlpflt.sys as a filesystem minifilter service in the
+;;; "FSFilter Content Screener" load-order group with a DEFAULT instance and a
+;;; development altitude of 265000 (the Content Screener 260000-269998 band).
+;;;
+;;; PRODUCTION: the altitude MUST be replaced with a Microsoft-ASSIGNED altitude
+;;; (request one via the sysdev "Allocated Filter Altitudes" process). 265000 is
+;;; a development-only placeholder -- see README.
+;;;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = "ContentScreener"
+ClassGuid   = {3e3f0674-c83c-4d4b-8515-54043dcb26a3}
+Provider    = %ProviderName%
+DriverVer   =
+CatalogFile = dlpflt.cat
+PnpLockDown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 12            ; %windir%\System32\drivers
+DlpFlt.DriverFiles      = 12
+
+;;
+;; Default install section
+;;
+
+[DefaultInstall.NTamd64]
+OptionDesc  = %ServiceDesc%
+CopyFiles   = DlpFlt.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService  = %ServiceName%,,DlpFlt.Service
+
+;;
+;; Service section
+;;
+
+[DlpFlt.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDesc%
+ServiceBinary  = %12%\%DriverName%.sys        ; %windir%\System32\drivers\dlpflt.sys
+Dependencies   = "FltMgr"
+ServiceType    = 2                            ; SERVICE_FILE_SYSTEM_DRIVER
+StartType      = 3                            ; SERVICE_DEMAND_START (fltmc/manual)
+ErrorControl   = 1                            ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "FSFilter Content Screener"
+AddReg         = DlpFlt.AddRegistry
+
+;;
+;; Registry: minifilter instances + altitude + FailMode default
+;;
+
+[DlpFlt.AddRegistry]
+HKR,,"DebugFlags",0x00010001,0x0
+HKR,,"SupportedFeatures",0x00010001,0x3
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\"%InstanceName%,"Altitude",0x00000000,%Altitude%
+HKR,"Instances\"%InstanceName%,"Flags",0x00010001,0x0
+; FailMode default (0 = allow+audit, 1 = block/fail-secure). Read by the driver
+; at DriverEntry from its service key. Operators flip this per deployment.
+HKR,,"FailMode",0x00010001,0x0
+
+;;
+;; Copy the driver binary
+;;
+
+[DlpFlt.DriverFiles]
+%DriverName%.sys
+
+[SourceDisksFiles]
+dlpflt.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+;;
+;; Uninstall
+;;
+
+[DefaultUninstall.NTamd64]
+LegacyUninstall = 1
+DelFiles        = DlpFlt.DriverFiles
+
+[DefaultUninstall.NTamd64.Services]
+DelService = %ServiceName%,0x200            ; SPSVCINST_STOPSERVICE
+
+;;
+;; Strings
+;;
+
+[Strings]
+ProviderName    = "On-Premise DLP"
+ServiceName     = "dlpflt"
+ServiceDesc     = "DLP Removable-Media Content Screener"
+DriverName      = "dlpflt"
+DiskName        = "DLP Minifilter Install Disk"
+
+; Instance / altitude. 265000 is a DEV placeholder in the Content Screener band
+; (260000-269998). Production requires a Microsoft-assigned altitude.
+DefaultInstance = "DlpFlt Instance"
+InstanceName    = "DlpFlt Instance"
+Altitude        = "265000"

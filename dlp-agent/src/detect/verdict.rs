@@ -74,7 +74,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Scan one file against a verified bundle. Errors only on I/O (unreadable
-/// content is a verdict, not an error).
+/// content is a verdict, not an error). This is now a thin wrapper: read the
+/// file bytes, then hand them to `verdict_bytes` (the content-in-hand core).
 pub fn verdict(path: &Path, bundle: &Bundle) -> Result<Verdict> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -82,30 +83,42 @@ pub fn verdict(path: &Path, bundle: &Bundle) -> Result<Verdict> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let file_sha256 = sha256_hex(&bytes);
+    Ok(verdict_bytes(&bytes, &file_name, bundle))
+}
 
-    let extracted = match extract_text(&bytes, &file_name) {
+/// Score already-in-memory file content against a verified bundle. This is the
+/// content-over-port entry point (the kernel minifilter reads the file in the
+/// FS stack and ships the bytes here, so user mode never re-opens the file and
+/// cannot hit a sharing violation). Infallible — the content is already in hand,
+/// so there is no I/O; an unreadable/unsupported format is a VALID verdict, not
+/// an error. `filename` is used only to pick the extraction format (extension)
+/// and to label the verdict; NEVER log `content`.
+pub fn verdict_bytes(content: &[u8], filename: &str, bundle: &Bundle) -> Verdict {
+    let file_name = filename.to_string();
+    let file_sha256 = sha256_hex(content);
+
+    let extracted = match extract_text(content, &file_name) {
         Ok(e) => e,
         Err(unreadable) => {
-            return Ok(Verdict {
+            return Verdict {
                 file_name,
                 file_sha256,
                 extraction: Extraction::Unreadable { reason: unreadable.reason.code().into() },
                 idm: Vec::new(),
                 edm: Vec::new(),
-            });
+            };
         }
     };
 
     let (idm, edm) = match_text(&extracted.text, bundle);
 
-    Ok(Verdict {
+    Verdict {
         file_name,
         file_sha256,
         extraction: Extraction::Ok { format: extracted.format },
         idm,
         edm,
-    })
+    }
 }
 
 /// The post-extraction matching core (IDM containment/coverage + EDM

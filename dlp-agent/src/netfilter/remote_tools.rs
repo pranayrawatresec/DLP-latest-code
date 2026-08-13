@@ -1,13 +1,24 @@
-//! Remote-access-tool signature set + matcher (Tier-2 plan §2.2, mechanism ⑧).
+//! Remote-access-tool signature set + matcher (optional, opt-in hygiene).
 //!
-//! These tools (AnyDesk, TeamViewer, VNC, Chrome Remote Desktop, RDP-out,
-//! Splashtop, LogMeIn) are the classic "screen-share exfil" path: an operator on
-//! the other end can drive the machine, transfer files, and — the analog hole we
-//! CANNOT close — simply *read the screen and photograph it*. We can block the
-//! tool's network egress (WFP app-id BLOCK so it never reaches its relay) and
-//! terminate the process; we CANNOT retroactively un-share a screen the operator
-//! already saw. That limit is documented in the plan §0/§2.2 and restated in the
-//! CLI help — do not overstate what this stops.
+//! IMPORTANT — this is NOT one of the network data-exfil layers. Blocking
+//! agent-*detected* sensitive data leaving over any tool (AnyDesk/RustDesk/…) is
+//! done by **read-taint** (content the agent flags → taint the reader → cut its
+//! egress) and **default-deny egress** (a tool's relay isn't an approved
+//! destination → blocked). Neither needs to know the tool's name.
+//!
+//! This signature set exists only for the ONE case those two cannot cover: the
+//! **analog hole** — an operator *screen-viewing* a document over a remote tool
+//! and photographing it. No file leaves, so there is nothing to detect or taint;
+//! the only lever is to forbid the tool itself. Because that is a different threat
+//! (and disruptive), remote-tool action **defaults to `detect` (visibility only —
+//! never blocks/kills)**; blocking is a deliberate opt-in
+//! (`[netfilter] remote_tool_action = "block_network" | "kill"`).
+//!
+//! **Matching is PRIMARY on process image name.** Ports are unreliable (every one
+//! of these tools falls back to 443/TCP to punch through firewalls), so a port
+//! match is only a weak secondary signal; relay domains are a secondary signal
+//! for the netfilter layer. The image-name matcher below is the authoritative
+//! one. Pure logic, fully unit-tested; no I/O.
 //!
 //! **Matching is PRIMARY on process image name.** Ports are unreliable (every one
 //! of these tools falls back to 443/TCP to punch through firewalls), so a port
@@ -58,6 +69,18 @@ pub const REMOTE_TOOLS: &[RemoteTool] = &[
         publishers: &["AnyDesk Software GmbH"],
         relay_domains: &["anydesk.com", "net.anydesk.com"],
         ports: &[7070],
+    },
+    RemoteTool {
+        id: "rustdesk",
+        name: "RustDesk",
+        // Self-hosted or public-relay remote desktop with built-in file transfer.
+        // Single main image; the tray/service run from the same rustdesk.exe.
+        images: &["rustdesk.exe"],
+        publishers: &["Purslane Ltd", "RustDesk"],
+        relay_domains: &["rustdesk.com"],
+        // hbbs/hbbr signal ports (21115-21119); secondary — RustDesk also uses
+        // 443 relay fallback, so image name stays the authoritative signal.
+        ports: &[21115, 21116, 21117, 21118, 21119],
     },
     RemoteTool {
         id: "teamviewer",
@@ -180,9 +203,11 @@ pub struct RemoteToolPolicy {
 
 impl Default for RemoteToolPolicy {
     fn default() -> Self {
-        // Defence default: cut the relay. Not `kill` (disruptive, operator choice).
+        // Default `detect` (visibility only): remote-tool blocking is decoupled
+        // from the data-exfil layers (read-taint + default-deny) and is opt-in.
+        // Set block_network/kill via config to deliberately forbid the tools.
         RemoteToolPolicy {
-            default_action: ToolAction::BlockNetwork,
+            default_action: ToolAction::Detect,
             overrides: HashMap::new(),
         }
     }
@@ -218,6 +243,13 @@ mod tests {
     }
 
     #[test]
+    fn matches_rustdesk() {
+        assert_eq!(match_image(r"C:\Program Files\RustDesk\rustdesk.exe").unwrap().id, "rustdesk");
+        assert_eq!(match_image("RustDesk.exe").unwrap().id, "rustdesk");
+        assert_eq!(match_relay_domain("rs-ny.rustdesk.com").unwrap().id, "rustdesk");
+    }
+
+    #[test]
     fn matches_vnc_family() {
         assert_eq!(match_image("vncserver.exe").unwrap().id, "realvnc");
         assert_eq!(match_image("tvnserver.exe").unwrap().id, "tightvnc");
@@ -246,19 +278,29 @@ mod tests {
     }
 
     #[test]
-    fn policy_default_is_block_network() {
+    fn policy_default_is_detect_not_block() {
+        // Decoupled: by default remote tools are DETECTED (visibility), never
+        // blocked/killed. Blocking is opt-in via config.
         let pol = RemoteToolPolicy::default();
         let m = pol.match_app("anydesk.exe").unwrap();
         assert_eq!(m.tool_id, "anydesk");
-        assert_eq!(m.action, ToolAction::BlockNetwork);
+        assert_eq!(m.action, ToolAction::Detect);
     }
 
     #[test]
-    fn policy_override_takes_effect() {
+    fn policy_override_opts_in_to_block() {
+        // An operator can still deliberately forbid a specific tool.
         let mut pol = RemoteToolPolicy::default();
-        pol.overrides.insert("rdp-out".into(), ToolAction::Detect);
-        assert_eq!(pol.match_app("mstsc.exe").unwrap().action, ToolAction::Detect);
-        // A tool without an override still gets the default.
+        pol.overrides.insert("rdp-out".into(), ToolAction::BlockNetwork);
+        assert_eq!(pol.match_app("mstsc.exe").unwrap().action, ToolAction::BlockNetwork);
+        // A tool without an override still gets the detect-only default.
+        assert_eq!(pol.match_app("anydesk.exe").unwrap().action, ToolAction::Detect);
+    }
+
+    #[test]
+    fn explicit_block_default_still_works() {
+        // Setting the whole policy to block (opt-in) is preserved.
+        let pol = RemoteToolPolicy { default_action: ToolAction::BlockNetwork, overrides: HashMap::new() };
         assert_eq!(pol.match_app("anydesk.exe").unwrap().action, ToolAction::BlockNetwork);
     }
 

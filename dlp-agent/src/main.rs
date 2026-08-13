@@ -9,6 +9,7 @@
 //!   dlp-agent status        print stored identity summary
 //!   dlp-agent index-update  check in, fetch a newer index bundle if advertised
 //!   dlp-agent scan          score one file against a bundle (audit-mode verdict)
+//!   dlp-agent decrypt       open a .dlpenc envelope (audited-first, offline keyring)
 mod checkin;
 mod client;
 mod enroll;
@@ -19,14 +20,17 @@ mod kguard;
 // integration tests and the binary share one set of types. Re-import the
 // modules at the crate root so the binary submodules keep addressing them as
 // `crate::config` / `crate::storage`.
-use dlp_agent::{browser_host, clipboard, config, detect, netfilter, storage, usb};
+use dlp_agent::{
+    browser_host, clipboard, config, crypto, decrypt, detect, exfil, netfilter, notify, storage,
+    trustdest, trustsync, usb,
+};
 
 use anyhow::{Context, Result};
 use config::Config;
 use std::path::PathBuf;
 use std::time::Duration;
 use storage::Storage;
-use usb::UsbIncident;
+use usb::{ActionTaken, UsbIncident};
 use x509_cert::der::DecodePem;
 
 const DEFAULT_CONFIG: &str = r"C:\ProgramData\DLPAgent\agent.toml";
@@ -79,6 +83,17 @@ fn run() -> Result<()> {
         print_browserhost_help();
         return Ok(());
     }
+    if mode == "decrypt" && args.iter().any(|a| a == "-h" || a == "--help") {
+        print_decrypt_help();
+        return Ok(());
+    }
+
+    // `toast` is the in-session renderer the Session-0 service spawns via
+    // CreateProcessAsUserW. It must run WITHOUT loading config/enrollment (it runs
+    // in an arbitrary user's context and only draws a toast), so handle it here.
+    if mode == "toast" {
+        return cmd_toast(&args);
+    }
 
     let config_path =
         std::env::var("DLP_AGENT_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
@@ -109,6 +124,7 @@ fn run() -> Result<()> {
         "clipboard-monitor" => cmd_clipboard_monitor(&cfg, &storage, &args)?,
         "net-monitor" => cmd_net_monitor(&cfg, &storage, &args)?,
         "browser-host" => cmd_browser_host(&cfg, &storage, &args)?,
+        "decrypt" => cmd_decrypt(&cfg, &storage, &args)?,
         other => {
             eprintln!("unknown mode: {other}");
             print_help();
@@ -289,6 +305,62 @@ struct IncidentRequest<'a> {
     #[serde(rename = "fileSha256")]
     file_sha256: &'a str,
     verdict: &'a detect::Verdict,
+    /// What the agent actually did ("blocked" | "audited" | "read_only"). Lets the
+    /// console distinguish a real block from an audit-only observation. Optional so
+    /// older/scan-path callers stay wire-compatible.
+    #[serde(rename = "actionTaken", skip_serializing_if = "Option::is_none")]
+    action_taken: Option<&'a str>,
+    /// Best-effort interactive user on the endpoint ("who"). Metadata only; never
+    /// a credential. Optional.
+    #[serde(rename = "osUser", skip_serializing_if = "Option::is_none")]
+    os_user: Option<String>,
+    /// KEK id a successful seal used (encrypt-on-write M3). FREE-FORM opaque
+    /// string. Additive wire field — absent for every unsealed incident.
+    #[serde(rename = "keyId", skip_serializing_if = "Option::is_none")]
+    key_id: Option<&'a str>,
+    /// hex SHA-256 of the sealed `.dlpenc` envelope (successful seals only).
+    /// Additive wire field; `fileSha256` stays the plaintext hash.
+    #[serde(rename = "sealedSha256", skip_serializing_if = "Option::is_none")]
+    sealed_sha256: Option<&'a str>,
+}
+
+/// Wire label for an `ActionTaken` (matches the server's accepted values;
+/// "encrypted" is additive — an older server stores actionTaken as null).
+fn action_taken_label(a: ActionTaken) -> &'static str {
+    match a {
+        ActionTaken::Blocked => "blocked",
+        ActionTaken::Audited => "audited",
+        ActionTaken::ReadOnly => "read_only",
+        ActionTaken::Encrypted => "encrypted",
+    }
+}
+
+/// `toast` subcommand: render the endpoint "blocked by DLP" toast in THIS session.
+/// Spawned by the Session-0 service (CreateProcessAsUserW) into the user session,
+/// or runnable directly. Never fails the process on a toast error — the block it
+/// reports already happened; a missing toast must not look like a crash.
+fn cmd_toast(args: &[String]) -> Result<()> {
+    let mut aumid = String::new();
+    let mut title = String::new();
+    let mut body = String::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--aumid" => aumid = it.next().cloned().unwrap_or_default(),
+            "--title" => title = it.next().cloned().unwrap_or_default(),
+            "--body" => body = it.next().cloned().unwrap_or_default(),
+            _ => {}
+        }
+    }
+    // The parent encodes body newlines as U+2028 so they survive the command line.
+    let body = body.replace('\u{2028}', "\n");
+    if aumid.is_empty() {
+        aumid = "Resec.DLP.Agent".to_string();
+    }
+    if let Err(e) = notify::show_toast_from_cli(&title, &body, &aumid) {
+        tracing::warn!(error = %e, "toast render failed");
+    }
+    Ok(())
 }
 
 /// Report a scan verdict to the server over mTLS (POST /agent/incidents).
@@ -303,6 +375,10 @@ fn report_incident(
         file_name: &verdict.file_name,
         file_sha256: &verdict.file_sha256,
         verdict,
+        action_taken: None,
+        os_user: None,
+        key_id: None,
+        sealed_sha256: None,
     })
     .context("serializing incident")?;
     let id = post_incident_body(cfg, storage, &body)?;
@@ -343,8 +419,23 @@ fn usb_incident_body(inc: &UsbIncident) -> Option<String> {
         file_name: &inc.file_name,
         file_sha256: &inc.file_sha256,
         verdict,
+        action_taken: Some(action_taken_label(inc.action_taken)),
+        os_user: notify::current_user(),
+        key_id: inc.key_id.as_deref(),
+        sealed_sha256: inc.sealed_sha256.as_deref(),
     })
     .ok()
+}
+
+/// The single funnel every channel's incident sink runs an incident through:
+/// (1) fire the endpoint "blocked by DLP" toast — best-effort and internally
+/// gated so it only shows on an actual BLOCK (see `notify::on_block_for_incident`),
+/// so EVERY channel (usb/clipboard/network/web-upload) notifies uniformly; then
+/// (2) build the mTLS wire body. Returns `None` for metadata-only incidents (e.g.
+/// network, which carries no verdict) — those are logged locally, not posted.
+fn incident_wire_body(cfg: &Config, inc: &UsbIncident) -> Option<String> {
+    notify::on_block_for_incident(&cfg.notify, inc);
+    usb_incident_body(inc)
 }
 
 /// usb-monitor: run the removable-media device-control + copy-audit loop.
@@ -367,6 +458,17 @@ fn cmd_usb_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Result<(
         }
     }
 
+    // M6: pull the console-authored trusted-destination whitelist + encryption
+    // keys over mTLS, then merge the synced destinations into the effective
+    // [usb] config so the monitor whitelists + seals exactly what the admin set
+    // — with NO local [usb]/[crypto] config required. Best-effort: a sync
+    // failure is logged inside and we fall back to the last-persisted whitelist
+    // (offline, fail secure). Everything below uses the MERGED config.
+    let _ = checkin::sync_trusted_config(cfg, storage);
+    let synced = checkin::load_synced_destinations(storage);
+    let effective = cfg.with_synced_destinations(&synced);
+    let cfg = &effective;
+
     let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
 
     // Flush anything queued while the server was previously unreachable.
@@ -380,7 +482,7 @@ fn cmd_usb_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Result<(
     // The incident sink: post verdict-bearing incidents over mTLS; on failure
     // (or when unenrolled) queue them on disk, bounded (spec §3.6 edge 11).
     // Metadata-only incidents (too-large, enforcement-failed) are logged.
-    let sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+    let sink = |inc: UsbIncident| match incident_wire_body(cfg, &inc) {
         Some(body) => {
             if storage.has_identity() {
                 match post_incident_body(cfg, storage, &body) {
@@ -403,7 +505,49 @@ fn cmd_usb_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Result<(
         ),
     };
 
-    usb::run_monitor(cfg, storage, enforce, sink);
+    // Trusted-destination sealer (encrypt-on-write M3/M6). PREFER the synced
+    // DPAPI keyring at rest (written by sync_trusted_config above) over the dev
+    // [crypto] keyfile; the keyfile is only a fallback for when no synced
+    // keyring exists yet. Fail secure: with no keyring the sealer errors on
+    // every call, so files on Encrypt volumes stay plaintext but every one
+    // raises an EnforcementFailed incident — never a silent pass. Decrypt/seal
+    // are offline: the cached keyring is the only key source on the hot path
+    // (project decision). Errors carry ids/lengths only — NEVER key material.
+    let keyring: Option<crypto::Keyring> = match storage.load_keyring() {
+        Ok(Some(bytes)) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            match crypto::Keyring::from_dev_json(&bytes) {
+                Ok(ring) => Some(ring),
+                Err(e) => {
+                    tracing::warn!(error = %e, "synced keyring unusable — falling back to dev keyfile");
+                    load_dev_keyring(&cfg.crypto.keyfile)
+                }
+            }
+        }
+        Ok(None) => load_dev_keyring(&cfg.crypto.keyfile),
+        Err(e) => {
+            tracing::warn!(error = %e, "sealed keyring unreadable — falling back to dev keyfile");
+            load_dev_keyring(&cfg.crypto.keyfile)
+        }
+    };
+    // origin_agent = the enrolled agent id (never the hostname, spec §4).
+    let agent_id = storage
+        .load_meta()
+        .map(|m| m.agent_id)
+        .unwrap_or_else(|_| "unenrolled".to_string());
+    let sealer = move |path: &std::path::Path, key_id: &str| -> anyhow::Result<usb::SealOutcome> {
+        let ring = keyring
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no keyring loaded ([crypto] keyfile unset or unreadable)"))?;
+        let kek = ring.lookup(key_id).map_err(anyhow::Error::new)?;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        usb::seal_file_in_place(path, kek, &agent_id, now_unix)
+    };
+
+    usb::run_monitor(cfg, storage, enforce, sealer, sink);
     Ok(())
 }
 
@@ -427,6 +571,17 @@ fn cmd_usb_guard(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
         }
     }
 
+    // M6: same trusted-config sync + merge as usb-monitor so the guard's
+    // write-scan whitelist is driven by the console-authored destinations. The
+    // guard's decide()/write_scan_override reads cfg.usb via
+    // decide/encrypt_params, so feeding kguard::run the MERGED config makes it
+    // stand aside for exactly the synced Encrypt destinations. Best-effort;
+    // last-persisted whitelist on failure. Everything below uses the MERGED cfg.
+    let _ = checkin::sync_trusted_config(cfg, storage);
+    let synced = checkin::load_synced_destinations(storage);
+    let effective = cfg.with_synced_destinations(&synced);
+    let cfg = &effective;
+
     let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
 
     // Flush anything queued while previously offline (identical to usb-monitor).
@@ -439,7 +594,7 @@ fn cmd_usb_guard(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
 
     // Same sink shape as cmd_usb_monitor: post verdict-bearing incidents over
     // mTLS; on failure or when unenrolled, queue them on disk (bounded).
-    let sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+    let sink = |inc: UsbIncident| match incident_wire_body(cfg, &inc) {
         Some(body) => {
             if storage.has_identity() {
                 match post_incident_body(cfg, storage, &body) {
@@ -497,7 +652,7 @@ fn cmd_clipboard_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Re
 
     // Same sink shape as cmd_usb_monitor: post verdict-bearing incidents over
     // mTLS; on failure or when unenrolled, queue them on disk (bounded).
-    let sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+    let sink = |inc: UsbIncident| match incident_wire_body(cfg, &inc) {
         Some(body) => {
             if storage.has_identity() {
                 match post_incident_body(cfg, storage, &body) {
@@ -584,7 +739,7 @@ fn cmd_net_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Result<(
     // Same sink shape as cmd_usb_monitor. Network incidents carry no verdict, so
     // usb_incident_body returns None → they are LOGGED locally (metadata only),
     // never posted (a server-side network-incident schema is a follow-on).
-    let sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+    let sink = |inc: UsbIncident| match incident_wire_body(cfg, &inc) {
         Some(body) => {
             if storage.has_identity() {
                 match post_incident_body(cfg, storage, &body) {
@@ -646,7 +801,7 @@ fn cmd_browser_host(cfg: &Config, storage: &Storage, args: &[String]) -> Result<
 
     // Same sink shape as cmd_usb_monitor: web-upload incidents carry a verdict, so
     // they POST over mTLS when enrolled, else queue locally (bounded).
-    let mut sink = |inc: UsbIncident| match usb_incident_body(&inc) {
+    let mut sink = |inc: UsbIncident| match incident_wire_body(cfg, &inc) {
         Some(body) => {
             if storage.has_identity() {
                 match post_incident_body(cfg, storage, &body) {
@@ -681,6 +836,7 @@ fn cmd_browser_host(cfg: &Config, storage: &Storage, args: &[String]) -> Result<
                 channel,
                 |t| detect::verdict_text(t, &b),
                 |p| detect::verdict(p, &b),
+                |bytes, name| detect::verdict_bytes(bytes, name, &b),
                 &mut sink,
             )?;
         }
@@ -706,11 +862,203 @@ fn cmd_browser_host(cfg: &Config, storage: &Storage, args: &[String]) -> Result<
                 channel,
                 |_t| clean(),
                 |_p| Ok(clean()),
+                |_b, _n| clean(),
                 &mut sink,
             )?;
         }
     }
     Ok(())
+}
+
+/// Load a dev keyfile keyring (⚠ DEV ONLY: plaintext KEK material, spec §4.1)
+/// as the SEALER fallback when no synced DPAPI keyring exists at rest. Errors
+/// are logged as metadata only (never key material); a failure disables sealing
+/// (fail secure — files on Encrypt volumes then raise EnforcementFailed rather
+/// than pass in plaintext).
+fn load_dev_keyring(keyfile: &Option<PathBuf>) -> Option<crypto::Keyring> {
+    match keyfile {
+        Some(path) => match crypto::Keyring::load_dev_keyfile(path) {
+            Ok(ring) => Some(ring),
+            Err(e) => {
+                tracing::warn!(error = %e, "dev keyfile load failed — sealing disabled (fail secure)");
+                None
+            }
+        },
+        None => None,
+    }
+}
+
+/// Load the keyring for decrypt/seal — offline and cached, NEVER a server
+/// round-trip (project decision; matches cached-policy semantics):
+/// 1. `[crypto] keyfile` (⚠ DEV ONLY: PLAINTEXT key material, spec §4.1) when
+///    configured — wins, and refreshes the DPAPI-sealed at-rest copy;
+/// 2. else the DPAPI-sealed keyring at rest (machine scope, M4);
+/// 3. else an EMPTY ring — every open then fails `UnknownKeyId`, which the
+///    decrypt path surfaces as a `DecryptDenied` incident (fail secure, and
+///    the attempt itself is signal).
+/// Errors are logged as metadata only — never key material or file contents.
+fn load_decrypt_keyring(cfg: &Config, storage: &Storage) -> crypto::Keyring {
+    if let Some(path) = &cfg.crypto.keyfile {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let bytes = zeroize::Zeroizing::new(bytes);
+                match crypto::Keyring::from_dev_json(&bytes) {
+                    Ok(ring) => {
+                        // Cache at rest so later decrypts work without the dev
+                        // keyfile. DPAPI machine scope on Windows; on
+                        // non-Windows dev builds this is a plaintext
+                        // passthrough (loud warning lives in storage.rs).
+                        if let Err(e) = storage.store_keyring(&bytes) {
+                            tracing::warn!(error = %e, "could not cache keyring at rest");
+                        }
+                        return ring;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "dev keyfile unusable — trying sealed keyring")
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "dev keyfile unreadable — trying sealed keyring"),
+        }
+    }
+    match storage.load_keyring() {
+        Ok(Some(bytes)) => {
+            let bytes = zeroize::Zeroizing::new(bytes);
+            match crypto::Keyring::from_dev_json(&bytes) {
+                Ok(ring) => return ring,
+                Err(e) => tracing::warn!(error = %e, "sealed keyring unusable"),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "sealed keyring unreadable"),
+    }
+    tracing::warn!("no keyring available — every decrypt will be denied (fail secure)");
+    crypto::Keyring::new("")
+}
+
+/// decrypt: open a `.dlpenc` envelope on this enrolled endpoint (encrypt-on-
+/// write spec §5.3, M4). Offline-capable: the cached keyring is the only key
+/// source. The audit incident (channel "decrypt") is recorded BEFORE the
+/// plaintext is written; if it can neither be posted nor queued locally,
+/// nothing is written. Unknown/destroyed key ⇒ DecryptDenied incident and a
+/// non-zero exit, nothing written.
+fn cmd_decrypt(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()> {
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-o" | "--output" => {
+                output = Some(PathBuf::from(
+                    it.next().context("-o requires a path")?,
+                ));
+            }
+            other if !other.starts_with('-') && input.is_none() => {
+                input = Some(PathBuf::from(other));
+            }
+            other => {
+                eprintln!("unknown decrypt option: {other}");
+                print_decrypt_help();
+                std::process::exit(2);
+            }
+        }
+    }
+    let input = input.context("decrypt requires <file.dlpenc>")?;
+    let envelope_bytes =
+        std::fs::read(&input).with_context(|| format!("reading {}", input.display()))?;
+    let envelope_name = input
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| input.display().to_string());
+
+    let keyring = load_decrypt_keyring(cfg, storage);
+    let agent_id = storage
+        .load_meta()
+        .map(|m| m.agent_id)
+        .unwrap_or_else(|_| "unenrolled".to_string());
+
+    // Audit sink: post over mTLS when enrolled; on post failure (or when
+    // unenrolled) queue on disk, bounded — same wire/queue path as every other
+    // channel. Errors ONLY when both fail; decrypt_envelope then refuses to
+    // write the plaintext (no un-audited decrypt, fail secure).
+    let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
+    let audit = |inc: &UsbIncident| -> Result<()> {
+        let body = usb_incident_body(inc).context("serializing decrypt incident")?;
+        if storage.has_identity() {
+            match post_incident_body(cfg, storage, &body) {
+                Ok(id) => {
+                    tracing::info!(incident_id = %id, kind = ?inc.kind, "decrypt incident reported");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "decrypt incident post failed — queuing locally")
+                }
+            }
+        }
+        queue.enqueue(&body).context("queuing decrypt incident locally")
+    };
+
+    // Writer: default output name comes from the AUTHENTICATED header — name
+    // component only (never a path from the envelope, even an authenticated
+    // one), beside the input; refuses to overwrite unless -o chose the target.
+    let written: std::cell::RefCell<Option<PathBuf>> = std::cell::RefCell::new(None);
+    let write = |header: &crypto::EnvelopeHeader, plaintext: &[u8]| -> Result<()> {
+        let out_path = match &output {
+            Some(p) => p.clone(),
+            None => {
+                let name = std::path::Path::new(&header.orig_name)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| {
+                        envelope_name.trim_end_matches(".dlpenc").to_string()
+                    });
+                let candidate = input
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default()
+                    .join(name);
+                if candidate.exists() {
+                    anyhow::bail!(
+                        "refusing to overwrite {} (pass -o to choose a destination)",
+                        candidate.display()
+                    );
+                }
+                candidate
+            }
+        };
+        std::fs::write(&out_path, plaintext)
+            .with_context(|| format!("writing {}", out_path.display()))?;
+        *written.borrow_mut() = Some(out_path);
+        Ok(())
+    };
+
+    match decrypt::decrypt_envelope(
+        &envelope_bytes,
+        &envelope_name,
+        &keyring,
+        &agent_id,
+        audit,
+        write,
+    ) {
+        Ok(summary) => {
+            let out = written.borrow();
+            println!(
+                "decrypted:  {}",
+                out.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+            );
+            println!("orig name:  {}", summary.header.orig_name);
+            println!("key id:     {}", summary.header.key_id);
+            println!("sealed by:  {} (unix {})", summary.header.origin_agent, summary.header.created_unix);
+            println!("sha256:     {}", summary.plaintext_sha256);
+            println!("size:       {} bytes", summary.plaintext_len);
+            Ok(())
+        }
+        // Typed failure → non-zero exit via main's error path. Any
+        // DecryptDenied incident was already recorded/queued.
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("decrypt of {} failed", input.display()))),
+    }
 }
 
 fn print_status(storage: &Storage) -> Result<()> {
@@ -754,8 +1102,9 @@ fn extract_cert_pem(identity: &[u8]) -> Option<String> {
 }
 
 fn print_help() {
-    println!("dlp-agent <enroll|once|run|status|index-update|scan|usb-monitor|usb-guard|clipboard-monitor|net-monitor|browser-host>");
+    println!("dlp-agent <enroll|once|run|status|index-update|scan|usb-monitor|usb-guard|clipboard-monitor|net-monitor|browser-host|decrypt>");
     println!("  scan --bundle <path> --file <path> [--json] [--report --channel <name>]");
+    println!("  decrypt <file.dlpenc> [-o <out>]   open a sealed envelope; audited (see --help)");
     println!("  usb-monitor [--enforce]   watch removable media; audit copies (see --help)");
     println!("  usb-guard                 answer the kernel minifilter's scan port (see --help)");
     println!("  clipboard-monitor [--enforce]  watch the clipboard; audit copies (see --help)");
@@ -861,6 +1210,26 @@ fn print_browserhost_help() {
     println!("  With no cached bundle the host allows all uploads (audit-only) so the");
     println!("  browser is never bricked. True end-to-end needs a real browser (MANUAL).");
     println!("  Thresholds: [kguard] block_at / coverage_block_at.");
+}
+
+fn print_decrypt_help() {
+    println!("dlp-agent decrypt <file.dlpenc> [-o <out>]");
+    println!("  Opens a `.dlpenc` envelope sealed by this organisation (encrypt-on-write,");
+    println!("  trusted-destination encryption) using the locally cached keyring — OFFLINE");
+    println!("  by design: no server round-trip. Keys come from the DPAPI-sealed keyring at");
+    println!("  rest (machine scope), or in dev from [crypto] keyfile (plaintext, dev only;");
+    println!("  loading it refreshes the sealed cache).");
+    println!("  The audit incident (channel \"decrypt\": key id, plaintext hash, agent id,");
+    println!("  outcome) is recorded BEFORE the plaintext is written — posted over mTLS when");
+    println!("  enrolled, else queued locally (bounded). If it can be neither posted nor");
+    println!("  queued, NOTHING is written (fail secure: no un-audited decrypt).");
+    println!("  An unknown or crypto-shredded (destroyed) key id is refused: DecryptDenied");
+    println!("  incident + non-zero exit, nothing written. Old/foreign sealed media showing");
+    println!("  up here is signal, not noise.");
+    println!("  -o, --output <out>  write the plaintext to <out> (may overwrite). Default:");
+    println!("                      the authenticated original name beside the input file;");
+    println!("                      refuses to overwrite an existing file without -o.");
+    println!("  Incidents and output carry hashes/ids/metadata only — never key material.");
 }
 
 fn print_scan_help() {
