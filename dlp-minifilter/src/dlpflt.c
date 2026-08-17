@@ -86,12 +86,6 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI DlpPreSetInformation(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Flt_CompletionContext_Outptr_ PVOID *CompletionContext);
 
-FLT_POSTOP_CALLBACK_STATUS FLTAPI DlpPostRead(
-    _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _In_opt_ PVOID CompletionContext,
-    _In_ FLT_POST_OPERATION_FLAGS Flags);
-
 /* Read-deny pre-op (content-aware exfil-tool read blocking, read-deny-LLD). */
 FLT_PREOP_CALLBACK_STATUS FLTAPI DlpPreRead(
     _Inout_ PFLT_CALLBACK_DATA Data,
@@ -101,8 +95,9 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI DlpPreRead(
 /* Section-sync pre-op: denies an exfil PID from memory-MAPPING a sensitive file.
  * Mapped/paging reads never reach DlpPreRead (SKIP_PAGING_IO on IRP_MJ_READ), so
  * this is the chokepoint that blocks mmap-based exfil -- the path real RustDesk /
- * AnyDesk / VNC file transfer actually uses. The verdict is seeded synchronously
- * at DlpPostCreate (safe cached read), so this callback never reads a file. */
+ * AnyDesk / VNC file transfer actually uses. Cache-only (stream ctx / SensFile /
+ * CleanFile, seeded by the DlpPreRead classifier); it never reads a file, and an
+ * UNKNOWN mapping by an exfil PID fails secure per ExfilReadFailBlock. */
 FLT_PREOP_CALLBACK_STATUS FLTAPI DlpPreAcquireForSection(
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -131,29 +126,14 @@ static BOOLEAN DlpClassifyActive(VOID);
 static BOOLEAN DlpNameHas(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Sub);
 static BOOLEAN DlpIsOpord(_Inout_ PFLT_CALLBACK_DATA Data);
 
-/* Read-deny (mapped-read defence): enqueue an ASYNC content scan for an exfil
- * PID's OPEN of an in-scope file. The scan worker reads + up-calls at PASSIVE
- * OFF the create path, then taints the opener (WFP network cut -- the reliable
- * backstop that catches mmap exfil the read hooks cannot see) and seeds SensFile
- * (so the section-sync pre-op can block the mapping too). Never blocks the create
- * path and never up-calls synchronously, so it cannot deadlock the create
- * completion nor storm the guard. Claim-once via the stream context. */
-static VOID DlpEnqueueOpenScan(_In_ PCFLT_RELATED_OBJECTS FltObjects,
-                               _Inout_ PFLT_CALLBACK_DATA Data);
-
-/* Shared stream-read helper (factored out of DlpInspectStream; write behavior
- * is unchanged). Reads offset 0..min(EOF,DLP_MAX_CONTENT) into a fresh
+/* Shared stream-read helper (used by DlpInspectStream and the read-deny
+ * classifier). Reads offset 0..min(EOF,DLP_MAX_CONTENT) into a fresh
  * NonPagedPoolNx buffer the caller frees with DLP_GENERAL_TAG. */
 static NTSTATUS DlpReadStreamContent(_In_ PFLT_INSTANCE Instance,
                                      _In_ PFILE_OBJECT FileObject,
                                      _Outptr_result_maybenull_ PVOID *Buffer,
                                      _Out_ PULONG Length,
                                      _Out_ PBOOLEAN Truncated);
-
-/* Async read-taint scan worker (folded taint.c). Static internals. */
-static VOID     DlpScanWorker(_In_ PVOID StartContext);
-static VOID     DlpProcessScanJob(_In_ PDLP_SCAN_JOB Job);
-static VOID     DlpFreeScanJob(_In_ PDLP_SCAN_JOB Job);
 
 static BOOLEAN DlpVolumeIsRemovable(_In_ PFLT_VOLUME Volume);
 static BOOLEAN DlpShouldSkip(_In_ PFLT_CALLBACK_DATA Data,
@@ -198,12 +178,11 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
                                  DlpPreCleanup,           NULL          },
     { IRP_MJ_SET_INFORMATION, 0, DlpPreSetInformation,    NULL          },
     /* READ. Pre-op = read-deny (content-aware exfil-tool block, no-op unless
-     * ExfilReadBlockEnabled); post-op = read-taint trigger (no-op unless
-     * ReadTaintEnabled). SKIP_PAGING_IO like WRITE/CLEANUP so we never sit on the
-     * modified/lazy-writer path. Both default-off, so the shipped default adds
+     * ExfilReadBlockEnabled). SKIP_PAGING_IO like WRITE/CLEANUP so we never sit
+     * on the modified/lazy-writer path. Default-off, so the shipped default adds
      * nothing to the read path. */
     { IRP_MJ_READ,            FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
-                                 DlpPreRead,              DlpPostRead   },
+                                 DlpPreRead,              NULL          },
     /* ACQUIRE_FOR_SECTION_SYNCHRONIZATION (pre). The MAPPED-read half of read-
      * deny: an exfil PID creating a data section over a sensitive file is denied
      * HERE, because the subsequent page-fault (paging) reads bypass IRP_MJ_READ
@@ -273,20 +252,9 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     gDlpData.BadHashNext = 0;
     gDlpData.ObCallbackHandle = NULL;
 
-    /* Read-taint state (all gated by ReadTaintEnabled). Initialize the taint
-     * table + sensfile cache BEFORE FltStartFiltering so any early DlpPostRead
-     * finds valid spinlocks. Both mirror the BadHash ring (epoch-stamped). The
-     * scan queue / rundown / worker thread are brought up later, gated on the
-     * registry switch (DlpStartScanWorker); DlpPostRead does nothing until the
-     * worker publishes readiness via ScanRundownInit. Defaults are the shipped
-     * OFF/block-all (DlpReadTaintPolicy only overrides them from the registry). */
-    gDlpData.ReadTaintEnabled = DLP_READTAINT_DISABLED;
-    gDlpData.TaintedEgressPolicy = DLP_TEP_BLOCK_ALL;
-    KeInitializeSpinLock(&gDlpData.TaintLock);
-    RtlZeroMemory(gDlpData.Taint, sizeof(gDlpData.Taint));
-    gDlpData.TaintEpoch = 1;                                /* 0 reserved       */
-    gDlpData.TaintCount = 0;
-    gDlpData.TaintNext = 0;
+    /* Read-deny file-id caches. Initialize BEFORE FltStartFiltering so any early
+     * read callback finds valid spinlocks. Both mirror the BadHash ring
+     * (epoch-stamped). */
     KeInitializeSpinLock(&gDlpData.SensFileLock);
     RtlZeroMemory(gDlpData.SensFile, sizeof(gDlpData.SensFile));
     gDlpData.SensFileNext = 0;
@@ -303,8 +271,6 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     RtlZeroMemory(gDlpData.Exfil, sizeof(gDlpData.Exfil));
     gDlpData.ExfilEpoch = 1;                                /* 0 reserved       */
     gDlpData.ExfilCount = 0;
-    gDlpData.ScanRundownInit = FALSE;
-    gDlpData.ScanThread = NULL;
     gDlpData.ProcNotifyRegistered = FALSE;
 
     /* Scan-scope config lock. Initialize BEFORE FltStartFiltering so any early
@@ -328,12 +294,6 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 
     /* Read the deployment's FailMode from the service registry key. */
     DlpReadFailMode(RegistryPath);
-
-    /* Read the read-taint knobs (ReadTaintEnabled, TaintedEgressPolicy) from the
-     * same key BEFORE FltStartFiltering, so the DlpPostRead kill-switch sees the
-     * real value from the first read callback. Absent key => stays OFF (today's
-     * FS-only behavior). */
-    DlpReadTaintPolicy(RegistryPath);
 
     /* Read the read-deny knobs (ExfilReadBlockEnabled, ExfilReadFailBlock) from the
      * same key BEFORE FltStartFiltering, so DlpPreRead's kill-switch is correct from
@@ -382,43 +342,11 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         return status;
     }
 
-    /* --- Read-taint bring-up (opt-in; default OFF behaves EXACTLY as today) ---
-     * Done AFTER FltStartFiltering (the FS filter must be live first, LLD §5.2).
-     * All best-effort: read-taint must never fail DriverEntry -- losing the
-     * network-egress block must not take down USB/content/FS protection.
-     *   - Worker-start failure  => disable read-taint entirely (no half-up
-     *                              subsystem; DlpPostRead then no-ops).
-     *   - Process-notify failure => continue without exit-untaint (taint slots
-     *                              are still bounded by ring eviction).
-     *   - WFP register failure   => continue FS-only (NON-FATAL, LLD §5.2). */
-    if (gDlpData.ReadTaintEnabled == DLP_READTAINT_ENABLED ||
-        gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
-        NTSTATUS rtStatus = DlpStartScanWorker();
-        if (!NT_SUCCESS(rtStatus)) {
-            /* No worker => read-taint cannot function AND read-deny loses its
-             * async open-scan (the mmap backstop: taint-the-opener + SensFile
-             * seed). Disable read-taint; read-deny keeps its synchronous buffered-
-             * read block (DlpPreRead) -- just without the mapped-read backstop. */
-            gDlpData.ReadTaintEnabled = DLP_READTAINT_DISABLED;
-        } else {
-            /* WFP egress callout (wfpcallout.c): the taint -> network-cut enforcer.
-             * Needed by BOTH read-taint and read-deny's open-scan backstop (a
-             * tainted exfil tool cannot ship a mapped read it already made off the
-             * box). NON-FATAL: on failure roll back partial WFP state (idempotent)
-             * and keep FS protection + the read/section blocks. */
-            rtStatus = DlpWfpRegister();
-            if (!NT_SUCCESS(rtStatus)) {
-                DlpWfpUnregister();
-            }
-        }
-    }
-
-    /* Process-exit notify serves BOTH read-taint (untaint the PID) and read-deny
-     * (drop the exfil PID -> closes the PID-reuse window between agent pushes).
-     * Register once if EITHER feature is live. Non-fatal: ring eviction / the
-     * agent's next full-replace still bound both tables without it. */
-    if (gDlpData.ReadTaintEnabled == DLP_READTAINT_ENABLED ||
-        gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
+    /* Process-exit notify serves read-deny: drop an exited exfil PID (closes the
+     * PID-reuse window between agent pushes). Registered AFTER FltStartFiltering,
+     * only when read-deny is live. Non-fatal: the agent's next full-replace still
+     * bounds the exfil table without it. */
+    if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
         if (NT_SUCCESS(PsSetCreateProcessNotifyRoutineEx(DlpCreateProcessNotify,
                                                          FALSE))) {
             gDlpData.ProcNotifyRegistered = TRUE;
@@ -438,50 +366,36 @@ DlpUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     UNREFERENCED_PARAMETER(Flags);
     PAGED_CODE();
 
-    /* Teardown order per LLD §5.5 -- STRICT REVERSE of bring-up. Every read-taint
-     * step is idempotent / guarded by its own flag, so a driver that never
-     * enabled read-taint (or only partially brought it up) tears down cleanly. */
+    /* Teardown order -- STRICT REVERSE of bring-up. Every step is idempotent /
+     * guarded by its own flag, so a partially-brought-up driver tears down
+     * cleanly. */
 
     /* 1) Drop tamper protection FIRST (item 11): stop intercepting process-handle
      *    opens before anything else tears down. */
     DlpUnregisterObCallbacks();
 
-    /* 2) Stop blocking egress: remove the WFP filters + callouts BEFORE the
-     *    worker stops, so no new connect is blocked while we drain. No-op (fully
-     *    idempotent, flag-guarded) when read-taint was never/only-partly up. */
-    DlpWfpUnregister();
-
-    /* 3+4) Stop the async scan worker. DlpStopScanWorker folds LLD §5.5 steps 3
-     *    and 4 in the race-free order: it FIRST runs down ScanRundown (so every
-     *    subsequent DlpScanEnqueue drops its job instead of orphaning a rundown
-     *    ref) and drains all in-flight jobs the still-running worker holds, THEN
-     *    signals + joins the worker thread. No-op if the worker never started. */
-    DlpStopScanWorker();
-
-    /* 5) Close the server port (and defensively NULL the client port) so no new
-     *    agent can connect and no new up-call can begin. Done AFTER the worker
-     *    drains so an in-flight read-scan up-call still reaches the agent. */
+    /* 2) Close the server port (and defensively NULL the client port) so no new
+     *    agent can connect and no new up-call can begin. */
     DlpCloseCommunicationPort();
 
-    /* 6) Drain in-flight FltSendMessage up-calls (item 2, A4). Waited EXACTLY
+    /* 3) Drain in-flight FltSendMessage up-calls (item 2, A4). Waited EXACTLY
      *    ONCE, only here, and only AFTER the ports are closed so any send past
      *    the rundown-acquire runs to completion and none can newly start. This
      *    is what guarantees FltUnregisterFilter cannot hang on an outstanding
-     *    send. Step 5 already NULLed &gDlpData.ClientPort, unblocking any send
+     *    send. Step 2 already NULLed &gDlpData.ClientPort, unblocking any send
      *    currently waiting inside FltSendMessage. */
     if (gDlpData.SendRundownInit) {
         ExWaitForRundownProtectionRelease(&gDlpData.SendRundown);
         gDlpData.SendRundownInit = FALSE;
     }
 
-    /* 7) Unregister the process-exit untaint notify. Safe here: nothing reads the
-     *    taint table any more (WFP gone in step 2, worker gone in step 3). */
+    /* 4) Unregister the process-exit notify (read-deny exfil-PID drop). */
     if (gDlpData.ProcNotifyRegistered) {
         (VOID)PsSetCreateProcessNotifyRoutineEx(DlpCreateProcessNotify, TRUE);
         gDlpData.ProcNotifyRegistered = FALSE;
     }
 
-    /* 8) Unregister the filter; delete the config lock. */
+    /* 5) Unregister the filter; delete the config lock. */
     if (gDlpData.Filter != NULL) {
         FltUnregisterFilter(gDlpData.Filter);
         gDlpData.Filter = NULL;
@@ -781,25 +695,33 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
-    /* Read-deny (mapped-read defence): if an exfil-channel PID just opened a file,
-     * enqueue an ASYNC content scan. The worker (off the create path, at PASSIVE)
-     * taints the opener -> WFP cuts its egress, catching mmap-based exfil that the
-     * read hooks miss (a memory-mapped read is paging I/O and never reaches
-     * DlpPreRead), and seeds SensFile so the section-sync pre-op blocks the mapping
-     * too. This runs for read-only opens (an mmap-read open has no write access).
-     * A synchronous classify HERE would stall the create completion (FltReadFile /
-     * FltSendMessage on the create path deadlocks) -- hence the async worker. */
+    desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+
+    /* Open-time read-deny (exfil channel). An untrusted process opening an
+     * in-scope SENSITIVE file for read is denied the OPEN itself
+     * (FltCancelFileOpen) -- so no delegate, preview map, or transient worker of
+     * that process can pull the bytes even when a DIFFERENT (unflagged) PID
+     * issues the actual read. Closes the multi-process evasion where the flagged
+     * tool opens the file but hands the read to Explorer's preview map or a
+     * short-lived worker that races the agent's ~2 s PID push. Gated exactly like
+     * DlpPreRead (read-deny enabled + exfil PID + a read-capable open); scope and
+     * sensitivity come from the shared classifier, whose SensFile/CleanFile cache
+     * makes repeat opens O(1). A non-read open falls through to the write path. */
     if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED &&
-        gDlpData.ScanRundownInit) {
-        ULONG rpid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-        if (DlpExfilLookup(rpid)) {
-            DlpEnqueueOpenScan(FltObjects, Data);
+        (desiredAccess & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ |
+                          GENERIC_ALL | MAXIMUM_ALLOWED)) != 0) {
+        ULONG exfilPid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
+        if (DlpExfilLookup(exfilPid) &&
+            DlpExfilClassifyAndCache(FltObjects, Data, exfilPid) == DLP_EXFIL_DENY) {
+            FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            return FLT_POSTOP_FINISHED_PROCESSING;
         }
     }
 
     /* Only track opens that could write: a read-only open cannot leak new
      * content onto the media. */
-    desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
     wantsWrite = (desiredAccess &
                   (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | DELETE)) != 0;
     if (!wantsWrite) {
@@ -820,6 +742,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         ctx->Dirty = 0;
         ctx->Inspected = 0;
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
+        ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;   /* contexts are NOT zeroed by FltMgr */
 
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
@@ -907,6 +830,7 @@ DlpPreSetInformation(_Inout_ PFLT_CALLBACK_DATA Data,
                 ctx->Dirty = 1;
                 ctx->Inspected = 0;
                 ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
+                ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;  /* contexts are NOT zeroed */
                 if (!NT_SUCCESS(FltSetStreamContext(
                         FltObjects->Instance, FltObjects->FileObject,
                         FLT_SET_CONTEXT_KEEP_IF_EXISTS, (PFLT_CONTEXT)ctx, NULL))) {
@@ -1031,9 +955,9 @@ DlpInspectStream(_Inout_ PFLT_CALLBACK_DATA Data,
     (VOID)FltParseFileNameInformation(nameInfo);
 
     /* The write/quarantine path targets EXFIL destinations only -- removable +
-     * network. A fixed-volume watch arms READ-TAINT (DlpPostRead), NOT local file
+     * network. A fixed-volume watch scopes READ-DENY (DlpPreRead), NOT local file
      * deletion: copying a sensitive file C:->C: is not exfiltration and must never
-     * be quarantined. So the write path never inspects a fixed volume; read-taint
+     * be quarantined. So the write path never inspects a fixed volume; read-deny
      * (a separate callback) still covers reads there. (Blocking writes into a
      * specific cloud-sync folder is a separate, narrower future feature.) */
     if (VolumeClass == DLP_VOL_FIXED) {
@@ -1047,7 +971,7 @@ DlpInspectStream(_Inout_ PFLT_CALLBACK_DATA Data,
      * would -- FltReadFile issues a fresh IRP below our instance, immune to the
      * share modes on the caller's handle. Any query/alloc/read failure just
      * ships no content and fails-safe; it must NEVER crash. Factored into
-     * DlpReadStreamContent (shared byte-for-byte with the read-taint worker). */
+     * DlpReadStreamContent (shared byte-for-byte with the read-deny classifier). */
     (VOID)DlpReadStreamContent(FltObjects->Instance, FltObjects->FileObject,
                                &content, &contentBytes, &truncated);
 
@@ -1473,13 +1397,13 @@ DlpUnregisterObCallbacks(VOID)
 
 
 /* ========================================================================= *
- *  Read-taint -- shared in-kernel stream read (LLD §3 step 2)               *
+ *  Shared in-kernel stream read                                             *
  *                                                                           *
  *  Factored out of the write path so DlpInspectStream (CLEANUP) and the     *
- *  async scan worker read the stream IDENTICALLY: offset 0 .. min(EOF,      *
+ *  read-deny classifier read the stream IDENTICALLY: offset 0 .. min(EOF,   *
  *  DLP_MAX_CONTENT) into a fresh NonPagedPoolNx buffer the caller frees with *
  *  DLP_GENERAL_TAG. PASSIVE_LEVEL only (FltReadFile waits). On any failure   *
- *  the caller fails-safe (write path ships no content; worker adds NO taint).*
+ *  the caller fails-safe (ships no content / classifies fail-secure).       *
  * ------------------------------------------------------------------------- */
 static NTSTATUS
 DlpReadStreamContent(_In_ PFLT_INSTANCE Instance,
@@ -1510,7 +1434,7 @@ DlpReadStreamContent(_In_ PFLT_INSTANCE Instance,
     }
 
     /* Empty file: no content, but NOT an error (the service scores what it gets;
-     * the worker treats "no content" as no taint). */
+     * the read-deny classifier resolves "no content" fail-safe). */
     if (stdInfo.EndOfFile.QuadPart <= 0) {
         return STATUS_SUCCESS;
     }
@@ -1551,153 +1475,7 @@ DlpReadStreamContent(_In_ PFLT_INSTANCE Instance,
 
 
 /* ========================================================================= *
- *  Read-taint -- taint table (LLD §4; mirrors the BadHash ring exactly)     *
- *                                                                           *
- *  One dedicated KSPIN_LOCK (gDlpData.TaintLock), TaintEpoch-stamped so an   *
- *  admin "reset taint" (epoch bump) implicitly clears the table with no walk,*
- *  ring cursor for capacity eviction, PID 0 == empty-slot sentinel. Only     *
- *  DlpTaintLookup runs at <= DISPATCH (the WFP callout); the mutators run at  *
- *  PASSIVE (worker / process-notify). No pool (static array).               *
- * ------------------------------------------------------------------------- */
-
-BOOLEAN
-DlpTaintLookup(_In_ ULONG Pid)
-{
-    KIRQL oldIrql;
-    BOOLEAN found = FALSE;
-    LONG taintEpoch;
-    ULONG i;
-
-    /* PID 0 is the empty-slot sentinel -- never a match (mirrors the Rust
-     * select_pid_rows "PID 0 never matches" invariant). */
-    if (Pid == 0) {
-        return FALSE;
-    }
-
-    taintEpoch = InterlockedCompareExchange(&gDlpData.TaintEpoch, 0, 0);
-
-    /* KSPIN_LOCK is valid at <= DISPATCH; this is the ONLY taint fn the WFP
-     * classifyFn calls, and it neither allocates, waits, nor does I/O. */
-    KeAcquireSpinLock(&gDlpData.TaintLock, &oldIrql);
-    for (i = 0; i < DLP_TAINT_MAX; i++) {
-        if (gDlpData.Taint[i].Valid &&
-            gDlpData.Taint[i].TaintEpoch == taintEpoch &&
-            (ULONG)gDlpData.Taint[i].Pid == Pid) {
-            found = TRUE;
-            break;
-        }
-    }
-    KeReleaseSpinLock(&gDlpData.TaintLock, oldIrql);
-    return found;
-}
-
-VOID
-DlpTaintAdd(_In_ ULONG Pid)
-{
-    KIRQL oldIrql;
-    LONG taintEpoch;
-    ULONGLONG createTime = 0;
-    PEPROCESS proc = NULL;
-    LONG slot = -1;
-    ULONG i;
-
-    if (Pid == 0) {
-        return;                            /* never taint the sentinel PID */
-    }
-
-    /* PID-reuse guard: capture the target process's create time BEFORE taking the
-     * spinlock (PsLookupProcessByProcessId / PsGetProcessCreateTimeQuadPart are
-     * PASSIVE-level, must NOT run under a spinlock). A failed lookup (the PID
-     * already exited) leaves createTime 0 -- it is advisory: taint MATCHING keys
-     * only on Pid + TaintEpoch, so the create time is a stored disambiguator for
-     * a recycled PID, never consulted in the DISPATCH-level lookup. */
-    if (NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Pid, &proc))) {
-        createTime = (ULONGLONG)PsGetProcessCreateTimeQuadPart(proc);
-        ObDereferenceObject(proc);
-    }
-
-    taintEpoch = InterlockedCompareExchange(&gDlpData.TaintEpoch, 0, 0);
-
-    KeAcquireSpinLock(&gDlpData.TaintLock, &oldIrql);
-
-    /* Dedup within the current epoch (do not double-count a PID). */
-    for (i = 0; i < DLP_TAINT_MAX; i++) {
-        if (gDlpData.Taint[i].Valid &&
-            gDlpData.Taint[i].TaintEpoch == taintEpoch &&
-            (ULONG)gDlpData.Taint[i].Pid == Pid) {
-            KeReleaseSpinLock(&gDlpData.TaintLock, oldIrql);
-            return;
-        }
-    }
-
-    /* Prefer a genuinely free slot; grow the live count when we take one. */
-    for (i = 0; i < DLP_TAINT_MAX; i++) {
-        if (!gDlpData.Taint[i].Valid) {
-            slot = (LONG)i;
-            break;
-        }
-    }
-    if (slot < 0) {
-        /* Table full: evict the oldest via the ring cursor (net count unchanged
-         * -- we overwrite an occupied slot). A real deployment will not hold 1024
-         * concurrently-tainted PIDs; an evicted PID falls back to the user-mode
-         * default-deny allow-list (fail-safe). */
-        slot = gDlpData.TaintNext;
-        if (slot < 0 || slot >= DLP_TAINT_MAX) {
-            slot = 0;
-        }
-        gDlpData.TaintNext = (slot + 1) % DLP_TAINT_MAX;
-    } else if (gDlpData.TaintCount < DLP_TAINT_MAX) {
-        InterlockedIncrement(&gDlpData.TaintCount);   /* saturating */
-    }
-
-    gDlpData.Taint[slot].Pid = (LONG)Pid;
-    gDlpData.Taint[slot].TaintEpoch = taintEpoch;
-    gDlpData.Taint[slot].CreateTime = createTime;
-    gDlpData.Taint[slot].Valid = TRUE;
-
-    KeReleaseSpinLock(&gDlpData.TaintLock, oldIrql);
-}
-
-VOID
-DlpTaintRemove(_In_ ULONG Pid)
-{
-    KIRQL oldIrql;
-    ULONG i;
-
-    if (Pid == 0) {
-        return;
-    }
-
-    KeAcquireSpinLock(&gDlpData.TaintLock, &oldIrql);
-    /* Clear EVERY slot holding this PID (a PID can occupy a current-epoch slot
-     * plus a stale-epoch duplicate after an admin reset); decrement the live
-     * count for each. Process exit removes the PID from all epochs at once. */
-    for (i = 0; i < DLP_TAINT_MAX; i++) {
-        if (gDlpData.Taint[i].Valid && (ULONG)gDlpData.Taint[i].Pid == Pid) {
-            gDlpData.Taint[i].Valid = FALSE;
-            gDlpData.Taint[i].Pid = 0;
-            gDlpData.Taint[i].CreateTime = 0;
-            if (gDlpData.TaintCount > 0) {
-                InterlockedDecrement(&gDlpData.TaintCount);
-            }
-        }
-    }
-    KeReleaseSpinLock(&gDlpData.TaintLock, oldIrql);
-}
-
-VOID
-DlpTaintResetAll(VOID)
-{
-    /* Admin "reset taint": bump the epoch ONLY (implicit clear, like the badhash
-     * epoch). NOT called on agent reconnect -- taint deliberately persists across
-     * an agent restart (HLD §6). Left as an unwired admin hook by design. */
-    InterlockedIncrement(&gDlpData.TaintEpoch);
-}
-
-
-/* ========================================================================= *
- *  Read-deny -- exfil-PID set (read-deny-LLD §2). Mirrors the taint ring:    *
+ *  Read-deny -- exfil-PID set (read-deny-LLD §2). Mirrors the BadHash ring:  *
  *  KSPIN_LOCK, epoch stamp, full-replace bumps the epoch. DlpExfilLookup runs *
  *  on the read hot path (DlpPreRead, PASSIVE) under the lock; DlpExfilReplace *
  *  applies the agent-pushed full set; DlpExfilRemove drops an exited PID.    *
@@ -1788,9 +1566,9 @@ DlpExfilRemove(_In_ ULONG Pid)
  *  DlpShouldSkip (PASSIVE, no re-entrancy) and the exfil-set lookup, so an    *
  *  ordinary process's reads exit after one spinlocked scan.                  *
  *                                                                           *
- *  RETURN CONTRACT: every allow/skip path returns SUCCESS_WITH_CALLBACK so   *
- *  the paired post-op (DlpPostRead / read-taint) still runs; only a deny      *
- *  returns FLT_PREOP_COMPLETE with STATUS_ACCESS_DENIED.                     *
+ *  RETURN CONTRACT: every allow/skip path returns SUCCESS_NO_CALLBACK (no    *
+ *  post-op is registered on READ); only a deny returns FLT_PREOP_COMPLETE    *
+ *  with STATUS_ACCESS_DENIED.                                                *
  * ------------------------------------------------------------------------- */
 
 /* Complete the read as denied (the tool's ReadFile fails -> its transfer aborts). */
@@ -1880,7 +1658,6 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         ctx->Dirty = 0;
         ctx->Inspected = 0;
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
-        ctx->ReadScanState = 0;
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
@@ -2030,9 +1807,9 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
 
     *CompletionContext = NULL;
 
-    /* 1. Kill-switch (default OFF). Still WITH_CALLBACK so read-taint's post-op runs. */
+    /* 1. Kill-switch (default OFF). */
     if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_ENABLED) {
-        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* TEMP-DIAGNOSTIC: record every OPORD read (pid, exfil, would-skip). */
     if (KeGetCurrentIrql() == PASSIVE_LEVEL && DlpIsOpord(Data)) {
@@ -2042,27 +1819,26 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
     }
     /* 2. Top-of-callback gate: PASSIVE + no re-entrancy + skip agent/System. */
     if (DlpShouldSkip(Data, FltObjects)) {
-        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* 3. Only exfil-channel PIDs are subject to read-deny -- the common case
      *    (ordinary app) exits here after ONE spinlocked scan. */
     pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
     if (!DlpExfilLookup(pid)) {
-        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* 4. Zero-length read: nothing to gate. */
     if (Data->Iopb->Parameters.Read.Length == 0) {
-        return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     /* 5. Classify (cache-first; reads + up-calls at most once per file/epoch).
-     *    DlpDenyRead completes the buffered read as STATUS_ACCESS_DENIED; every
-     *    allow path returns WITH_CALLBACK so read-taint's post-op still runs. */
+     *    DlpDenyRead completes the buffered read as STATUS_ACCESS_DENIED. */
     verdict = DlpExfilClassifyAndCache(FltObjects, Data, pid);
     if (verdict == DLP_EXFIL_DENY) {
         return DlpDenyRead(Data);
     }
-    return FLT_PREOP_SUCCESS_WITH_CALLBACK;
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
 
@@ -2072,8 +1848,9 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
  *  The MAPPED-read half of read-deny. When an exfil PID creates a data       *
  *  section over a file, the ensuing reads are page faults (paging I/O) that   *
  *  never reach DlpPreRead -- so we block the SECTION here. This callback is   *
- *  cache-only: the verdict was seeded synchronously at DlpPostCreate (a safe  *
- *  point to read), so we never read or up-call on the delicate section path.  *
+ *  cache-only (stream ctx / SensFile / CleanFile, seeded by the DlpPreRead    *
+ *  classifier); we never read or up-call on the delicate section path, and an *
+ *  UNKNOWN mapping by an exfil PID fails secure per ExfilReadFailBlock.       *
  * ------------------------------------------------------------------------- */
 FLT_PREOP_CALLBACK_STATUS FLTAPI
 DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
@@ -2127,8 +1904,7 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    /* 7. Cache-only decision. The verdict was seeded at create (which runs to
-     *    completion before the handle is returned, hence before any mapping):
+    /* 7. Cache-only decision:
      *      stream ctx  -> authoritative (DENY/ALLOW),
      *      else SensFile by file id (cross-open) -> deny,
      *      else CleanFile -> allow,
@@ -2155,11 +1931,11 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
 
     /* Deny a KNOWN-sensitive mapping; and, when fail-secure is configured, also
      * deny an UNKNOWN one (an exfil tool mapping an in-scope file we have not yet
-     * cleared -- e.g. it maps before the create-time classify seeded the verdict).
-     * Our OWN re-entrant classification read was already waved through at step 2
-     * (DlpClassifyActive) and the async worker runs as System (skipped at step 5),
-     * so an UNKNOWN reaching here is the exfil process's real mapping -- failing it
-     * secure is correct, and MmCreateSection then aborts the mmap/copy. */
+     * cleared -- e.g. it maps without ever issuing a buffered read the classifier
+     * could score). Our OWN re-entrant classification read was already waved
+     * through at step 2 (DlpClassifyActive), so an UNKNOWN reaching here is the
+     * exfil process's real mapping -- failing it secure is correct, and
+     * MmCreateSection then aborts the mmap/copy. */
     if (verdict == DLP_EXFIL_DENY ||
         (verdict == DLP_EXFIL_UNKNOWN && gDlpData.ExfilReadFailBlock)) {
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
@@ -2171,12 +1947,12 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
 
 
 /* ========================================================================= *
- *  Read-taint -- known-sensitive file-id cache (LLD §4; CONTENT epoch)      *
+ *  Read-deny -- known-sensitive file-id cache (CONTENT epoch)               *
  *                                                                           *
- *  Same ring pattern as the taint table, but stamped with the CONTENT-policy *
- *  gDlpData.Epoch (NOT TaintEpoch): an agent reconnect's epoch bump          *
- *  invalidates cached sensitivity, which is correct for a content verdict.  *
- *  VolumeId 0 is the documented "unknown volume" fallback (v1). PASSIVE.     *
+ *  Same ring pattern as the BadHash table, stamped with the CONTENT-policy   *
+ *  gDlpData.Epoch: an agent reconnect's epoch bump invalidates cached        *
+ *  sensitivity, which is correct for a content verdict. VolumeId 0 is the    *
+ *  documented "unknown volume" fallback (v1). PASSIVE.                       *
  * ------------------------------------------------------------------------- */
 
 BOOLEAN
@@ -2405,591 +2181,13 @@ DlpClassifyActive(VOID)
     return active;
 }
 
-
 /* ========================================================================= *
- *  Read-taint -- async scan worker + queue (LLD §2 enqueue, §3 worker)      *
- *                                                                           *
- *  ScanRundown is acquired at enqueue and released BY THE WORKER per job, so *
- *  Unload's single ExWaitForRundownProtectionRelease drains all in-flight +  *
- *  queued jobs. DlpFreeScanJob fully destroys a job (derefs its FILE_OBJECT  *
- *  if referenced, then frees) -- centralised so no path double-derefs.      *
- * ------------------------------------------------------------------------- */
-
-static VOID
-DlpFreeScanJob(_In_ PDLP_SCAN_JOB Job)
-{
-    /* FileObject is NULL only for a job dropped in DlpPostRead BEFORE it took the
-     * reference (queue-full / OOM). Every enqueued job has a reference, released
-     * here exactly once. */
-    if (Job->FileObject != NULL) {
-        ObDereferenceObject(Job->FileObject);
-        Job->FileObject = NULL;
-    }
-    ExFreePoolWithTag(Job, DLP_JOB_TAG);
-}
-
-VOID
-DlpScanEnqueue(_Inout_ __drv_aliasesMem PDLP_SCAN_JOB Job)
-{
-    KIRQL oldIrql;
-
-    /* Rundown gate: a failed acquire means the driver is tearing down the scan
-     * subsystem -> drop the job (deref + free), fail-safe. The acquire here pairs
-     * 1:1 with the worker's per-job release. */
-    if (!ExAcquireRundownProtection(&gDlpData.ScanRundown)) {
-        DlpFreeScanJob(Job);
-        return;
-    }
-
-    KeAcquireSpinLock(&gDlpData.ScanQueueLock, &oldIrql);
-    InsertTailList(&gDlpData.ScanQueue, &Job->Link);
-    InterlockedIncrement(&gDlpData.ScanQueueDepth);
-    KeReleaseSpinLock(&gDlpData.ScanQueueLock, oldIrql);
-
-    /* Signal AFTER releasing the spinlock (keep the lock region pure list ops). */
-    KeReleaseSemaphore(&gDlpData.ScanSem, 0, 1, FALSE);
-}
-
-/* Dequeue one job under the queue spinlock; returns NULL when the queue is
- * empty. Never blocks. */
-static PDLP_SCAN_JOB
-DlpScanDequeue(VOID)
-{
-    KIRQL oldIrql;
-    PDLP_SCAN_JOB job = NULL;
-    PLIST_ENTRY entry;
-
-    KeAcquireSpinLock(&gDlpData.ScanQueueLock, &oldIrql);
-    if (!IsListEmpty(&gDlpData.ScanQueue)) {
-        entry = RemoveHeadList(&gDlpData.ScanQueue);
-        InterlockedDecrement(&gDlpData.ScanQueueDepth);
-        job = CONTAINING_RECORD(entry, DLP_SCAN_JOB, Link);
-    }
-    KeReleaseSpinLock(&gDlpData.ScanQueueLock, oldIrql);
-    return job;
-}
-
-static VOID
-DlpProcessScanJob(_In_ PDLP_SCAN_JOB Job)
-{
-    NTSTATUS status;
-    FILE_INTERNAL_INFORMATION intInfo;
-    ULONGLONG fileId = 0;
-    ULONGLONG volumeId = 0;        /* v1: "unknown volume" fallback (LLD §4)   */
-    PVOID content = NULL;
-    ULONG contentBytes = 0;
-    BOOLEAN truncated = FALSE;
-    BOOLEAN block = FALSE;
-    UNICODE_STRING pathName;
-    UCHAR sha[DLP_SHA256_LEN];
-
-    /* 1. File-id -> cheapest repeat path (no read, no up-call). A detached
-     *    instance makes this (and the read below) fail cleanly => no taint. */
-    RtlZeroMemory(&intInfo, sizeof(intInfo));
-    status = FltQueryInformationFile(Job->Instance, Job->FileObject, &intInfo,
-                                     sizeof(intInfo), FileInternalInformation,
-                                     NULL);
-    if (NT_SUCCESS(status)) {
-        fileId = (ULONGLONG)intInfo.IndexNumber.QuadPart;
-        if (DlpSensFileLookup(fileId, volumeId)) {
-            DlpTaintAdd(Job->Pid);         /* already known-sensitive */
-            return;
-        }
-    }
-
-    /* 2. Read the content in-kernel (shared helper). Any failure => NO taint
-     *    (we never taint on an unreadable read -- fail-safe). */
-    status = DlpReadStreamContent(Job->Instance, Job->FileObject,
-                                  &content, &contentBytes, &truncated);
-    if (!NT_SUCCESS(status) || content == NULL || contentBytes == 0) {
-        if (content != NULL) {
-            ExFreePoolWithTag(content, DLP_GENERAL_TAG);
-        }
-        return;
-    }
-
-    /* 3. Known-bad content-hash fast path (item-10 ring; shared meaning
-     *    "sensitive content"). A hit taints with no up-call. */
-    DlpComputeSha256((const UCHAR *)content, contentBytes, sha);
-    if (DlpBadHashLookup(sha)) {
-        DlpTaintAdd(Job->Pid);
-        DlpSensFileInsert(fileId, volumeId);
-        ExFreePoolWithTag(content, DLP_GENERAL_TAG);
-        return;
-    }
-
-    /* 4. Up-call with Reason=READ. Ship the file name captured at enqueue: the
-     *    agent selects its extractor from the extension, so an empty path made
-     *    every read come back Unreadable (never matched). On any fail-safe status
-     *    DlpQueryVerdict already set *block from FailMode. */
-    pathName.Buffer = Job->Path;
-    pathName.Length = Job->PathLength;
-    pathName.MaximumLength = Job->PathLength;
-    status = DlpQueryVerdict(&pathName, fileId, Job->Pid, content, contentBytes,
-                             truncated, DLP_REASON_READ, &block);
-
-    /* 5. Tag on BLOCK. Taint on any block (fail-secure). Seed the persistent
-     *    caches (sensfile + known-bad hash) ONLY on a GENUINE verdict -- an EXACT
-     *    STATUS_SUCCESS. STATUS_TIMEOUT is NT_SUCCESS-*severity* but means "no
-     *    verdict" (FailMode set *block); seeding on it would permanently mark a
-     *    file sensitive because the agent was momentarily slow, mirroring the
-     *    read-deny classifier's STATUS_SUCCESS discipline. */
-    if (block) {
-        DlpTaintAdd(Job->Pid);
-        if (status == STATUS_SUCCESS) {
-            DlpSensFileInsert(fileId, volumeId);
-            DlpBadHashInsert(sha);
-        }
-    }
-
-    /* 6. Free the content buffer (every path frees exactly once). */
-    ExFreePoolWithTag(content, DLP_GENERAL_TAG);
-}
-
-static VOID
-DlpScanWorker(_In_ PVOID StartContext)
-{
-    PDLP_SCAN_JOB job;
-
-    UNREFERENCED_PARAMETER(StartContext);
-
-    for (;;) {
-        KeWaitForSingleObject(&gDlpData.ScanSem, Executive, KernelMode, FALSE,
-                              NULL);
-
-        if (InterlockedCompareExchange(&gDlpData.ScanStop, 0, 0) != 0) {
-            /* Drain-and-exit: consume every remaining job (each: deref + free +
-             * release its rundown ref exactly once), then terminate. In practice
-             * DlpStopScanWorker has already run the rundown down, so the queue is
-             * empty here; this loop is the belt-and-braces path. */
-            while ((job = DlpScanDequeue()) != NULL) {
-                DlpFreeScanJob(job);
-                ExReleaseRundownProtection(&gDlpData.ScanRundown);
-            }
-            PsTerminateSystemThread(STATUS_SUCCESS);
-            return;                        /* not reached */
-        }
-
-        job = DlpScanDequeue();
-        if (job == NULL) {
-            continue;                      /* spurious wake / already drained */
-        }
-
-        DlpProcessScanJob(job);
-        DlpFreeScanJob(job);
-        ExReleaseRundownProtection(&gDlpData.ScanRundown);   /* pairs w/ enqueue */
-    }
-}
-
-NTSTATUS
-DlpStartScanWorker(VOID)
-{
-    NTSTATUS status;
-    HANDLE threadHandle = NULL;
-    OBJECT_ATTRIBUTES oa;
-
-    /* Init the queue + semaphore + rundown BEFORE creating the thread. */
-    KeInitializeSpinLock(&gDlpData.ScanQueueLock);
-    InitializeListHead(&gDlpData.ScanQueue);
-    KeInitializeSemaphore(&gDlpData.ScanSem, 0, MAXLONG);
-    gDlpData.ScanQueueDepth = 0;
-    gDlpData.ScanDropped = 0;
-    gDlpData.ScanStop = 0;
-    gDlpData.ScanThread = NULL;
-    gDlpData.ScanThreadHandle = NULL;
-    ExInitializeRundownProtection(&gDlpData.ScanRundown);
-
-    InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-    status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, &oa,
-                                  NULL, NULL, DlpScanWorker, NULL);
-    if (!NT_SUCCESS(status)) {
-        /* No thread => leave ScanRundownInit FALSE so DlpPostRead never enqueues
-         * (the caller also disables read-taint outright). Nothing to unwind. */
-        return status;
-    }
-
-    /* Keep a referenced PETHREAD so Unload can KeWaitForSingleObject on it; drop
-     * the HANDLE (we only need the object). */
-    status = ObReferenceObjectByHandle(threadHandle, THREAD_ALL_ACCESS,
-                                       *PsThreadType, KernelMode,
-                                       (PVOID *)&gDlpData.ScanThread, NULL);
-    ZwClose(threadHandle);
-    if (!NT_SUCCESS(status)) {
-        /* The thread is running but unreferenceable: signal it to exit so it
-         * does not run forever. No enqueue can occur (ScanRundownInit stays
-         * FALSE => DlpPostRead is a no-op), so nothing leaks. */
-        InterlockedExchange(&gDlpData.ScanStop, 1);
-        KeReleaseSemaphore(&gDlpData.ScanSem, 0, 1, FALSE);
-        gDlpData.ScanThread = NULL;
-        return status;
-    }
-
-    /* Publish readiness LAST: only now may DlpPostRead enqueue (it gates on
-     * ScanRundownInit) and only now will Unload wait the rundown. */
-    gDlpData.ScanRundownInit = TRUE;
-    return STATUS_SUCCESS;
-}
-
-VOID
-DlpStopScanWorker(VOID)
-{
-    /* Fold LLD §5.5 steps 3+4 in the race-free order:
-     *
-     * FIRST run the rundown down. ExWaitForRundownProtectionRelease makes every
-     * subsequent ExAcquireRundownProtection in DlpScanEnqueue return FALSE (new
-     * jobs are dropped + freed, holding no ref) AND blocks until every already-
-     * acquired job has been processed + released by the STILL-RUNNING worker.
-     * When it returns, the queue holds no rundown-protected job and none can be
-     * added -- so no job can be orphaned when the worker exits. */
-    if (gDlpData.ScanRundownInit) {
-        ExWaitForRundownProtectionRelease(&gDlpData.ScanRundown);
-        gDlpData.ScanRundownInit = FALSE;
-    }
-
-    /* THEN signal the now-idle worker to exit and join it. */
-    if (gDlpData.ScanThread != NULL) {
-        InterlockedExchange(&gDlpData.ScanStop, 1);
-        KeReleaseSemaphore(&gDlpData.ScanSem, 0, 1, FALSE);
-        KeWaitForSingleObject(gDlpData.ScanThread, Executive, KernelMode, FALSE,
-                              NULL);
-        ObDereferenceObject(gDlpData.ScanThread);
-        gDlpData.ScanThread = NULL;
-    }
-}
-
-
-/* ------------------------------------------------------------------------- *
- *  DlpEnqueueOpenScan -- async content scan for an exfil PID's file OPEN     *
- *                                                                           *
- *  Mirrors DlpPostRead's claim-once + scope + enqueue tail, but triggered at *
- *  IRP_MJ_CREATE (post) for read-deny. Enqueuing at OPEN -- not READ -- is    *
- *  what defeats mmap-based exfil: the transfer must open() the file (a normal *
- *  create we see), even though its subsequent mapped reads are paging I/O the *
- *  read hooks never see. The worker taints the opener (network cut) + seeds   *
- *  SensFile (section block). PASSIVE; caller confirmed worker-ready + exfil.  *
- * ------------------------------------------------------------------------- */
-static VOID
-DlpEnqueueOpenScan(_In_ PCFLT_RELATED_OBJECTS FltObjects,
-                   _Inout_ PFLT_CALLBACK_DATA Data)
-{
-    NTSTATUS status;
-    PDLP_STREAM_CONTEXT ctx = NULL;
-    PDLP_INSTANCE_CONTEXT instCtx = NULL;
-    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
-    PDLP_SCAN_JOB job = NULL;
-    ULONG volumeClass = DLP_VOL_REMOVABLE;   /* fallback: inspect-all */
-    ULONG pid;
-
-    /* Get/attach the stream context (allocate-or-get). */
-    status = FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
-                                 (PFLT_CONTEXT *)&ctx);
-    if (!NT_SUCCESS(status)) {
-        status = FltAllocateContext(gDlpData.Filter, FLT_STREAM_CONTEXT,
-                                    sizeof(DLP_STREAM_CONTEXT), NonPagedPoolNx,
-                                    (PFLT_CONTEXT *)&ctx);
-        if (!NT_SUCCESS(status)) {
-            return;                            /* fail-safe: do not track */
-        }
-        ctx->WriteCandidate = 0;
-        ctx->Dirty = 0;
-        ctx->Inspected = 0;
-        ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
-        ctx->ReadScanState = 0;
-        ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
-        status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
-                                     FLT_SET_CONTEXT_KEEP_IF_EXISTS,
-                                     (PFLT_CONTEXT)ctx, NULL);
-        if (!NT_SUCCESS(status)) {
-            FltReleaseContext((PFLT_CONTEXT)ctx);
-            return;
-        }
-    }
-
-    /* Claim-once: only the first open/read of this stream enqueues one job.
-     * Shared with DlpPostRead's claim so a create + first read do not double-
-     * enqueue. */
-    if (InterlockedCompareExchange(&ctx->ReadScanState, 1, 0) != 0) {
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return;
-    }
-
-    /* Cheap repeat path: already known-sensitive -> taint the opener now (no
-     * read, no up-call, no enqueue). */
-    {
-        FILE_INTERNAL_INFORMATION intInfo;
-        RtlZeroMemory(&intInfo, sizeof(intInfo));
-        if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
-                FltObjects->FileObject, &intInfo, sizeof(intInfo),
-                FileInternalInformation, NULL))) {
-            if (DlpSensFileLookup((ULONGLONG)intInfo.IndexNumber.QuadPart, 0)) {
-                pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-                DlpTaintAdd(pid);
-                FltReleaseContext((PFLT_CONTEXT)ctx);
-                return;
-            }
-        }
-    }
-
-    /* Scope filter (reuses the write-path config): FIXED volumes only under a
-     * watch prefix; removable/network inspect everything. A failed name query
-     * cannot be scoped -> do not enqueue. */
-    status = FltGetFileNameInformation(
-        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
-    if (!NT_SUCCESS(status) || nameInfo == NULL) {
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return;
-    }
-    (VOID)FltParseFileNameInformation(nameInfo);
-
-    if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance,
-                                         (PFLT_CONTEXT *)&instCtx)) &&
-        instCtx != NULL) {
-        volumeClass = instCtx->VolumeClass;
-        FltReleaseContext((PFLT_CONTEXT)instCtx);
-    }
-    if (volumeClass == DLP_VOL_FIXED &&
-        !DlpConfigPathIsWatched(&nameInfo->Name)) {
-        FltReleaseFileNameInformation(nameInfo);
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return;
-    }
-
-    /* Bound the queue (drop under flood = a miss; fail-safe toward not deadlocking
-     * / not growing non-paged pool). */
-    if (InterlockedCompareExchange(&gDlpData.ScanQueueDepth, 0, 0) >=
-        DLP_SCAN_QUEUE_MAX) {
-        InterlockedIncrement(&gDlpData.ScanDropped);
-        FltReleaseFileNameInformation(nameInfo);
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return;
-    }
-
-#pragma warning(suppress: 4996)
-    job = (PDLP_SCAN_JOB)ExAllocatePoolWithTag(NonPagedPoolNx,
-                                               sizeof(DLP_SCAN_JOB), DLP_JOB_TAG);
-    if (job == NULL) {
-        FltReleaseFileNameInformation(nameInfo);
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return;
-    }
-    RtlZeroMemory(job, sizeof(*job));
-    job->Instance = FltObjects->Instance;
-    job->FileObject = FltObjects->FileObject;
-    ObReferenceObject(FltObjects->FileObject);
-    job->Pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-    job->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
-
-    {
-        USHORT nameBytes = nameInfo->Name.Length;
-        USHORT cap = (USHORT)(DLP_MAX_PATH_CHARS * sizeof(WCHAR));
-        if (nameBytes > cap) {
-            nameBytes = cap;
-        }
-        if (nameBytes > 0 && nameInfo->Name.Buffer != NULL) {
-            RtlCopyMemory(job->Path, nameInfo->Name.Buffer, nameBytes);
-        }
-        job->PathLength = nameBytes;
-    }
-
-    FltReleaseFileNameInformation(nameInfo);
-    DlpScanEnqueue(job);
-    FltReleaseContext((PFLT_CONTEXT)ctx);
-}
-
-
-/* ========================================================================= *
- *  Read-taint -- IRP_MJ_READ post-op trigger (LLD §2)                       *
- *                                                                           *
- *  Runs <= DISPATCH / possibly nested. It must NOT read the file, up-call,   *
- *  or touch stream context at raised IRQL -- DlpShouldSkip enforces          *
- *  PASSIVE + no top-level IRP, so the whole trigger is strictly PASSIVE. It   *
- *  only claims the FIRST substantial read of a stream and ENQUEUES an async   *
- *  scan; no scan latency is added to the read. All gated on ReadTaintEnabled  *
- *  (default OFF => today's behavior) and ScanRundownInit (worker ready).     *
- * ------------------------------------------------------------------------- */
-FLT_POSTOP_CALLBACK_STATUS FLTAPI
-DlpPostRead(_Inout_ PFLT_CALLBACK_DATA Data,
-            _In_ PCFLT_RELATED_OBJECTS FltObjects,
-            _In_opt_ PVOID CompletionContext,
-            _In_ FLT_POST_OPERATION_FLAGS Flags)
-{
-    NTSTATUS status;
-    PDLP_STREAM_CONTEXT ctx = NULL;
-    PDLP_INSTANCE_CONTEXT instCtx = NULL;
-    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
-    PDLP_SCAN_JOB job = NULL;
-    ULONG volumeClass = DLP_VOL_REMOVABLE;   /* fallback: inspect-all */
-    ULONG pid;
-
-    UNREFERENCED_PARAMETER(CompletionContext);
-
-    /* 1. Draining. */
-    if (Flags & FLTFL_POST_OPERATION_DRAINING) {
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-    /* 2. Kill-switch: the default-OFF gate that keeps today's FS-only behavior,
-     *    plus the worker-ready gate (ScanRundownInit) that closes the window
-     *    between FltStartFiltering and DlpStartScanWorker. */
-    if (gDlpData.ReadTaintEnabled != DLP_READTAINT_ENABLED ||
-        !gDlpData.ScanRundownInit) {
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-    /* 3. The single top-of-callback gate (paging/self/System/IRQL/re-entrancy).
-     *    It enforces PASSIVE_LEVEL + IoGetTopLevelIrp()==NULL, so an async read
-     *    at DISPATCH is skipped here (caught on a later read or not at all --
-     *    fail-safe); the trigger is strictly PASSIVE from here on. */
-    if (DlpShouldSkip(Data, FltObjects)) {
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-    /* 4. Failed read or zero bytes: nothing substantial happened. */
-    if (!NT_SUCCESS(Data->IoStatus.Status) ||
-        Data->IoStatus.Information == 0) {
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-    /* 5. Substantiality gate: a 1-byte probe read must not arm a scan. */
-    if (Data->Iopb->Parameters.Read.Length < DLP_READ_MIN) {
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-    /* 6. Get/attach the stream context (allocate-or-get, exactly as DlpPostCreate
-     *    -- if another thread wins the set race we simply do not claim here; the
-     *    winner will claim-once on the attached context). */
-    status = FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
-                                 (PFLT_CONTEXT *)&ctx);
-    if (!NT_SUCCESS(status)) {
-        status = FltAllocateContext(gDlpData.Filter, FLT_STREAM_CONTEXT,
-                                    sizeof(DLP_STREAM_CONTEXT), NonPagedPoolNx,
-                                    (PFLT_CONTEXT *)&ctx);
-        if (!NT_SUCCESS(status)) {
-            return FLT_POSTOP_FINISHED_PROCESSING;   /* fail-safe: do not track */
-        }
-        ctx->WriteCandidate = 0;
-        ctx->Dirty = 0;
-        ctx->Inspected = 0;
-        ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
-        ctx->ReadScanState = 0;
-
-        status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
-                                     FLT_SET_CONTEXT_KEEP_IF_EXISTS,
-                                     (PFLT_CONTEXT)ctx, NULL);
-        if (!NT_SUCCESS(status)) {
-            /* Another thread attached first (or it cannot be set) -- benign; that
-             * thread owns the claim-once. */
-            FltReleaseContext((PFLT_CONTEXT)ctx);
-            return FLT_POSTOP_FINISHED_PROCESSING;
-        }
-    }
-
-    /* 7. Claim-once: only the FIRST substantial read of this stream enqueues. */
-    if (InterlockedCompareExchange(&ctx->ReadScanState, 1, 0) != 0) {
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-    /* 8. Cheap repeat path: if this file id is already known-sensitive, taint the
-     *    reader directly -- no scope query, no read, no up-call, no enqueue. */
-    {
-        FILE_INTERNAL_INFORMATION intInfo;
-        RtlZeroMemory(&intInfo, sizeof(intInfo));
-        if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
-                FltObjects->FileObject, &intInfo, sizeof(intInfo),
-                FileInternalInformation, NULL))) {
-            ULONGLONG fid = (ULONGLONG)intInfo.IndexNumber.QuadPart;
-            if (DlpSensFileLookup(fid, 0)) {
-                pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-                DlpTaintAdd(pid);
-                FltReleaseContext((PFLT_CONTEXT)ctx);
-                return FLT_POSTOP_FINISHED_PROCESSING;
-            }
-        }
-    }
-
-    /* 9. Scope filter (reuses the write-path config). Resolve the name; on a
-     *    FIXED volume, only enqueue reads under a configured watch prefix --
-     *    keeping C: reads cheap. Removable/network inspect everything. A failed
-     *    name query fails-safe toward NOT enqueuing (we cannot scope it). */
-    status = FltGetFileNameInformation(
-        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
-    if (!NT_SUCCESS(status) || nameInfo == NULL) {
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-    (VOID)FltParseFileNameInformation(nameInfo);
-
-    if (NT_SUCCESS(FltGetInstanceContext(FltObjects->Instance,
-                                         (PFLT_CONTEXT *)&instCtx)) &&
-        instCtx != NULL) {
-        volumeClass = instCtx->VolumeClass;
-        FltReleaseContext((PFLT_CONTEXT)instCtx);
-    }
-    if (volumeClass == DLP_VOL_FIXED &&
-        !DlpConfigPathIsWatched(&nameInfo->Name)) {
-        FltReleaseFileNameInformation(nameInfo);
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-    /* 10. Enqueue. Bound the queue (drop under flood = a miss; fail-safe toward
-     *     not deadlocking / not growing non-paged pool without limit). Reference
-     *     the FILE_OBJECT for the worker (released by DlpFreeScanJob). */
-    if (InterlockedCompareExchange(&gDlpData.ScanQueueDepth, 0, 0) >=
-        DLP_SCAN_QUEUE_MAX) {
-        InterlockedIncrement(&gDlpData.ScanDropped);
-        FltReleaseFileNameInformation(nameInfo);
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-
-#pragma warning(suppress: 4996)
-    job = (PDLP_SCAN_JOB)ExAllocatePoolWithTag(NonPagedPoolNx,
-                                               sizeof(DLP_SCAN_JOB), DLP_JOB_TAG);
-    if (job == NULL) {
-        FltReleaseFileNameInformation(nameInfo);
-        FltReleaseContext((PFLT_CONTEXT)ctx);
-        return FLT_POSTOP_FINISHED_PROCESSING;
-    }
-    RtlZeroMemory(job, sizeof(*job));
-    job->Instance = FltObjects->Instance;    /* kept valid by the scan rundown  */
-    job->FileObject = FltObjects->FileObject;
-    ObReferenceObject(FltObjects->FileObject);
-    job->Pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-    job->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
-
-    /* Capture the normalized name for the worker's up-call. nameInfo is still held
-     * here; the worker runs after the file may be closed, so we copy the bytes now
-     * (bounded to Path). Without this the up-call ships an empty path and the agent
-     * can't pick the format extractor -> every read came back Unreadable. */
-    {
-        USHORT nameBytes = nameInfo->Name.Length;
-        USHORT cap = (USHORT)(DLP_MAX_PATH_CHARS * sizeof(WCHAR));
-        if (nameBytes > cap) {
-            nameBytes = cap;
-        }
-        if (nameBytes > 0 && nameInfo->Name.Buffer != NULL) {
-            RtlCopyMemory(job->Path, nameInfo->Name.Buffer, nameBytes);
-        }
-        job->PathLength = nameBytes;
-    }
-
-    FltReleaseFileNameInformation(nameInfo);
-
-    /* Hands ownership of the job (and its FILE_OBJECT ref) to the queue; the
-     * worker derefs + frees + releases the rundown. If the rundown is already
-     * running down (Unload), DlpScanEnqueue drops the job safely. */
-    DlpScanEnqueue(job);
-
-    FltReleaseContext((PFLT_CONTEXT)ctx);
-    return FLT_POSTOP_FINISHED_PROCESSING;
-}
-
-
-/* ========================================================================= *
- *  Read-taint -- process-exit untaint (LLD §4)                              *
+ *  Read-deny -- process-exit notify                                         *
  *                                                                           *
  *  Registered in DriverEntry (gated) with PsSetCreateProcessNotifyRoutineEx  *
  *  (needs /INTEGRITYCHECK, already on the link line). On process EXIT we      *
- *  untaint the PID -- freeing a taint slot and closing the PID-reuse window.  *
- *  PASSIVE_LEVEL. Registration is unregistered in Unload.                    *
+ *  drop the PID from the exfil set -- closing the PID-reuse window between    *
+ *  agent pushes. PASSIVE_LEVEL. Unregistered in Unload.                      *
  * ------------------------------------------------------------------------- */
 VOID
 DlpCreateProcessNotify(_In_ PEPROCESS Process,
@@ -3000,8 +2198,7 @@ DlpCreateProcessNotify(_In_ PEPROCESS Process,
 
     /* CreateInfo == NULL => the process is EXITING. On create we do nothing. */
     if (CreateInfo == NULL) {
-        DlpTaintRemove((ULONG)(ULONG_PTR)ProcessId);
-        /* Also drop an exfil-channel PID on exit (defence in depth; the agent's
+        /* Drop an exfil-channel PID on exit (defence in depth; the agent's
          * next full-replace would clear it anyway). */
         DlpExfilRemove((ULONG)(ULONG_PTR)ProcessId);
     }

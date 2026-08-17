@@ -37,17 +37,11 @@ cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /sdl /guard:cf /GS /Od /GF /Gy
   /Fobuild\out\comms.obj src\comms.c
 if errorlevel 1 goto :fail
 
-echo === compile wfpcallout.c ===
-cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /sdl /guard:cf /GS /Od /GF /Gy /GR- /kernel ^
-  /D_WIN64 /D_AMD64_ /DAMD64 /DNTDDI_VERSION=0x0A000000 /D_WIN32_WINNT=0x0A00 ^
-  /Fobuild\out\wfpcallout.obj src\wfpcallout.c
-if errorlevel 1 goto :fail
-
 echo === link dlpflt.sys ===
 link.exe /NOLOGO /OUT:build\out\dlpflt.sys /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry ^
   /NODEFAULTLIB /RELEASE /INTEGRITYCHECK /GUARD:CF ^
-  build\out\dlpflt.obj build\out\comms.obj build\out\wfpcallout.obj ^
-  fltMgr.lib ntoskrnl.lib hal.lib wdmsec.lib fwpkclnt.lib ndis.lib BufferOverflowFastFailK.lib
+  build\out\dlpflt.obj build\out\comms.obj ^
+  fltMgr.lib ntoskrnl.lib hal.lib wdmsec.lib BufferOverflowFastFailK.lib
 if errorlevel 1 goto :fail
 
 echo === SUCCESS ===

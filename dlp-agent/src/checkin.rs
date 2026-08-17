@@ -1,6 +1,7 @@
 //! Check-in: the mutual-TLS heartbeat. Proves identity with the client
 //! certificate, refreshes state, and (Phase 3) will receive the licensed
 //! entitlement token and signed policy bundle.
+use crate::trustedreaders::{self, SyncedReader};
 use crate::trustsync::{self, SyncedDestination, TrustedConfig};
 use crate::{client, config::Config, storage::Storage};
 use anyhow::{bail, Context, Result};
@@ -160,6 +161,73 @@ pub fn load_synced_destinations(storage: &Storage) -> Vec<SyncedDestination> {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(error = %e, "persisted trusted-destinations unparseable — ignoring");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    }
+}
+
+/// Read-deny allowlist posture: pull the console-authored sanctioned-reader
+/// allowlist from the management server over the agent's mTLS identity
+/// (`GET /agent/trusted-readers`), persist it (metadata only), and return it.
+///
+/// FAIL SOFT (offline fail-secure, matching `sync_trusted_config`): on ANY
+/// network/parse error, log a warning and return the LAST-persisted allowlist —
+/// so a curated list keeps enforcing with no server round-trip on the hot path.
+/// Independent of encryption config (no Org Root Key involved).
+pub fn sync_trusted_readers(cfg: &Config, storage: &Storage) -> Vec<SyncedReader> {
+    match fetch_trusted_readers(cfg, storage) {
+        Ok(readers) => {
+            if let Err(e) = storage.store_trusted_readers(&trustedreaders::serialize_readers(&readers)) {
+                tracing::warn!(error = %e, "could not persist synced trusted readers");
+            }
+            tracing::info!(readers = readers.len(), "synced trusted readers from server");
+            readers
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "trusted-readers sync failed — using last-persisted allowlist (offline, fail secure)"
+            );
+            load_synced_readers(storage)
+        }
+    }
+}
+
+/// The mTLS GET half of the reader sync — same CA-pinned client identity as
+/// check-in. Response shape: `{ "readers": [ {matchType, value} ] }`.
+fn fetch_trusted_readers(cfg: &Config, storage: &Storage) -> Result<Vec<SyncedReader>> {
+    #[derive(Deserialize)]
+    struct ReadersResponse {
+        #[serde(default)]
+        readers: Vec<SyncedReader>,
+    }
+    let (identity_pem, ca_pem) = storage.load_identity()?;
+    let client = client::checkin_client(&ca_pem, &identity_pem)?;
+    let resp = client
+        .get(cfg.trusted_readers_url())
+        .send()
+        .context("trusted-readers request failed")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        bail!("trusted-readers refused [{status}]: {body}");
+    }
+    Ok(resp
+        .json::<ReadersResponse>()
+        .context("parsing trusted-readers response")?
+        .readers)
+}
+
+/// The last-persisted sanctioned-reader allowlist (metadata only). Empty when
+/// the agent has never synced, or when the persisted file is unparseable (logged).
+pub fn load_synced_readers(storage: &Storage) -> Vec<SyncedReader> {
+    match storage.load_trusted_readers() {
+        Some(bytes) => match trustedreaders::parse_readers(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "persisted trusted-readers unparseable — ignoring");
                 Vec::new()
             }
         },

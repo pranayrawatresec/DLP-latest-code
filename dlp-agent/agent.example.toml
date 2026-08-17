@@ -21,37 +21,90 @@ state_dir = "C:\\ProgramData\\DLPAgent"
 # Fallback cadence; the server's response takes precedence.
 checkin_interval_seconds = 300
 
-# --- Kernel minifilter port client (usb-guard) + read-taint scope ------------
+# --- Kernel minifilter port client (usb-guard) + read-deny scope -------------
 # The driver reads file content in-kernel and asks usb-guard for a verdict. The
-# same watch-set doubles as the READ-TAINT scope: reads of files under these
-# prefixes trigger a taint scan (block sensitive data from leaving over ANY
-# network channel, encrypted included, by cutting the reading process's egress).
+# same watch-set doubles as the READ-DENY scope on fixed volumes: an
+# exfil-channel process (remote tool / public-connection holder / VM worker)
+# reading a file under these prefixes is content-classified and, if sensitive,
+# DENIED the read. Removable/network volumes are always in scope.
 [kguard]
 # fail_block = true    # fail-secure: block when no verified bundle is cached
 scan_fixed = true      # inspect fixed-volume (C:) reads/writes under watch_paths
 watch_paths = ["\\Users", "\\Data"]
+# exfil_read_block = true  # run the untrusted-reader tracker + push the set to
+#   the driver so DlpPreRead can deny sensitive reads by untrusted processes.
+#   Pair with the driver registry knobs below. Default false.
+# exfil_posture = "allowlist"  # WHICH processes get pushed:
+#   "blocklist" (default, unchanged) — exfil channels chosen by remote-tool
+#     signature + public-connection behaviour + loaded hypervisor. Robust against
+#     nothing new; turning read-deny on changes nothing else.
+#   "allowlist" — every process NOT on the sanctioned-reader allowlist
+#     ([[trusted_readers]] below, merged with the console-authored list) is an
+#     untrusted reader. Scales against unknown tools (a never-seen uploader isn't
+#     on the allowlist ⇒ denied at the read). RECOMMENDED — but always roll out
+#     monitor → measure → enforce, and curate the allowlist first (an empty
+#     allowlist pushes NOTHING, fail-safe toward availability).
 # removable_write_block_at = 0.15  # containment ceiling for BLOCKING a sensitive
 #   file copied to a NON-whitelisted removable device (WRITE path). Also blocks on
 #   any EDM hit or coverage >= coverage_block_at. DISTINCT from block_at (0.30),
-#   which still drives read-taint and the trusted-side decide_seal band. Default 0.15.
+#   which still drives the read-scan and trusted-side decide_seal bands. Default 0.15.
 # sealer_health_timeout_secs = 10  # run-endpoint: the guard stands aside for the
 #   in-process sealer only if the sealer marked itself alive within this window AND
 #   a keyring is present; otherwise a seal-eligible write is BLOCKED (fail secure).
 #   Default 10.
 #
-# Read-taint MASTER SWITCH + egress policy are NOT set here — they are driver
+# Read-deny MASTER SWITCH + fail policy are NOT set here — they are driver
 # registry DWORDs under the service key (read in DriverEntry, like FailMode), so
 # the frozen v2 wire protocol is untouched. The installer/INF sets:
-#   ReadTaintEnabled      = 1   (0 = filesystem/USB protection only)
-#   TaintedEgressPolicy   = 0   (0 = block ALL tainted egress, fail-secure;
-#                                1 = permit RFC1918/loopback, block the rest)
+#   ExfilReadBlockEnabled = 1   (0 = filesystem/USB protection only)
+#   ExfilReadFailBlock    = 1   (deny an exfil PID's read of unverifiable
+#                                content; fail-secure default)
 
-# --- Network-egress default-deny (composes with read-taint) ------------------
-# Read-taint blocks a TAINTED process even to an approved dest; this allow-list
-# blocks ANY process to an unapproved dest. Under `--enforce allowlist` the
-# allow-list MUST permit the agent's own lifelines or the agent cuts itself off:
-# the management server host:port and the DNS resolver(s), at minimum. The
-# agent's own PIDs are never tainted, so read-taint never blocks agent traffic.
+# --- Sanctioned-reader allowlist (read-deny "allowlist" posture) -------------
+# The applications ALLOWED to read sensitive content locally. Every process NOT
+# matching one of these (and not a known remote tool / VM worker) is treated as
+# an untrusted reader and denied the read of sensitive files. Only used when
+# [kguard] exfil_posture = "allowlist". Merged (union) with the console-authored
+# list synced over mTLS, so central management is preferred; these locals are a
+# fallback / air-gapped-site convenience.
+#
+# Match by ONE of (priority publisher → path → name):
+#   publisher = "..."  Authenticode signer name — spoof-resistant (malware can't
+#                      sign as Microsoft). Covers embedded- AND catalog-signed
+#                      binaries. NOTE (verified on real Windows): Microsoft signs
+#                      under SEVERAL names — "Microsoft Windows", "Microsoft
+#                      Windows Publisher", AND "Microsoft Corporation" — so to
+#                      cover the OS by publisher you must list all three. It is
+#                      usually simpler to cover the OS with a Windows PATH rule
+#                      (below) and reserve publisher rules for specific third-party
+#                      vendors (e.g. "Adobe Inc.", "Google LLC").
+#   path      = "..."  image path prefix at a path boundary (non-user-writable
+#                      dirs like Program Files / Windows are a strong signal).
+#   name      = "..."  image base name — weakest; pair with WDAC/AppLocker.
+#
+# A minimal starter set (adapt per enclave — inherit your AppLocker/WDAC list):
+# [[trusted_readers]]
+# path = "C:\\Windows"                    # the OS (svchost, explorer, indexer, ...)
+# note = "Windows"
+# [[trusted_readers]]
+# path = "C:\\Program Files\\Microsoft Office"
+# note = "Office"
+# [[trusted_readers]]
+# path = "C:\\Program Files\\Adobe"       # the approved PDF reader
+# note = "Acrobat"
+# [[trusted_readers]]
+# publisher = "Microsoft Corporation"     # Defender, Edge, and other MS-signed apps
+# [[trusted_readers]]
+# name = "dlp-agent.exe"                  # the agent itself (reads files to scan)
+# note = "DLP agent"
+# Remember AV + backup + your sanctioned sync client also read every file — add
+# them (by publisher or install path) or they will be denied.
+
+# --- Network-egress default-deny ---------------------------------------------
+# This allow-list blocks ANY process to an unapproved dest. Under
+# `--enforce allowlist` it MUST permit the agent's own lifelines or the agent
+# cuts itself off: the management server host:port and the DNS resolver(s), at
+# minimum.
 [netfilter]
 mode = "monitor"        # NEVER default-deny by config; opt in via --enforce allowlist
 

@@ -109,6 +109,12 @@ export const UsbIcon = (p) => (
     <path d="M11 6h.01M13 6h.01" />
   </S>
 )
+export const AppWindowIcon = (p) => (
+  <S {...p}>
+    <rect x="2" y="4" width="20" height="16" rx="2" />
+    <path d="M2 9h20M6 6.5h.01M9 6.5h.01" />
+  </S>
+)
 export const RefreshIcon = (p) => (
   <S {...p}>
     <path d="M21 2v6h-6M3 22v-6h6" />

@@ -23,7 +23,7 @@ mod service;
 // `crate::config` / `crate::storage`.
 use dlp_agent::{
     browser_host, clipboard, config, crypto, decrypt, detect, exfil, netfilter, notify, storage,
-    supervise, trustdest, trustsync, usb,
+    supervise, trustdest, trustedreaders, trustsync, usb,
 };
 
 use anyhow::{Context, Result};
@@ -583,7 +583,10 @@ fn cmd_usb_guard(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
     // last-persisted whitelist on failure. Everything below uses the MERGED cfg.
     let _ = checkin::sync_trusted_config(cfg, storage);
     let synced = checkin::load_synced_destinations(storage);
-    let effective = cfg.with_synced_destinations(&synced);
+    // Read-deny allowlist posture: also pull the sanctioned-reader allowlist so
+    // the exfil pusher classifies against the console-authored list.
+    let readers = checkin::sync_trusted_readers(cfg, storage);
+    let effective = cfg.with_synced_destinations(&synced).with_synced_readers(&readers);
     let cfg = &effective;
 
     let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
@@ -774,7 +777,10 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
     // worker so UI whitelist changes propagate WITHOUT a restart.
     let _ = checkin::sync_trusted_config(cfg, storage);
     let synced = checkin::load_synced_destinations(storage);
-    let effective = cfg.with_synced_destinations(&synced);
+    // Read-deny allowlist posture: pull the sanctioned-reader allowlist too, so
+    // the guard's exfil pusher classifies against the console-authored list.
+    let readers = checkin::sync_trusted_readers(cfg, storage);
+    let effective = cfg.with_synced_destinations(&synced).with_synced_readers(&readers);
     let shared: Arc<RwLock<Config>> = Arc::new(RwLock::new(effective));
 
     // Sealer liveness: keyring presence is the strong startup signal; liveness is
@@ -897,7 +903,10 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                 }
                 let _ = checkin::sync_trusted_config(&base_cfg, &storage);
                 let synced = checkin::load_synced_destinations(&storage);
-                let new_effective = base_cfg.with_synced_destinations(&synced);
+                let readers = checkin::sync_trusted_readers(&base_cfg, &storage);
+                let new_effective = base_cfg
+                    .with_synced_destinations(&synced)
+                    .with_synced_readers(&readers);
                 health.set_keyring_present(build_sealer_keyring(&base_cfg, &storage).is_some());
                 match shared.write() {
                     Ok(mut w) => *w = new_effective,

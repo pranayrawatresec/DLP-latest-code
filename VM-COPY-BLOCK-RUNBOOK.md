@@ -5,8 +5,7 @@ copied into any VM** — shared folder, drag-and-drop, or clipboard file paste �
 hypervisor's VM worker process is auto-classified as an exfil channel and the kernel driver
 **denies its reads** of sensitive content.
 
-This is the **read-deny** path (per-open verdict, cached), **not read-taint** — no taint delay,
-no repeated scans. Builds on `USB-DEMO-RUNBOOK.md` setup (enrolled agent, bundle v3, test-signed
+This is the **read-deny** path (per-open verdict, cached) — no scan delay, no repeated scans. Builds on `USB-DEMO-RUNBOOK.md` setup (enrolled agent, bundle v3, test-signed
 driver). **Snapshot the test box before you start.**
 
 ---
@@ -32,7 +31,7 @@ driver). **Snapshot the test box before you start.**
 - **Driver with read-deny** (`DlpPreRead` + `DlpPreAcquireForSection`) loaded, and the knob ON
   (step 2). Absent knob = read-deny OFF (shipped default).
 - **Sensitive file on a REMOVABLE volume** (USB stick / removable VHD). Default scan scope is
-  removable-only until a watch config arrives — same constraint as the read-taint demo.
+  removable-only until a watch config arrives.
 - **`usb-guard` running with bundle v3** and `exfil_read_block = true` (step 3). Without the
   guard, `ExfilReadFailBlock=1` fail-secure denies exfil-PID reads of *everything* removable.
 
@@ -42,7 +41,6 @@ driver). **Snapshot the test box before you start.**
 $svc = "HKLM\SYSTEM\CurrentControlSet\Services\dlpflt"
 reg add $svc /v ExfilReadBlockEnabled /t REG_DWORD /d 1 /f   # read-deny ON
 reg add $svc /v ExfilReadFailBlock    /t REG_DWORD /d 1 /f   # fail-secure on unreadable (default)
-# ReadTaintEnabled is NOT required for this test — leave it as-is.
 ```
 
 ## 2. Reload the driver so DriverEntry re-reads the knobs (admin)

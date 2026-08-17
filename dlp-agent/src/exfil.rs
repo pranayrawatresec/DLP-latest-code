@@ -135,6 +135,541 @@ pub fn compute_exfil_pids(_self_pid: u32) -> Vec<u32> {
 }
 
 // ---------------------------------------------------------------------------
+// Read-deny ALLOWLIST posture: compute the UNTRUSTED-reader PID set.
+//
+// A process is untrusted (pushed to the driver, subject to read-deny) unless it
+// is on the admin-authored sanctioned-reader allowlist (publisher / path / name;
+// `crate::trustedreaders`). Known remote tools and VM workers are ALSO forced
+// untrusted even if a rule would sanction them (belt-and-suspenders against a
+// too-broad path rule). This scales against unknown tools: a never-before-seen
+// uploader isn't on the allowlist, so it is denied at the read.
+// ---------------------------------------------------------------------------
+use crate::trustedreaders::ReaderMatch;
+
+#[cfg(not(windows))]
+pub fn compute_untrusted_pids(_self_pid: u32, _rules: &[ReaderMatch]) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Vec<u32> {
+    use std::collections::HashSet;
+
+    // Empty allowlist ⇒ fail toward AVAILABILITY, not lockout. An empty list
+    // almost always means "not configured / monitor mode"; pushing every PID
+    // would deny sensitive reads system-wide. Push nothing and log once so the
+    // operator knows the allowlist must be populated before it enforces.
+    if rules.is_empty() {
+        tracing::warn!(
+            "read-deny allowlist posture with an EMPTY sanctioned-reader list — pushing no PIDs \
+             (populate the trusted-reader allowlist before it can enforce)"
+        );
+        return Vec::new();
+    }
+
+    // Enable SeDebugPrivilege once (best-effort): when the guard runs elevated /
+    // as SYSTEM this lets `OpenProcess` identify SYSTEM- and higher-integrity
+    // processes (e.g. a remote-access tool's privileged helper). Without it those
+    // come back with an empty image path and are skipped — so they would never be
+    // pushed and never denied. No-op when not elevated.
+    {
+        use std::sync::Once;
+        static DEBUG_PRIV: Once = Once::new();
+        DEBUG_PRIV.call_once(enable_debug_privilege);
+    }
+
+    let skip = |pid: u32| pid == 0 || pid == 4 || pid == self_pid;
+    let has_publisher_rule = rules.iter().any(ReaderMatch::needs_publisher);
+
+    let mut set: HashSet<u32> = HashSet::new();
+
+    // Every process we can identify AND that is NOT sanctioned → untrusted.
+    for (pid, image) in enumerate_processes_with_image() {
+        if skip(pid) {
+            continue;
+        }
+        // Could not resolve the image path (protected OS/AV process we cannot
+        // open, or it exited). Fail toward availability: DON'T push it — the
+        // processes we cannot open are exactly the protected OS/AV ones we want
+        // to trust; a user-mode exfil tool CAN be opened, so it is still judged.
+        if image.is_empty() {
+            continue;
+        }
+
+        // Cheap matchers first (path/name — no signature work).
+        let cheap_ok = rules
+            .iter()
+            .filter(|r| !r.needs_publisher())
+            .any(|r| r.matches(&image, None));
+        if cheap_ok {
+            continue;
+        }
+
+        // Only verify the Authenticode signer when a publisher rule might still
+        // sanction it — bounds signature verification to the processes the cheap
+        // rules didn't already clear (and it is cached per image path).
+        if has_publisher_rule {
+            let publisher = cached_publisher(&image);
+            let pub_ok = rules
+                .iter()
+                .filter(|r| r.needs_publisher())
+                .any(|r| r.matches(&image, publisher.as_deref()));
+            if pub_ok {
+                continue;
+            }
+        }
+
+        set.insert(pid);
+    }
+
+    // NOTE: the allowlist is authoritative in this posture — any process not
+    // sanctioned above is ALREADY untrusted. We deliberately do NOT additionally
+    // run the blocklist-style remote-tool / hypervisor-module scan here: it is
+    // redundant (an un-allowlisted tool/VM worker is already flagged) and the
+    // per-process module walk is O(processes x modules), which pushed the refresh
+    // cycle to ~25 s. Dropping it keeps the cycle ~1-2 s so a new untrusted
+    // process is denied almost immediately. (If a site allowlists a remote tool
+    // or VM host, that is an explicit trust decision — don't.)
+
+    set.into_iter().collect()
+}
+
+/// Enable SeDebugPrivilege on the current process token (best-effort). Lets an
+/// elevated / SYSTEM guard `OpenProcess` SYSTEM- and higher-integrity processes
+/// for image identification; a no-op (silently) when the token doesn't hold the
+/// privilege (non-elevated). Windows-only.
+#[cfg(windows)]
+fn enable_debug_privilege() {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
+        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let mut luid = LUID::default();
+        if LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid).is_ok() {
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            // No-op if the token lacks the privilege (non-elevated) — best-effort.
+            let _ = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
+        }
+        let _ = CloseHandle(token);
+    }
+}
+
+/// Enumerate every process as `(pid, full_image_path)`. A process we cannot open
+/// (protected / exited) yields an EMPTY path — the caller treats that as "cannot
+/// identify ⇒ do not push" (fail toward availability). Windows-only.
+#[cfg(windows)]
+fn enumerate_processes_with_image() -> Vec<(u32, String)> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::EnumProcesses;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let mut out = Vec::new();
+    let mut pids = vec![0u32; 4096];
+    let mut needed = 0u32;
+    let ok = unsafe {
+        EnumProcesses(
+            pids.as_mut_ptr(),
+            (pids.len() * std::mem::size_of::<u32>()) as u32,
+            &mut needed,
+        )
+    };
+    if ok.is_err() {
+        tracing::warn!("EnumProcesses failed (allowlist reader scan)");
+        return out;
+    }
+    let count = needed as usize / std::mem::size_of::<u32>();
+    for &pid in pids.iter().take(count) {
+        if pid == 0 {
+            continue;
+        }
+        let image = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(handle) => {
+                let mut buf = vec![0u16; 1024];
+                let mut size = buf.len() as u32;
+                let r = unsafe {
+                    QueryFullProcessImageNameW(
+                        handle,
+                        PROCESS_NAME_FORMAT(0),
+                        PWSTR(buf.as_mut_ptr()),
+                        &mut size,
+                    )
+                };
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
+                if r.is_ok() {
+                    String::from_utf16_lossy(&buf[..size as usize])
+                } else {
+                    String::new() // can't read the path → treat as unidentifiable
+                }
+            }
+            Err(_) => String::new(), // access denied (protected) / gone → unidentifiable
+        };
+        out.push((pid, image));
+    }
+    out
+}
+
+/// Process-wide cache of image-path → Authenticode publisher (signer subject
+/// CN). A binary's signature does not change, so we verify each distinct image
+/// at most once. `None` = unsigned / untrusted / unverifiable (fail-safe: a
+/// publisher rule then does NOT sanction it). Windows-only.
+#[cfg(windows)]
+fn cached_publisher(image_path: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
+
+    let key = image_path.to_ascii_lowercase();
+    if let Ok(mut guard) = CACHE.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        if let Some(hit) = map.get(&key) {
+            return hit.clone();
+        }
+        let publisher = authenticode_publisher(image_path);
+        map.insert(key, publisher.clone());
+        publisher
+    } else {
+        // Poisoned lock (a prior panic): compute without caching rather than fail.
+        authenticode_publisher(image_path)
+    }
+}
+
+/// Verify the file's Authenticode signature and, if trusted, return the signer's
+/// subject common-name (the "publisher"). Returns `None` on ANY failure —
+/// unsigned, untrusted chain, or an extraction error — so an unverifiable binary
+/// is never sanctioned by a publisher rule (fail-safe / more restrictive).
+///
+/// Handles BOTH signing styles a Windows binary can carry:
+/// * **Embedded** signature (third-party apps + many OS services like
+///   `svchost`/`explorer`): `WinVerifyTrust` then `CryptQueryObject` → signer
+///   `CERT_INFO` → `CertGetNameStringW`.
+/// * **Catalog** signature (OS binaries like `cmd.exe`/`notepad.exe` whose
+///   signature lives in a system `.cat`, not the PE): find the catalog that
+///   vouches for the file's hash, and read the signer of that catalog (which is
+///   itself an embedded-signed PKCS#7).
+///
+/// Every handle is released on every path. Windows-only.
+#[cfg(windows)]
+fn authenticode_publisher(image_path: &str) -> Option<String> {
+    // 1) Embedded signature.
+    if file_signature_is_trusted(image_path) {
+        if let Some(p) = signer_display_name(image_path) {
+            return Some(p);
+        }
+    }
+    // 2) System catalog (catalog-signed OS binaries).
+    catalog_publisher(image_path)
+}
+
+/// Resolve the publisher of a **catalog-signed** file: hash the file, find the
+/// system catalog whose membership vouches for that hash, and return the signer
+/// of that (embedded-signed) catalog. `None` when the file is in no catalog or
+/// any step fails. Windows-only.
+#[cfg(windows)]
+fn catalog_publisher(image_path: &str) -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Security::Cryptography::Catalog::{
+        CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
+        CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
+        CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = image_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // Catalog admin context. SHA-256 catalogs are the Win10+ baseline (the same
+    // NTDDI baseline this driver targets).
+    let mut h_admin: isize = 0;
+    let algo: Vec<u16> = "SHA256".encode_utf16().chain(std::iter::once(0)).collect();
+    if unsafe { CryptCATAdminAcquireContext2(&mut h_admin, None, PCWSTR(algo.as_ptr()), None, 0) }.is_err()
+        || h_admin == 0
+    {
+        return None;
+    }
+
+    let result = (|| {
+        let h_file: HANDLE = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .ok()?;
+        if h_file == INVALID_HANDLE_VALUE {
+            return None;
+        }
+
+        let cat_path = (|| {
+            // Size then compute the file's catalog hash.
+            let mut cb: u32 = 0;
+            let _ = unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(h_admin, h_file, &mut cb, None, 0)
+            };
+            if cb == 0 {
+                return None;
+            }
+            let mut hash = vec![0u8; cb as usize];
+            if unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(h_admin, h_file, &mut cb, Some(hash.as_mut_ptr()), 0)
+            }
+            .is_err()
+            {
+                return None;
+            }
+            // A catalog that contains this hash = the OS vouches for the file.
+            let h_cat = unsafe { CryptCATAdminEnumCatalogFromHash(h_admin, &hash, 0, None) };
+            if h_cat == 0 {
+                return None;
+            }
+            let mut info = CATALOG_INFO {
+                cbStruct: std::mem::size_of::<CATALOG_INFO>() as u32,
+                ..Default::default()
+            };
+            let got = unsafe { CryptCATCatalogInfoFromContext(h_cat, &mut info, 0) };
+            unsafe {
+                let _ = CryptCATAdminReleaseCatalogContext(h_admin, h_cat, 0);
+            }
+            if got.is_err() {
+                return None;
+            }
+            let n = info
+                .wszCatalogFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.wszCatalogFile.len());
+            let p = String::from_utf16_lossy(&info.wszCatalogFile[..n]);
+            if p.is_empty() {
+                None
+            } else {
+                Some(p)
+            }
+        })();
+
+        unsafe {
+            let _ = CloseHandle(h_file);
+        }
+
+        // The .cat is an embedded-signed PKCS#7 — its signer IS the effective
+        // publisher of the catalog-signed member. Verify the .cat then read it.
+        cat_path.and_then(|c| {
+            if file_signature_is_trusted(&c) {
+                signer_display_name(&c)
+            } else {
+                None
+            }
+        })
+    })();
+
+    unsafe {
+        let _ = CryptCATAdminReleaseContext(h_admin, 0);
+    }
+    result
+}
+
+/// `WinVerifyTrust(WINTRUST_ACTION_GENERIC_VERIFY_V2)` on the file — TRUE only
+/// when the file has a valid, trusted Authenticode signature.
+#[cfg(windows)]
+fn file_signature_is_trusted(image_path: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+        WINTRUST_DATA_0, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    };
+
+    let wide: Vec<u16> = image_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(wide.as_ptr()),
+        hFile: Default::default(),
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 { pFile: &mut file_info },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        ..Default::default()
+    };
+
+    // WinVerifyTrust returns 0 (ERROR_SUCCESS) exactly when the file is validly,
+    // trustedly signed; any non-zero is untrusted/unsigned/error → not trusted.
+    let status = unsafe {
+        WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            &mut data as *mut _ as *mut core::ffi::c_void,
+        )
+    };
+
+    // Always close the verify state to release the cached context.
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        let _ = WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            &mut data as *mut _ as *mut core::ffi::c_void,
+        );
+    }
+
+    status == 0
+}
+
+/// Extract the embedded signer's subject display name (the publisher). Assumes
+/// the caller already confirmed the signature is trusted. `None` on any error.
+#[cfg(windows)]
+fn signer_display_name(image_path: &str) -> Option<String> {
+    use windows::Win32::Security::Cryptography::{
+        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext,
+        CertGetNameStringW, CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_CONTEXT,
+        CERT_FIND_SUBJECT_CERT, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_ENCODING_TYPE, CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE,
+        CMSG_SIGNER_CERT_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+    };
+
+    let wide: Vec<u16> = image_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut h_store = HCERTSTORE::default();
+    // The message handle is an opaque `*mut c_void` in this binding (no HCRYPTMSG type).
+    let mut h_msg: *mut core::ffi::c_void = std::ptr::null_mut();
+
+    // Open the file's embedded PKCS#7 signature: gives us the cert store + the
+    // signed message we can pull the signer CERT_INFO from.
+    let ok = unsafe {
+        CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            wide.as_ptr() as *const core::ffi::c_void,
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            None,
+            None,
+            None,
+            Some(&mut h_store),
+            Some(&mut h_msg),
+            None,
+        )
+    };
+    if ok.is_err() || h_msg.is_null() {
+        if !h_msg.is_null() {
+            unsafe { let _ = CryptMsgClose(Some(h_msg)); }
+        }
+        return None;
+    }
+
+    let result = (|| {
+        // Size the signer CERT_INFO, then fetch it.
+        let mut needed: u32 = 0;
+        let sized = unsafe {
+            CryptMsgGetParam(h_msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, None, &mut needed)
+        };
+        if sized.is_err() || needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let got = unsafe {
+            CryptMsgGetParam(
+                h_msg,
+                CMSG_SIGNER_CERT_INFO_PARAM,
+                0,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                &mut needed,
+            )
+        };
+        if got.is_err() {
+            return None;
+        }
+
+        // Find the signer certificate in the store by its issuer+serial.
+        let cert_ctx: *mut CERT_CONTEXT = unsafe {
+            CertFindCertificateInStore(
+                h_store,
+                CERT_QUERY_ENCODING_TYPE(PKCS_7_ASN_ENCODING.0 | X509_ASN_ENCODING.0),
+                0,
+                CERT_FIND_SUBJECT_CERT,
+                Some(buf.as_ptr() as *const core::ffi::c_void),
+                None,
+            )
+        };
+        if cert_ctx.is_null() {
+            return None;
+        }
+
+        // Read the signer's simple display name (the publisher CN): size, then fetch.
+        let name = unsafe {
+            let len = CertGetNameStringW(cert_ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None);
+            if len <= 1 {
+                let _ = CertFreeCertificateContext(Some(cert_ctx as *const CERT_CONTEXT));
+                return None;
+            }
+            let mut namebuf = vec![0u16; len as usize];
+            let wrote = CertGetNameStringW(
+                cert_ctx,
+                CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                0,
+                None,
+                Some(&mut namebuf),
+            );
+            let _ = CertFreeCertificateContext(Some(cert_ctx as *const CERT_CONTEXT));
+            if wrote <= 1 {
+                return None;
+            }
+            // `wrote` includes the trailing NUL.
+            String::from_utf16_lossy(&namebuf[..(wrote as usize - 1)])
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    })();
+
+    unsafe {
+        let _ = CryptMsgClose(Some(h_msg));
+        let _ = CertCloseStore(h_store, 0);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Hypervisor VM-worker detection (rule 3). Substrate-based, not product-name
 // based: on Windows a hypervisor must either go through the Windows Hypervisor
 // Platform (winhvplatform.dll / vid.dll — Hyper-V, WSL2, Docker Desktop,
@@ -237,7 +772,7 @@ fn hypervisor_pids() -> Vec<u32> {
 /// PIDs holding an ESTABLISHED TCP connection to a public (non-local) peer, v4+v6.
 #[cfg(windows)]
 fn pids_with_public_connection() -> Vec<u32> {
-    use crate::netfilter::tcpreset::{query_tcp_table, v4_rows, v6_rows};
+    use crate::netfilter::tcptable::{query_tcp_table, v4_rows, v6_rows};
 
     const AF_INET: u32 = 2;
     const AF_INET6: u32 = 23;
@@ -327,5 +862,72 @@ mod tests {
         let big: Vec<u32> = (0..2000).collect();
         let m2 = DlpExfilUpdate::new(&big);
         assert_eq!(m2.count as usize, DLP_EXFIL_MSG_MAX);
+    }
+
+    // ----- Windows RUNTIME probe (run with `-- --nocapture`) -----------------
+    // Exercises the real Authenticode FFI + process enumeration against this
+    // machine's actual binaries — the part that unit tests can't cover. The one
+    // HARD assertion is fail-safe (an unsigned file must yield None); the rest is
+    // diagnostic printout so we can see what real signatures resolve to.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "runtime probe over the live process table; run explicitly: cargo test windows_runtime_authenticode_probe -- --ignored --nocapture"]
+    fn windows_runtime_authenticode_probe() {
+        // 1) Deterministic, fail-safe invariant: an unsigned file → None.
+        let tmp = std::env::temp_dir().join(format!("dlp-unsigned-{}.bin", std::process::id()));
+        std::fs::write(&tmp, b"not a signed PE, just bytes").unwrap();
+        let unsigned = authenticode_publisher(&tmp.to_string_lossy());
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(unsigned, None, "an unsigned file must never resolve to a publisher");
+        eprintln!("[probe] unsigned temp file -> publisher = {unsigned:?} (expected None) OK");
+
+        // 2) Candidate system binaries: print trusted? + extracted publisher.
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let candidates = [
+            format!(r"{sysroot}\System32\svchost.exe"),
+            format!(r"{sysroot}\System32\notepad.exe"),
+            format!(r"{sysroot}\explorer.exe"),
+            format!(r"{sysroot}\System32\cmd.exe"),
+            format!(r"{sysroot}\System32\taskhostw.exe"),
+        ];
+        eprintln!("[probe] --- system binaries (trusted? / publisher) ---");
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                let trusted = file_signature_is_trusted(c);
+                let publisher = authenticode_publisher(c);
+                eprintln!("[probe]  trusted={trusted:<5} publisher={:?}  {c}", publisher);
+            }
+        }
+
+        // 3) Sample of live processes: (pid, publisher, image).
+        eprintln!("[probe] --- live processes (up to 20) ---");
+        let mut shown = 0;
+        for (pid, image) in enumerate_processes_with_image() {
+            if image.is_empty() {
+                continue;
+            }
+            let publisher = authenticode_publisher(&image);
+            eprintln!("[probe]  pid={pid:<6} publisher={:?}  {image}", publisher);
+            shown += 1;
+            if shown >= 20 {
+                break;
+            }
+        }
+
+        // 4) compute_untrusted_pids with a realistic Microsoft-publisher + Windows-path
+        //    allowlist. Print how many of the machine's processes it would flag.
+        let rules = vec![
+            ReaderMatch::Publisher("Microsoft Corporation".into()),
+            ReaderMatch::Path(format!(r"{sysroot}")),
+        ];
+        let untrusted = compute_untrusted_pids(std::process::id(), &rules);
+        eprintln!(
+            "[probe] compute_untrusted_pids(Microsoft + {sysroot}) -> {} untrusted PID(s)",
+            untrusted.len()
+        );
+        // self / 0 / 4 must never be in the set.
+        assert!(!untrusted.contains(&std::process::id()));
+        assert!(!untrusted.contains(&0));
+        assert!(!untrusted.contains(&4));
     }
 }

@@ -19,5 +19,6 @@ pub mod notify;
 pub mod storage;
 pub mod supervise;
 pub mod trustdest;
+pub mod trustedreaders;
 pub mod trustsync;
 pub mod usb;

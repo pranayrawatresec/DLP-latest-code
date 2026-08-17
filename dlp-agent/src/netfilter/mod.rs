@@ -24,19 +24,11 @@
 
 pub mod remote_tools;
 pub mod rules;
-pub mod tcpreset;
+pub mod tcptable;
 pub mod wfp;
 
 pub use remote_tools::{RemoteToolPolicy, ToolAction};
 pub use rules::{Connection, Decision, Direction, NetMode, NetPolicy, NetRule};
-// Read-taint existing-connection teardown (LLD §7/§9.2): the pure row-selection +
-// tainted-egress mirror, and the operator-manual live TCP reset called by kguard
-// on a read-scan BLOCK. Re-exported so `crate::netfilter::reset_pid_connections`
-// resolves from the port client.
-pub use tcpreset::{
-    reset_pid_connections, select_pid_rows, tainted_egress_action, EgressAction, TcpFamily, TcpRow,
-    Tep,
-};
 
 use crate::config::{Config, NetfilterConfig};
 use crate::storage::Storage;

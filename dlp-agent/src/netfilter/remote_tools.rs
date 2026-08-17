@@ -2,23 +2,20 @@
 //!
 //! IMPORTANT — this is NOT one of the network data-exfil layers. Blocking
 //! agent-*detected* sensitive data leaving over any tool (AnyDesk/RustDesk/…) is
-//! done by **read-taint** (content the agent flags → taint the reader → cut its
-//! egress) and **default-deny egress** (a tool's relay isn't an approved
-//! destination → blocked). Neither needs to know the tool's name.
+//! done by **read-deny** (an exfil-classified process is denied the read of
+//! flagged content — the bytes never reach the tool) and **default-deny egress**
+//! (a tool's relay isn't an approved destination → blocked). Neither needs to
+//! know the tool's name; the signature set below IS one of the read-deny
+//! exfil-channel classifiers (`crate::exfil`), alongside the behavioral
+//! public-connection signal.
 //!
-//! This signature set exists only for the ONE case those two cannot cover: the
-//! **analog hole** — an operator *screen-viewing* a document over a remote tool
-//! and photographing it. No file leaves, so there is nothing to detect or taint;
-//! the only lever is to forbid the tool itself. Because that is a different threat
-//! (and disruptive), remote-tool action **defaults to `detect` (visibility only —
-//! never blocks/kills)**; blocking is a deliberate opt-in
-//! (`[netfilter] remote_tool_action = "block_network" | "kill"`).
-//!
-//! **Matching is PRIMARY on process image name.** Ports are unreliable (every one
-//! of these tools falls back to 443/TCP to punch through firewalls), so a port
-//! match is only a weak secondary signal; relay domains are a secondary signal
-//! for the netfilter layer. The image-name matcher below is the authoritative
-//! one. Pure logic, fully unit-tested; no I/O.
+//! As a *blocking* action, this set exists only for the ONE case the exfil
+//! layers cannot cover: the **analog hole** — an operator *screen-viewing* a
+//! document over a remote tool and photographing it. No file leaves, so there is
+//! nothing to detect or deny; the only lever is to forbid the tool itself.
+//! Because that is a different threat (and disruptive), remote-tool action
+//! **defaults to `detect` (visibility only — never blocks/kills)**; blocking is
+//! a deliberate opt-in (`[netfilter] remote_tool_action = "block_network" | "kill"`).
 //!
 //! **Matching is PRIMARY on process image name.** Ports are unreliable (every one
 //! of these tools falls back to 443/TCP to punch through firewalls), so a port
@@ -204,7 +201,7 @@ pub struct RemoteToolPolicy {
 impl Default for RemoteToolPolicy {
     fn default() -> Self {
         // Default `detect` (visibility only): remote-tool blocking is decoupled
-        // from the data-exfil layers (read-taint + default-deny) and is opt-in.
+        // from the data-exfil layers (read-deny + default-deny) and is opt-in.
         // Set block_network/kill via config to deliberately forbid the tools.
         RemoteToolPolicy {
             default_action: ToolAction::Detect,

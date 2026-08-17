@@ -34,7 +34,7 @@
 //! * WRITE scans headed to a whitelisted `action = "encrypt"` device stand
 //!   aside per `trustdest::decide_seal` (only while `[usb] enabled = true` —
 //!   with the monitor off nobody would seal, so the guard behaves exactly as
-//!   before). Read-taint semantics are unchanged in every case.
+//!   before). READ-scan (read-deny) semantics are unchanged in every case.
 //!
 //! **Verification boundary:** this module COMPILES and is analyzed here. End to
 //! end it needs the loaded driver, which requires test-signing + reboot on a
@@ -80,10 +80,9 @@ pub const DLP_VERDICT_BLOCK: u32 = 1;
 ///
 /// * `WRITE` (0) — legacy write/quarantine scan. This is the OLD `Reserved`
 ///   value, so an old driver (which zeroed `Reserved`) is read as a write scan:
-///   backward compatible in both directions (LLD §6).
-/// * `READ` (1) — read-taint scan: on BLOCK the driver taints the process and we
-///   additionally reset that PID's live TCP egress (close the in-flight socket
-///   the steady-state WFP callout can't retroactively catch).
+///   backward compatible in both directions.
+/// * `READ` (1) — read-deny classify scan: an exfil-channel PID is reading a
+///   file; on BLOCK the driver denies the read/mapping (read-deny-LLD §3).
 pub const DLP_REASON_WRITE: u32 = 0;
 pub const DLP_REASON_READ: u32 = 1;
 
@@ -203,7 +202,7 @@ pub fn should_block(v: &Verdict, cfg: &KguardConfig) -> bool {
 /// Distinct from [`should_block`]: this uses `removable_write_block_at`
 /// (default 0.15) — a TIGHTER containment ceiling for data leaving the machine
 /// on an untrusted stick — while `should_block` keeps `block_at` (0.30) for the
-/// read-taint path and the trusted-side seal band. Coverage and EDM behave the
+/// read-scan path and the trusted-side seal band. Coverage and EDM behave the
 /// same in both.
 pub fn should_block_removable_write(v: &Verdict, cfg: &KguardConfig) -> bool {
     if !v.edm.is_empty() {
@@ -216,34 +215,26 @@ pub fn should_block_removable_write(v: &Verdict, cfg: &KguardConfig) -> bool {
 
 /// Human label for a scan reason, for structured logs. An unrecognised value
 /// (a newer driver) is reported as `unknown` rather than misattributed — the
-/// verdict path still runs, only the taint side-effect is gated on READ.
+/// verdict path runs identically for every reason.
 fn reason_label(reason: u32) -> &'static str {
     match reason {
         DLP_REASON_WRITE => "write",
-        DLP_REASON_READ => "read-taint",
+        DLP_REASON_READ => "read",
         _ => "unknown",
     }
 }
 
 /// The incident note for a kernel BLOCK, chosen by scan reason (pure, tested).
-/// A read-taint scan (`DLP_REASON_READ`) that blocks is labelled `read-taint`
-/// so a reviewer can tell "this file's reader was tainted, its egress cut" from
-/// the legacy write/quarantine block, which keeps its `kernel-blocked` note.
+/// A read-deny classify scan (`DLP_REASON_READ`) that blocks is labelled
+/// `exfil-read-denied` so a reviewer can tell "an exfil-channel process was
+/// denied this read" from the legacy write/quarantine block, which keeps its
+/// `kernel-blocked` note.
 fn block_note(reason: u32) -> &'static str {
     if reason == DLP_REASON_READ {
-        "read-taint"
+        "exfil-read-denied"
     } else {
         "kernel-blocked"
     }
-}
-
-/// Whether this scan verdict warrants tearing down the requestor PID's live TCP
-/// egress: ONLY a read-taint scan (`DLP_REASON_READ`) that BLOCKED. A write scan
-/// never resets connections (there is no tainted long-lived socket to close);
-/// a clean read never resets. Pure — the Windows reset itself
-/// (`netfilter::reset_pid_connections`) is operator-manual and not unit-tested.
-pub fn should_reset_connections(reason: u32, blocked: bool) -> bool {
-    reason == DLP_REASON_READ && blocked
 }
 
 /// The CA the agent trusts for bundle signatures: pinned-at-enrollment when
@@ -317,7 +308,7 @@ fn incident_for(
             verdict: Some(verdict),
             device,
             action_taken: action,
-            // `read-taint` for a read-scan block, `kernel-blocked` for a write.
+            // `exfil-read-denied` for a read-scan block, `kernel-blocked` for a write.
             note: Some(block_note(reason).into()),
             key_id: None,
             sealed_sha256: None,
@@ -353,7 +344,7 @@ fn incident_for(
 ///
 /// Reason-INdependent by design, hence the deliberately unused `_reason`: a
 /// write of an envelope must not be quarantined (it is the sealer's own
-/// output) and a read of one must not taint the reader. Applies on every
+/// output) and a read of one must not be denied. Applies on every
 /// volume. Returns the guard decision when the content is an envelope; `None`
 /// otherwise (caller proceeds to scoring).
 fn envelope_passthrough(content: &[u8], _reason: u32) -> Option<(bool, Option<UsbIncident>)> {
@@ -371,7 +362,7 @@ fn envelope_passthrough(content: &[u8], _reason: u32) -> Option<(bool, Option<Us
 /// A WRITE scan whose target volume resolves to an `Action::Encrypt` trusted
 /// destination defers to the `usb-monitor` sealer instead of quarantining the
 /// very file the monitor is about to armour. Gates, in order:
-/// * READ scans are NEVER overridden — read-taint semantics are unchanged.
+/// * READ scans are NEVER overridden — read-deny semantics are unchanged.
 /// * `usb.enabled` must be true: with the monitor channel off there is nobody
 ///   to seal, so an allow here would strand plaintext on the stick. Fail
 ///   secure: guard behaviour is exactly as before.
@@ -568,10 +559,13 @@ where
     let pusher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let pusher = if initial.kguard.exfil_read_block {
         let pusher_stop = pusher_stop.clone();
+        // The pusher reads the SHARED config each cycle so a live re-sync
+        // (run-endpoint) picks up posture / allowlist changes without a restart.
+        let pusher_cfg = shared_cfg.clone();
         // The pusher opens its OWN push-only connection (below) — it never touches
         // this scanner handle, so FilterSendMessage cannot collide with the
         // scanner's FilterGetMessage.
-        Some(std::thread::spawn(move || exfil_push_loop(&pusher_stop)))
+        Some(std::thread::spawn(move || exfil_push_loop(&pusher_stop, &pusher_cfg)))
     } else {
         None
     };
@@ -591,12 +585,16 @@ where
     result
 }
 
-/// Background loop: recompute the exfil-channel PID set and push it to the driver
-/// every ~2s. Opens its OWN push-only port connection (context = DLP_EXFIL_VERSION)
-/// so `FilterSendMessage` never shares a handle with the scanner's blocking
-/// `FilterGetMessage` (which conflict). Exits on `stop` or a send error.
+/// Background loop: recompute the untrusted-reader PID set and push it to the
+/// driver every ~2s. Opens its OWN push-only port connection (context =
+/// DLP_EXFIL_VERSION) so `FilterSendMessage` never shares a handle with the
+/// scanner's blocking `FilterGetMessage` (which conflict). WHICH set is computed
+/// is chosen per cycle by `[kguard] exfil_posture` read from the shared config:
+/// `blocklist` (signature/behaviour/VM — unchanged) or `allowlist` (every
+/// process NOT on the sanctioned-reader allowlist). Exits on `stop` or a send error.
 #[cfg(windows)]
-fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool) {
+fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock<Config>>) {
+    use crate::config::ExfilPosture;
     use std::sync::atomic::Ordering;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -626,7 +624,21 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool) {
 
     let self_pid = std::process::id();
     while !stop.load(Ordering::Relaxed) {
-        let pids = crate::exfil::compute_exfil_pids(self_pid);
+        // Re-snapshot each cycle so a live re-sync picks up posture / allowlist
+        // changes. `blocklist` (default) is the UNCHANGED signature/behaviour set;
+        // `allowlist` pushes every process NOT on the sanctioned-reader allowlist.
+        let snap = snapshot_config(shared_cfg);
+        let pids = match snap.kguard.exfil_posture {
+            ExfilPosture::Blocklist => crate::exfil::compute_exfil_pids(self_pid),
+            ExfilPosture::Allowlist => {
+                let rules = crate::trustedreaders::resolve_matches(&snap.trusted_readers);
+                crate::exfil::compute_untrusted_pids(self_pid, &rules)
+            }
+        };
+        let posture = match snap.kguard.exfil_posture {
+            ExfilPosture::Blocklist => "blocklist",
+            ExfilPosture::Allowlist => "allowlist",
+        };
         let msg = crate::exfil::DlpExfilUpdate::new(&pids);
         let rc = unsafe {
             FilterSendMessage(
@@ -642,7 +654,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool) {
             tracing::warn!(error = %e, "exfil-set push failed (port closing?) — ending pusher");
             break;
         }
-        tracing::info!(count = pids.len(), pids = ?pids, "pushed exfil-channel PID set to driver");
+        tracing::info!(count = pids.len(), posture, pids = ?pids, "pushed untrusted-reader PID set to driver");
         // ~2s cadence, checking stop every 100ms so shutdown is prompt.
         for _ in 0..20 {
             if stop.load(Ordering::Relaxed) {
@@ -796,7 +808,7 @@ where
             let truncated = req.truncated != 0;
             // Score the in-memory content (NO file re-open), or fall back to the
             // configured fail behavior. `req.reason` selects the write vs
-            // read-taint incident labelling (verdict semantics are identical).
+            // read-deny incident labelling (verdict semantics are identical).
             decide(&cfg, kg, bundle, &device_path, content, truncated, req.reason, sealer_healthy)
         };
 
@@ -812,32 +824,6 @@ where
         };
         if let Err(e) = sent {
             tracing::warn!(error = %e, "FilterReplyMessage failed — the driver will apply FailMode");
-        }
-
-        // Read-taint side-effect: on a read-scan BLOCK the driver has just
-        // tainted this PID, but its ALREADY-OPEN sockets predate the WFP
-        // callout's new-connect block. Tear those live flows down by owning PID
-        // (best-effort; the kernel callout still guarantees the steady state, so
-        // a failure here only widens the tiny existing-connection race, LLD §7).
-        // Done AFTER replying so the kernel's read path is never delayed by it.
-        if should_reset_connections(req.reason, block) {
-            tracing::info!(
-                pid = req.process_id,
-                reason = reason_label(req.reason),
-                "read-taint block — tearing down live egress for tainted PID"
-            );
-            match crate::netfilter::reset_pid_connections(req.process_id) {
-                Ok(n) => tracing::warn!(
-                    pid = req.process_id,
-                    reset = n,
-                    "read-taint: reset tainted process's live TCP egress"
-                ),
-                Err(e) => tracing::warn!(
-                    pid = req.process_id,
-                    error = %e,
-                    "read-taint: connection reset failed (best-effort; WFP callout still blocks new connects)"
-                ),
-            }
         }
 
         // Raise the incident (if any) AFTER replying, so a slow network sink
@@ -948,12 +934,13 @@ fn decide(
     let block = if matches!(v.extraction, detect::Extraction::Unreadable { .. }) {
         // Content we can't parse. Fail-secure ONLY on the exfil-to-removable/network
         // (write) path, and only when `fail_block` is set: an unverifiable file must
-        // not leave the machine. NEVER fail-secure on the READ (taint) path — that
-        // would cut a user's network for merely opening an image/binary/encrypted
-        // file. Read-taint stays a genuine content match, not a fail-open guess.
+        // not leave the machine. NEVER on the READ (read-deny classify) path — the
+        // driver applies its own `ExfilReadFailBlock` policy to unverifiable reads
+        // by exfil PIDs; an agent-side block here would deny ordinary binary/image
+        // reads on a genuine-allow verdict.
         reason != DLP_REASON_READ && kg.fail_block
     } else if reason == DLP_REASON_READ {
-        // Read-taint path is UNCHANGED: keep the `block_at` (0.30) band.
+        // Read-deny classify path: keep the `block_at` (0.30) band.
         should_block(&v, kg)
     } else {
         // WRITE (or forward-compat unknown) to a NON-whitelisted removable device:
@@ -1136,7 +1123,7 @@ mod tests {
         assert!(!should_block_removable_write(&verdict_with(0.14, 0.0), &cfg)); // below
         assert!(should_block_removable_write(&verdict_with(0.15, 0.0), &cfg)); // at
         assert!(should_block_removable_write(&verdict_with(0.20, 0.0), &cfg)); // above
-        // A row that would NOT trip the read-taint band (0.30) DOES trip the
+        // A row that would NOT trip the read-scan band (0.30) DOES trip the
         // tighter removable-write band — the whole point of the new threshold.
         assert!(!should_block(&verdict_with(0.20, 0.0), &cfg));
     }
@@ -1186,39 +1173,30 @@ mod tests {
         assert!(incident_for("E:\\ok.txt", clean_verdict(), false, "usb-kguard", DLP_REASON_WRITE).is_none());
     }
 
-    // --- Read-taint reason plumbing (LLD §9.1, §12 unit 5) -----------------
+    // --- Read-scan reason plumbing (read-deny) -----------------------------
 
     #[test]
-    fn read_scan_block_is_labelled_read_taint() {
-        // A read-scan (DLP_REASON_READ) block drives the read-taint incident:
+    fn read_scan_block_is_labelled_exfil_read_denied() {
+        // A read-scan (DLP_REASON_READ) block drives the read-deny incident:
         // same Match/Blocked shape, but the note distinguishes it for reviewers.
         let inc = incident_for("E:\\secret.docx", verdict_with(1.0, 1.0), true, "usb-kguard", DLP_REASON_READ)
-            .expect("a read-taint block must raise an incident");
+            .expect("a read-deny block must raise an incident");
         assert_eq!(inc.kind, IncidentKind::Match);
         assert_eq!(inc.action_taken, ActionTaken::Blocked);
-        assert_eq!(inc.note.as_deref(), Some("read-taint"));
+        assert_eq!(inc.note.as_deref(), Some("exfil-read-denied"));
     }
 
     #[test]
     fn block_note_selects_by_reason() {
-        assert_eq!(block_note(DLP_REASON_READ), "read-taint");
+        assert_eq!(block_note(DLP_REASON_READ), "exfil-read-denied");
         assert_eq!(block_note(DLP_REASON_WRITE), "kernel-blocked");
     }
 
     #[test]
     fn reason_label_names_known_and_unknown() {
         assert_eq!(reason_label(DLP_REASON_WRITE), "write");
-        assert_eq!(reason_label(DLP_REASON_READ), "read-taint");
+        assert_eq!(reason_label(DLP_REASON_READ), "read");
         assert_eq!(reason_label(99), "unknown"); // forward-compat: newer driver
-    }
-
-    #[test]
-    fn reset_only_on_read_scan_block() {
-        // Only a READ scan that BLOCKED tears down the PID's live egress.
-        assert!(should_reset_connections(DLP_REASON_READ, true));
-        assert!(!should_reset_connections(DLP_REASON_READ, false)); // clean read
-        assert!(!should_reset_connections(DLP_REASON_WRITE, true)); // legacy write block
-        assert!(!should_reset_connections(DLP_REASON_WRITE, false));
     }
 
     #[test]
@@ -1550,7 +1528,7 @@ mod tests {
 
     #[test]
     fn read_reason_is_never_overridden() {
-        // Read-taint semantics unchanged: even a seal-opt-in courier stick
+        // Read-deny semantics unchanged: even a seal-opt-in courier stick
         // never suppresses a read-scan verdict.
         let usb = encrypt_usb_cfg(BlockBandPolicy::Seal, Some(EncryptMode::EncryptAll));
         let dev = dev_with_serial("COURIER");

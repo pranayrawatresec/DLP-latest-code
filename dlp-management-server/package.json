@@ -19,6 +19,7 @@
     "test:edm": "node test/edm.test.js",
     "test:bundle": "node test/bundle.test.js",
     "test:encryption": "node test/encryption.test.js",
+    "test:readers": "node test/trustedReaders.test.js",
     "e2e:detection": "node scripts/detection-e2e.js"
   },
   "dependencies": {

@@ -74,6 +74,13 @@ windows = { version = "0.58", features = [
     "Win32_Security",                   # PSECURITY_DESCRIPTOR + SID (Fwpm*Add0 are security-gated)
     "Win32_System_Threading",           # OpenProcess/TerminateProcess/QueryFullProcessImageNameW/CreateProcessAsUserW/ProcessIdToSessionId
     "Win32_System_ProcessStatus",       # EnumProcesses (remote-tool process enumeration)
+    # Read-deny allowlist posture (src/exfil): verify a process image's
+    # Authenticode signature and extract the signer publisher so the
+    # sanctioned-reader allowlist can match by publisher (spoof-resistant id).
+    "Win32_Security_WinTrust",          # WinVerifyTrust + WINTRUST_DATA/WINTRUST_FILE_INFO
+    "Win32_Security_Cryptography_Catalog", # CryptCATAdmin* — resolve the signer of
+                                        # catalog-signed OS binaries (cmd/notepad/…),
+                                        # not just embedded-signed apps.
     # Endpoint "blocked by DLP" toast (src/notify): render a native Windows toast
     # (WinRT) and, from the Session-0 service, spawn the toast into the interactive
     # user session (WTSQueryUserToken + CreateProcessAsUserW + CreateEnvironmentBlock).

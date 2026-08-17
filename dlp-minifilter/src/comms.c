@@ -34,6 +34,8 @@ static VOID FLTAPI DlpPortDisconnect(_In_opt_ PVOID ConnectionCookie);
 
 static VOID DlpReadDword(_In_ HANDLE Key, _In_ PCWSTR Name, _Inout_ PULONG Out);
 
+static LONG DlpConfigExceptionFilter(_In_ ULONG Code);
+
 static NTSTATUS FLTAPI DlpPortMessage(
     _In_opt_ PVOID PortCookie,
     _In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
@@ -49,7 +51,6 @@ static NTSTATUS FLTAPI DlpPortMessage(
 #pragma alloc_text(PAGE, DlpPortDisconnect)
 #pragma alloc_text(PAGE, DlpReadFailMode)
 #pragma alloc_text(PAGE, DlpReadDword)
-#pragma alloc_text(PAGE, DlpReadTaintPolicy)
 #pragma alloc_text(PAGE, DlpReadExfilPolicy)
 #endif
 
@@ -142,7 +143,7 @@ DlpPortConnect(_In_ PFLT_PORT ClientPort,
     if (ConnectionContext != NULL && SizeOfContext >= sizeof(ULONG)) {
         __try {
             connCtx = *(const volatile ULONG *)ConnectionContext;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
             connCtx = 0;
         }
     }
@@ -651,7 +652,7 @@ DlpReadFailMode(_In_ PUNICODE_STRING RegistryPath)
 }
 
 /* Read one REG_DWORD from the open key into *Out; leaves *Out unchanged if the
- * value is absent or not a DWORD. Helper for DlpReadTaintPolicy. */
+ * value is absent or not a DWORD. Helper for DlpReadExfilPolicy. */
 static VOID
 DlpReadDword(_In_ HANDLE Key, _In_ PCWSTR Name, _Inout_ PULONG Out)
 {
@@ -669,42 +670,6 @@ DlpReadDword(_In_ HANDLE Key, _In_ PCWSTR Name, _Inout_ PULONG Out)
         info->DataLength == sizeof(ULONG)) {
         *Out = *(PULONG)info->Data;
     }
-}
-
-VOID
-DlpReadTaintPolicy(_In_ PUNICODE_STRING RegistryPath)
-{
-    NTSTATUS status;
-    OBJECT_ATTRIBUTES oa;
-    HANDLE key = NULL;
-    ULONG enabled = DLP_READTAINT_DISABLED;
-    ULONG policy = DLP_TEP_BLOCK_ALL;
-
-    PAGED_CODE();
-
-    /* Defaults already set by DriverEntry (disabled + block-all). Only override
-     * from explicit, valid REG_DWORD values -- an absent key keeps read-taint
-     * OFF (today's FS-only behavior; opt-in, fail-safe). */
-    InitializeObjectAttributes(&oa, RegistryPath,
-                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-                               NULL, NULL);
-
-    status = ZwOpenKey(&key, KEY_READ, &oa);
-    if (!NT_SUCCESS(status)) {
-        return;
-    }
-
-    DlpReadDword(key, L"ReadTaintEnabled", &enabled);
-    DlpReadDword(key, L"TaintedEgressPolicy", &policy);
-
-    ZwClose(key);
-
-    gDlpData.ReadTaintEnabled =
-        (enabled == DLP_READTAINT_ENABLED) ? DLP_READTAINT_ENABLED
-                                           : DLP_READTAINT_DISABLED;
-    gDlpData.TaintedEgressPolicy =
-        (policy == DLP_TEP_BLOCK_NONLOCAL) ? DLP_TEP_BLOCK_NONLOCAL
-                                           : DLP_TEP_BLOCK_ALL;
 }
 
 VOID

@@ -19,7 +19,7 @@ const baseQuery = async (args, apiCtx, extra) => {
 export const apiSlice = createApi({
   reducerPath: 'api',
   baseQuery,
-  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination'],
+  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader'],
   endpoints: (b) => ({
     // Enrollment tokens
     getEnrollmentTokens: b.query({
@@ -159,6 +159,24 @@ export const apiSlice = createApi({
       query: () => '/encryption/keys',
       transformResponse: (res) => res?.keys || [],
     }),
+
+    // Read-deny allowlist posture: the sanctioned-reader allowlist (which apps
+    // may read sensitive content locally). Every other process is treated as an
+    // untrusted reader and denied the read of sensitive files on endpoints.
+    getTrustedReaders: b.query({
+      query: () => '/trusted-readers',
+      transformResponse: (res) => res?.readers || [],
+      providesTags: ['TrustedReader'],
+    }),
+    createTrustedReader: b.mutation({
+      // body: { matchType: 'publisher'|'path'|'name', value, note? }
+      query: (body) => ({ url: '/trusted-readers', method: 'POST', body }),
+      invalidatesTags: ['TrustedReader'],
+    }),
+    deleteTrustedReader: b.mutation({
+      query: (id) => ({ url: `/trusted-readers/${id}`, method: 'DELETE' }),
+      invalidatesTags: ['TrustedReader'],
+    }),
   }),
 })
 
@@ -189,4 +207,7 @@ export const {
   useCreateTrustedDestinationMutation,
   useDeleteTrustedDestinationMutation,
   useGetEncryptionKeysQuery,
+  useGetTrustedReadersQuery,
+  useCreateTrustedReaderMutation,
+  useDeleteTrustedReaderMutation,
 } = apiSlice

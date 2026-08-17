@@ -9,6 +9,7 @@ import AuditLog from './pages/AuditLog'
 import Incidents from './pages/Incidents'
 import ProtectedDocuments from './pages/ProtectedDocuments'
 import TrustedDestinations from './pages/TrustedDestinations'
+import TrustedReaders from './pages/TrustedReaders'
 import AppLayout from './components/layout/AppLayout'
 import ProtectedRoute from './components/ProtectedRoute'
 import RequirePermission from './components/RequirePermission'
@@ -49,6 +50,10 @@ function App() {
         <Route
           path="trusted-destinations"
           element={<RequirePermission permission="trusted_destinations:read"><TrustedDestinations /></RequirePermission>}
+        />
+        <Route
+          path="trusted-readers"
+          element={<RequirePermission permission="trusted_readers:read"><TrustedReaders /></RequirePermission>}
         />
         <Route
           path="sessions"

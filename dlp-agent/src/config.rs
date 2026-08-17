@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::netfilter::remote_tools::ToolAction;
 use crate::netfilter::rules::{Cidr, NetMode, NetRule, RuleAction};
 use crate::trustdest::{BlockBandPolicy, EncryptBands, EncryptMode};
+use crate::trustedreaders::{SyncedReader, TrustedReaderRule};
 use crate::trustsync::{merge_into_usb, SyncedDestination};
 use crate::usb::device::DeviceIdentity;
 use crate::usb::policy::{Action, DeviceRule, RuleMatch, UsbPolicy};
@@ -78,6 +79,34 @@ pub struct Config {
     /// the browser-host channel in M7). Absent ⇒ no trusted origins.
     #[serde(default)]
     pub webupload: WebuploadConfig,
+
+    /// Sanctioned-reader allowlist (`[[trusted_readers]]`) — the applications
+    /// allowed to read sensitive content locally under the read-deny
+    /// **allowlist** posture (`[kguard] exfil_posture = "allowlist"`). Every
+    /// process NOT matching one of these is treated as an untrusted reader and
+    /// pushed to the driver for read-deny. Empty in the default *blocklist*
+    /// posture (where it is unused), so existing configs keep working. The
+    /// console-authored list is merged in over mTLS via [`Config::with_synced_readers`].
+    #[serde(default)]
+    pub trusted_readers: Vec<TrustedReaderRule>,
+}
+
+/// Read-deny classification posture (`[kguard] exfil_posture`).
+///
+/// * `Blocklist` (default, UNCHANGED behaviour) — a process is an exfil channel
+///   only if it matches a remote-tool SIGNATURE, holds a public connection, or
+///   hosts a VM ([`crate::exfil::compute_exfil_pids`]). Robust against nothing
+///   new; the shipped default so turning read-deny on changes nothing else.
+/// * `Allowlist` — a process is an untrusted reader UNLESS it is on the
+///   sanctioned-reader allowlist ([`Config::trusted_readers`]). Scales against
+///   unknown tools (a never-before-seen uploader isn't on the allowlist, so it
+///   is denied at the read). This is the recommended posture; pair it with a
+///   curated allowlist (monitor → measure → enforce).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExfilPosture {
+    Blocklist,
+    Allowlist,
 }
 
 fn default_checkin() -> u64 {
@@ -230,9 +259,9 @@ impl UsbConfig {
 #[serde(default)]
 pub struct KguardConfig {
     /// Block when a matched document's containment reaches this fraction
-    /// (`idm[].containment >= block_at`). Default 0.30. Used by the read-taint
-    /// path (`should_block`) and mirrored into the trusted-side seal block band
-    /// (`Config::encrypt_bands`).
+    /// (`idm[].containment >= block_at`). Default 0.30. Used by the read-scan
+    /// (read-deny classify) path (`should_block`) and mirrored into the
+    /// trusted-side seal block band (`Config::encrypt_bands`).
     pub block_at: f64,
     /// Block when a scanned file's coverage by protected material reaches this
     /// fraction (`idm[].coverage >= coverage_block_at`). Default 0.60.
@@ -241,9 +270,9 @@ pub struct KguardConfig {
     /// NON-whitelisted removable device (the WRITE-reason, non-Encrypt
     /// fall-through in `kguard::decide`). Deliberately LOWER than `block_at`
     /// (0.30) — data leaving the machine on an untrusted stick is blocked at a
-    /// tighter containment than the read-taint band uses. Default 0.15. EDM hits
+    /// tighter containment than the read-scan band uses. Default 0.15. EDM hits
     /// and `coverage >= coverage_block_at` also block (see
-    /// `should_block_removable_write`). Does NOT affect read-taint or the
+    /// `should_block_removable_write`). Does NOT affect read-deny or the
     /// trusted-side `decide_seal` bands.
     pub removable_write_block_at: f64,
     /// Staleness window (seconds) for the in-process sealer liveness signal used
@@ -271,35 +300,27 @@ pub struct KguardConfig {
     /// to 260 wchars. Empty ⇒ the driver never attaches to fixed volumes
     /// (safety/back-compat invariant). Sent in `DLP_CONFIG`.
     ///
-    /// # Read-taint scope (LLD §6/§9.3) — NO new wire field
-    /// The read-taint feature (block sensitive data leaving over ANY network
-    /// channel, including encrypted ones, by tainting the reading process and
-    /// cutting its egress) deliberately adds NO field here: its master switch
-    /// and egress policy travel OUT-OF-BAND as registry DWORDs under the driver
-    /// service key (read in `DriverEntry`, the same pattern as the driver's
-    /// `FailMode`), so neither `DLP_CONFIG_VERSION` nor `DLP_MSG_VERSION` is
-    /// bumped and the frozen v2 wire layout is untouched:
-    ///
-    /// * `ReadTaintEnabled` (DWORD, default 0) — master switch. `1` registers the
-    ///   IRP_MJ_READ trigger, the scan worker, the WFP callout and the
-    ///   process-exit untaint. `0` = filesystem/USB protection only.
-    /// * `TaintedEgressPolicy` (DWORD) — `0` = block ALL outbound from a tainted
-    ///   PID (default, fail-secure); `1` = permit RFC1918/loopback/link-local,
-    ///   block the rest (see `netfilter::Tep` / `tainted_egress_action`).
-    ///
-    /// Read *scope* (which files trigger a scan) REUSES this `watch_paths` set —
-    /// the driver's `DlpConfigPathIsWatched` gate — so no separate scope config
-    /// exists. `scan=watch` (the default) means "taint on reads under
-    /// `watch_paths`"; there is no wire change to enable it.
+    /// Read-deny *scope* (which fixed-volume files an exfil PID's reads are
+    /// classified against) REUSES this set — the driver's
+    /// `DlpConfigPathIsWatched` gate — so no separate scope config exists.
+    /// Removable and network volumes are always in scope.
     pub watch_paths: Vec<String>,
 
     /// Read-deny (content-aware exfil-tool read blocking): when `true`, `usb-guard`
-    /// runs a background tracker that computes the exfil-channel PID set (remote
-    /// tools by signature + processes holding a public/non-local TCP connection)
-    /// and pushes it to the driver so the kernel's `DlpPreRead` can DENY a
-    /// sensitive read by an exfil process. Default `false`. Pair with the driver
+    /// runs a background tracker that computes the untrusted-reader PID set and
+    /// pushes it to the driver so the kernel's `DlpPreRead` can DENY a sensitive
+    /// read by an untrusted process. Default `false`. Pair with the driver
     /// registry knob `ExfilReadBlockEnabled=1` (out-of-band) for kernel enforcement.
+    ///
+    /// WHICH PIDs get pushed is governed by [`exfil_posture`](Self::exfil_posture).
     pub exfil_read_block: bool,
+
+    /// Read-deny classification posture. `blocklist` (default) keeps the exact
+    /// prior behaviour (exfil channels chosen by signature/behaviour/VM);
+    /// `allowlist` treats every process NOT on the sanctioned-reader allowlist
+    /// ([`Config::trusted_readers`]) as an untrusted reader. Only consulted when
+    /// [`exfil_read_block`](Self::exfil_read_block) is on.
+    pub exfil_posture: ExfilPosture,
 }
 
 impl Default for KguardConfig {
@@ -315,6 +336,7 @@ impl Default for KguardConfig {
             scan_network: false,
             watch_paths: Vec::new(),
             exfil_read_block: false,
+            exfil_posture: ExfilPosture::Blocklist,
         }
     }
 }
@@ -377,18 +399,14 @@ impl Default for ClipboardConfig {
 /// defaulted so the whole `[netfilter]` section — and any individual field — may
 /// be omitted; an absent section is the safe `monitor` posture (NEVER default-deny).
 ///
-/// # Read-taint interaction (LLD §9.3) — allow-list MUST include agent lifelines
-/// Read-taint (kernel) and this user-mode default-deny COMPOSE: the kernel WFP
-/// callout blocks a *tainted* PID's egress even to an approved destination, while
-/// this allow-list blocks *any* PID's egress to an unapproved destination. To
+/// # Allow-list MUST include agent lifelines
+/// This allow-list blocks *any* PID's egress to an unapproved destination. To
 /// avoid the agent cutting ITSELF off when running `--enforce allowlist`, the
 /// `[[netfilter.rules]]` allow-list MUST permit, at minimum:
 ///   * the management server `host:port` (mTLS check-in, incident upload),
 ///   * the DNS resolver(s) (UDP/TCP 53) so name resolution keeps working,
 ///   * any internal services the agent depends on.
-/// The agent's OWN processes are never tainted (the driver skips its service PID
-/// and PID 4/System), so read-taint never blocks agent traffic; the allow-list is
-/// the only thing that can, hence these entries. Example (illustrative):
+/// Example (illustrative):
 ///
 /// ```toml
 /// [netfilter]
@@ -418,7 +436,7 @@ pub struct NetfilterConfig {
     /// Default action for a matched remote-access tool (AnyDesk/TeamViewer/VNC/…).
     /// **Default `detect` (visibility only — never blocks/kills).** Remote-tool
     /// blocking is NOT part of blocking agent-detected sensitive data (that is
-    /// read-taint + default-deny); it is optional, opt-in hygiene that only helps
+    /// read-deny + default-deny); it is optional, opt-in hygiene that only helps
     /// the analog-hole/screen-view case. Set `block_network` (cut the relay) or
     /// `kill` (terminate; admin + `--enforce`) to deliberately opt in.
     pub remote_tool_action: ToolAction,
@@ -438,7 +456,7 @@ impl Default for NetfilterConfig {
             mode: NetMode::Monitor, // NEVER default-deny (plan §2.4/§5)
             channel_label: "network".into(),
             // detect-only by default: remote-tool blocking is decoupled from the
-            // data-exfil layers (read-taint + default-deny) and is opt-in.
+            // data-exfil layers (read-deny + default-deny) and is opt-in.
             remote_tool_action: ToolAction::Detect,
             remote_tool_overrides: HashMap::new(),
             persist: false,
@@ -628,6 +646,7 @@ impl Config {
                 notify: NotifyConfig::default(),
                 crypto: CryptoConfig::default(),
                 webupload: WebuploadConfig::default(),
+                trusted_readers: Vec::new(),
             }
         };
 
@@ -664,6 +683,13 @@ impl Config {
         format!("{}/agent/trusted-config", self.server_url.trim_end_matches('/'))
     }
 
+    /// Agent-facing sanctioned-reader allowlist endpoint (read-deny allowlist
+    /// posture). Served over the same mTLS listener as check-in; independent of
+    /// encryption config (no Org Root Key required).
+    pub fn trusted_readers_url(&self) -> String {
+        format!("{}/agent/trusted-readers", self.server_url.trim_end_matches('/'))
+    }
+
     /// Produce an effective config whose `[usb]` section has the synced
     /// trusted destinations merged in (encrypt-on-write M6). The
     /// console-authored whitelist takes precedence (first-match-wins) and any
@@ -674,6 +700,20 @@ impl Config {
     pub fn with_synced_destinations(&self, dests: &[SyncedDestination]) -> Config {
         let mut merged = self.clone();
         merged.usb = merge_into_usb(&self.usb, dests);
+        merged
+    }
+
+    /// Produce an effective config whose sanctioned-reader allowlist is the
+    /// UNION of the local `[[trusted_readers]]` and the console-authored readers
+    /// synced over mTLS (read-deny allowlist posture). Union is correct: a reader
+    /// trusted either locally or centrally is trusted. Pure — a clone with the
+    /// synced rules appended; everything else is unchanged.
+    pub fn with_synced_readers(&self, readers: &[SyncedReader]) -> Config {
+        if readers.is_empty() {
+            return self.clone();
+        }
+        let mut merged = self.clone();
+        merged.trusted_readers.extend(readers.iter().map(SyncedReader::to_rule));
         merged
     }
 

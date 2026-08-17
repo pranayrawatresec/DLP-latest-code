@@ -7,9 +7,9 @@ transfers non-sensitive files normally. This is the only content-aware way to st
 / VNC / C2 file exfil, because the wire is encrypted/pinned/P2P; the file *read* is the one plaintext
 chokepoint on the endpoint.
 
-This is a distinct enforcement from read-taint. Read-taint = *let the read happen, then block the
-reader's egress* (fails against multi-process tools on established connections). Read-deny = *don't let
-the exfil tool obtain the bytes at all* — no multi-process problem, no async race, no encryption problem.
+Read-deny = *don't let the exfil tool obtain the bytes at all* — no multi-process problem, no
+async race, no encryption problem. (An earlier read-taint layer — let the read happen, then cut
+the reader's network — was removed 2026-08-13; read-deny is the sole read-side enforcement.)
 
 Everything is gated by a registry switch (`ExfilReadBlockEnabled`, default 0 = off).
 
@@ -35,7 +35,7 @@ it (fast, spinlock, at ≤DISPATCH). A PID is an exfil channel if EITHER:
 
 The agent recomputes the set on a short interval (process enum + `GetExtendedTcpTable`) and pushes the
 full set to the driver via a new `DLP_EXFIL_UPDATE` message (full-replace, bounded to
-`DLP_EXFIL_MAX`). Kernel storage mirrors the taint ring exactly (KSPIN_LOCK, epoch stamp, PID+CreateTime
+`DLP_EXFIL_MAX`). Kernel storage mirrors the BadHash ring exactly (KSPIN_LOCK, epoch stamp, PID+CreateTime
 reuse guard). Process-exit `DlpCreateProcessNotify` also removes exited PIDs (defence in depth).
 
 Rationale for user-mode ownership: signature matching + TCP-table correlation are trivial in user mode
@@ -81,7 +81,7 @@ action Blocked) via the existing up-call incident path.
 - **IRQL:** all fingerprint/read/up-call work is gated behind `DlpShouldSkip` (PASSIVE + top-level-IRP
   NULL). The exfil-set lookup is a bounded spinlocked scan, safe at ≤DISPATCH.
 - **Re-entrancy:** the driver's own `FltReadFile` is skipped (System PID / top-level IRP), exactly like
-  the write path and the read-taint worker.
+  the write path.
 - **No deadlock:** the up-call uses the existing bounded timeout + circuit breaker; a wedged agent
   fails-safe (deny per `ExfilReadFailBlock`, default deny for exfil channels) and never hangs a read
   beyond the ceiling.
@@ -105,7 +105,7 @@ action Blocked) via the existing up-call incident path.
 ## 8. Config / registry
 - `ExfilReadBlockEnabled` (DWORD, default 0) — master switch.
 - `ExfilReadFailBlock` (DWORD, default 1) — deny on unverifiable content for an exfil process.
-- Reuses `[kguard] scan_fixed` + `watch_paths` for scope (same as read-taint).
+- Reuses `[kguard] scan_fixed` + `watch_paths` for scope.
 
 ## 9. Message contract (user -> kernel)
 `DLP_EXFIL_UPDATE` — its own version, full-replace, bounded array. Independent of `DLP_MSG_VERSION`

@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import { useSelector } from 'react-redux'
 import { selectUser } from '../../store/authSlice'
-import { ShieldIcon, HomeIcon, KeyIcon, MonitorIcon, UsersIcon, LogoutIcon, DocumentIcon, AlertIcon, UsbIcon } from '../ui/Icons'
+import { ShieldIcon, HomeIcon, KeyIcon, MonitorIcon, UsersIcon, LogoutIcon, DocumentIcon, AlertIcon, UsbIcon, AppWindowIcon } from '../ui/Icons'
 
 // Nav config — each item declares the permission it needs (null = always).
 const NAV = [
@@ -9,6 +9,7 @@ const NAV = [
   { to: '/incidents', label: 'Incidents', icon: AlertIcon, permission: 'incidents.read_metadata' },
   { to: '/protected-documents', label: 'Protected documents', icon: DocumentIcon, permission: 'protect:read' },
   { to: '/trusted-destinations', label: 'Trusted USB devices', icon: UsbIcon, permission: 'trusted_destinations:read' },
+  { to: '/trusted-readers', label: 'Trusted applications', icon: AppWindowIcon, permission: 'trusted_readers:read' },
   { to: '/agents', label: 'Agents', icon: MonitorIcon, permission: 'agents.read' },
   { to: '/enrollment-tokens', label: 'Enrollment tokens', icon: KeyIcon, permission: 'enrollment.manage' },
   { to: '/administrators', label: 'Administrators', icon: UsersIcon, permission: 'users.manage' },

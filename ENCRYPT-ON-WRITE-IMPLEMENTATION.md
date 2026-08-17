@@ -82,7 +82,7 @@ dlp-agent/                  Rust agent (runs on every endpoint)
 dlp-browser-ext/            MV3 extension: background.js, content.js, inject.js —
                             intercepts <input type=file> / drag-drop / fetch uploads,
                             calls the native host, blocks on `block`.
-dlp-minifilter/             Kernel driver (C): dlpflt.c/.h, comms.c, wfpcallout.c.
+dlp-minifilter/             Kernel driver (C): dlpflt.c/.h, comms.c.
                             Reads file content IN-KERNEL, ships ≤4 MiB over the port,
                             quarantines on BLOCK. Test-signing + reboot to load —
                             kernel changes are a LATER milestone (M8), not v1.

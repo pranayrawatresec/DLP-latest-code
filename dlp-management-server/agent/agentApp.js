@@ -343,6 +343,34 @@ app.get('/agent/trusted-config', async (req, res, next) => {
   }
 });
 
+// --- GET /agent/trusted-readers ----------------------------------------
+// mTLS. Delivers the sanctioned-reader allowlist for the read-deny "allowlist
+// posture" — the applications endpoints may let read sensitive content locally.
+// Metadata only ({matchType, value}); NO secrets, so this is independent of the
+// Org Root Key (a site can run read-deny without configuring encryption). The
+// agent treats every process NOT matching one of these as an untrusted reader.
+app.get('/agent/trusted-readers', async (req, res, next) => {
+  try {
+    const agent = await requireKnownAgent(req, res, 'agent-readers');
+    if (!agent) return;
+
+    const { rows } = await pool.query(
+      `select match_type, value from trusted_readers order by created_at desc, id desc`
+    );
+    const readers = rows.map((row) => ({ matchType: row.match_type, value: row.value }));
+
+    // One audit row per delivery — the allowlist is policy; who received it and
+    // how large it was is worth the trail (values are metadata, never secrets).
+    await audit('agent-readers', 'agent.readers_delivered', agent.id, {
+      readerCount: readers.length,
+    });
+
+    return res.status(200).json({ readers });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- POST /agent/incidents ---------------------------------------------
 // An agent reports a detection. The verdict carries hashes and ids ONLY —
 // never captured file content (evidence blobs are a later phase). Identity

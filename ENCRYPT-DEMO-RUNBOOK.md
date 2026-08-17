@@ -151,8 +151,8 @@ New 2026-08-12: `usb-guard` (the kernel minifilter client) and `usb-monitor` (th
    without this the guard scanned the sealer's own `.dlpenc.tmp` writes, read the ciphertext as
    Unreadable, and under `[kguard] fail_block = true` quarantined the envelope it had just been
    given. An envelope is already the strongest protected state; scanning ciphertext is noise, and
-   reading an envelope must never taint the reader either.
-2. **Whitelist-aware write scans.** For WRITE scans only (read-taint is untouched), the guard
+   reading an envelope must never be denied either.
+2. **Whitelist-aware write scans.** For WRITE scans only (read-deny is untouched), the guard
    resolves the target volume's device identity (NT path → drive letter via a cached
    `QueryDosDeviceW` map → the same IOCTL identity lookup the monitor uses) and evaluates the same
    `[[usb.rules]]` matrix. On an `action = "encrypt"` destination it applies `decide_seal` and
@@ -173,7 +173,7 @@ Gates and honest limitations:
 
 - **The override only applies when `[usb] enabled = true`.** With the monitor channel off there is
   nobody to seal — an allow-pending-seal would just strand plaintext on the stick — so the guard's
-  behaviour is exactly as before (fail secure). Non-encrypt devices, read-taint scans, and volumes
+  behaviour is exactly as before (fail secure). Non-encrypt devices, read scans, and volumes
   whose device cannot be resolved also keep today's behaviour exactly; the guard never guesses a
   whitelist match.
 - **The settle-window plaintext gap still applies.** Between the kernel's allow and the monitor's

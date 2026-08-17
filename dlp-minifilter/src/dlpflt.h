@@ -44,8 +44,8 @@ and are consumed by dlpflt.c and comms.c only.
  * the Rust mirror declares and size-locks). Backward compatible: an old client
  * ignores Reserved (still scores + replies), and Reason==0 is the legacy value.
  *   WRITE = the original write/quarantine scan (the old zero value of Reserved)
- *   READ  = a read-taint scan (the driver taints the PID on a BLOCK reply and
- *           the new client additionally tears down the PID's open TCP flows).  */
+ *   READ  = a read-deny classify scan (an exfil-channel PID is reading a file;
+ *           a BLOCK reply makes the driver deny the read / the mapping).      */
 #define DLP_REASON_WRITE     0
 #define DLP_REASON_READ      1
 
@@ -223,10 +223,6 @@ typedef struct _DLP_STREAM_CONTEXT {
     volatile LONG Dirty;            /* data written, or renamed-in          */
     volatile LONG Inspected;        /* CLEANUP already handled this stream  */
     volatile LONG Epoch;            /* gDlpData.Epoch snapshot (item 4)     */
-    /* Read-taint: 0 = unseen, 1 = the first substantial read of this stream
-     * has already been claimed and enqueued for an async taint scan, so later
-     * reads of the same stream do NOT re-enqueue (claim-once, interlocked). */
-    volatile LONG ReadScanState;
     /* Read-deny per-open verdict cache (DlpPreRead). A file transfer issues many
      * reads on ONE open; we classify the content ONCE and cache the verdict here
      * so every subsequent read of the same open is an O(1) branch (no re-read, no
@@ -261,45 +257,17 @@ typedef struct _DLP_INSTANCE_CONTEXT {
 } DLP_INSTANCE_CONTEXT, *PDLP_INSTANCE_CONTEXT;
 
 /* ========================================================================= *
- *  Read-taint network-egress blocking (READTAINT-DECISION-BRIEF / LLD)      *
+ *  Read-deny file-id caches (read-deny-LLD)                                 *
  *                                                                           *
- *  On a process's first substantial READ of a watched file we enqueue an    *
- *  async scan; a BLOCK verdict TAINTS the requestor PID. A WFP callout at    *
- *  ALE_AUTH_CONNECT_V4/V6 then blocks that tainted PID's outbound            *
- *  connections -- content-blind, so it works over TLS / AnyDesk / a         *
- *  malware socket. All state hangs off gDlpData so its lifetime tracks the   *
- *  driver. Everything below is gated by ReadTaintEnabled (registry, default  *
- *  0 = today's FS-only behavior).                                           *
+ *  Bounds. Both caches mirror the BadHash ring exactly (bounded, spinlock,  *
+ *  epoch-stamped).                                                          *
  * ------------------------------------------------------------------------- */
-
-/* Master switch (registry DWORD "ReadTaintEnabled", read in DriverEntry). */
-#define DLP_READTAINT_DISABLED   0
-#define DLP_READTAINT_ENABLED    1
-
-/* What a tainted PID's egress does (registry DWORD "TaintedEgressPolicy"). */
-#define DLP_TEP_BLOCK_ALL        0   /* block ALL outbound (default, fail-secure) */
-#define DLP_TEP_BLOCK_NONLOCAL   1   /* permit RFC1918/loopback, block the rest   */
-
-/* Bounds. The taint table and sensfile cache mirror the BadHash ring exactly
- * (bounded, spinlock, epoch). The scan queue is bounded so a read flood can
- * never grow non-paged pool without limit (excess jobs are dropped = a miss,
- * fail-safe toward not deadlocking). */
-#define DLP_TAINT_MAX            1024
 #define DLP_SENSFILE_MAX         512
 /* Known-clean file-id cache (read-deny). Larger than SensFile: an exfil PID
  * (e.g. a browser holding a public connection) opens many innocent files under
  * the watch scope; caching "clean" cross-open bounds the classify up-call load to
  * one call per distinct file instead of one per open. */
 #define DLP_CLEANFILE_MAX        4096
-#define DLP_SCAN_QUEUE_MAX       256
-
-/* Only the first read of at least this many bytes arms a scan (substantiality
- * gate) -- a 1-byte probe read does not enqueue a 4 MiB scan job. */
-#define DLP_READ_MIN             512
-
-/* Pool tags ('DlpT'/'DlpJ' -> 'TplD'/'JplD' on a little-endian tag dump). */
-#define DLP_TAINT_TAG            'TplD'
-#define DLP_JOB_TAG              'JplD'
 
 /* ---- Read-deny (content-aware exfil-tool read blocking, read-deny-LLD) ---- *
  * Master switch + fail-mode (registry, read in DriverEntry). Default OFF. */
@@ -307,11 +275,11 @@ typedef struct _DLP_INSTANCE_CONTEXT {
 #define DLP_EXFILREAD_ENABLED    1
 
 /* Kernel exfil-PID table size (holds the agent-pushed set). Bounded, spinlock,
- * epoch — mirrors the taint ring. */
+ * epoch — mirrors the BadHash ring. */
 #define DLP_EXFIL_MAX            1024
 #define DLP_EXFIL_TAG            'XplD'   /* 'DlpX' */
 
-/* One exfil-channel PID (agent-pushed). Epoch-stamped like the taint ring so a
+/* One exfil-channel PID (agent-pushed). Epoch-stamped like the BadHash ring so a
  * full-replace bumps the epoch and the old set reads as absent with no walk. */
 typedef struct _DLP_EXFIL_ENTRY {
     volatile LONG Pid;          /* exfil-channel PID (0 = empty slot)            */
@@ -319,44 +287,16 @@ typedef struct _DLP_EXFIL_ENTRY {
     BOOLEAN       Valid;
 } DLP_EXFIL_ENTRY, *PDLP_EXFIL_ENTRY;
 
-/* One tainted PID. Mirrors DLP_BADHASH_ENTRY: stamped with the TaintEpoch it
- * was inserted under; a stale-epoch entry reads as absent (admin reset bumps
- * the epoch). CreateTime is the process create-time, a PID-reuse guard. */
-typedef struct _DLP_TAINT_ENTRY {
-    volatile LONG Pid;          /* tainted requestor PID (0 = empty slot)        */
-    LONG          TaintEpoch;   /* gDlpData.TaintEpoch snapshot at insert        */
-    ULONGLONG     CreateTime;   /* PsGetProcessCreateTimeQuadPart (reuse guard)  */
-    BOOLEAN       Valid;
-} DLP_TAINT_ENTRY, *PDLP_TAINT_ENTRY;
-
 /* One known-sensitive file id (cheapest repeat-read path -- no read, no
  * up-call). Stamped with the CONTENT-policy Epoch (so a policy reload via
  * agent reconnect DOES invalidate cached sensitivity, which is correct for a
- * content verdict -- unlike taint, which deliberately persists). */
+ * content verdict). */
 typedef struct _DLP_SENSFILE_ENTRY {
     ULONGLONG FileId;           /* FILE_INTERNAL_INFORMATION.IndexNumber         */
     ULONGLONG VolumeId;         /* per-instance discriminator (0 = unknown)      */
     LONG      Epoch;            /* gDlpData.Epoch snapshot (content policy epoch) */
     BOOLEAN   Valid;
 } DLP_SENSFILE_ENTRY, *PDLP_SENSFILE_ENTRY;
-
-/* One queued async scan. Holds a referenced FILE_OBJECT + the instance so the
- * worker can FltReadFile at PASSIVE. The scan rundown (acquired at enqueue,
- * released by the worker per job) keeps the filter alive while a job runs. */
-typedef struct _DLP_SCAN_JOB {
-    LIST_ENTRY     Link;
-    PFLT_INSTANCE  Instance;    /* not separately referenced; scan rundown guards */
-    PFILE_OBJECT   FileObject;  /* ObReferenceObject'd at enqueue                 */
-    ULONG          Pid;
-    LONG           Epoch;       /* content-policy epoch snapshot                  */
-    /* Normalized file name captured at enqueue (DlpPostRead still holds the
-     * FLT_FILE_NAME_INFORMATION). The worker ships it in the up-call so the agent
-     * can pick its format extractor from the extension -- an EMPTY path made every
-     * read-taint scan come back Unreadable (never matched). Bytes, not NUL-term. */
-    WCHAR          Path[DLP_MAX_PATH_CHARS];
-    USHORT         PathLength;  /* valid bytes in Path (<= sizeof(Path))          */
-} DLP_SCAN_JOB, *PDLP_SCAN_JOB;
-
 
 /* Global driver state. Defined in dlpflt.c; the port fields are managed in
  * comms.c. */
@@ -415,19 +355,7 @@ typedef struct _DLP_FLT_DATA {
     volatile LONG  ConfigValid;     /* a valid DLP_CONFIG has been stored     */
     DLP_CONFIG     Config;          /* watch prefixes + ScanFixed/ScanNetwork */
 
-    /* ---- Read-taint (all gated by ReadTaintEnabled) --------------------- */
-
-    /* Master switch + tainted-egress policy (registry, read in DriverEntry). */
-    ULONG          ReadTaintEnabled;      /* DLP_READTAINT_* */
-    ULONG          TaintedEgressPolicy;   /* DLP_TEP_*       */
-
-    /* Taint table (mirrors the BadHash ring; written by worker/process-notify
-     * at PASSIVE, read by the WFP callout at <= DISPATCH under the spinlock). */
-    KSPIN_LOCK      TaintLock;
-    DLP_TAINT_ENTRY Taint[DLP_TAINT_MAX];
-    volatile LONG   TaintEpoch;   /* starts 1; bumped ONLY by DlpTaintResetAll   */
-    volatile LONG   TaintCount;   /* live entries (diagnostics / bounding)       */
-    LONG            TaintNext;    /* ring cursor used only when the table is full */
+    /* ---- Read-deny file-id caches ---------------------------------------- */
 
     /* Known-sensitive file-id cache. */
     KSPIN_LOCK         SensFileLock;
@@ -441,35 +369,6 @@ typedef struct _DLP_FLT_DATA {
     KSPIN_LOCK         CleanFileLock;
     DLP_SENSFILE_ENTRY CleanFile[DLP_CLEANFILE_MAX];
     LONG               CleanFileNext;     /* ring cursor                          */
-
-    /* Async scan queue + worker. */
-    KSPIN_LOCK      ScanQueueLock;
-    LIST_ENTRY      ScanQueue;
-    KSEMAPHORE      ScanSem;              /* signalled once per enqueue           */
-    volatile LONG   ScanQueueDepth;       /* bounded at DLP_SCAN_QUEUE_MAX        */
-    volatile LONG   ScanDropped;          /* jobs dropped under flood (diag)      */
-    PETHREAD        ScanThread;           /* referenced; Unload waits on it       */
-    HANDLE          ScanThreadHandle;
-    volatile LONG   ScanStop;             /* 1 => worker drains and exits         */
-    EX_RUNDOWN_REF  ScanRundown;          /* jobs hold it; Unload waits once      */
-    BOOLEAN         ScanRundownInit;
-
-    /* WFP callout state (wfpcallout.c). Each *Added/*Reg flag guards its own
-     * rollback so DlpWfpUnregister is idempotent. */
-    PDEVICE_OBJECT  WfpDevice;            /* IoCreateDevice (FwpsCalloutRegister) */
-    HANDLE          WfpEngine;            /* FwpmEngineOpen0 (non-dynamic)        */
-    UINT32          WfpCalloutIdV4;       /* FwpsCalloutRegister2 runtime id      */
-    UINT32          WfpCalloutIdV6;
-    UINT64          WfpFilterIdV4;        /* FwpmFilterAdd0 id (for delete)       */
-    UINT64          WfpFilterIdV6;
-    BOOLEAN         WfpCalloutV4Reg;      /* FwpsCalloutRegister2 done            */
-    BOOLEAN         WfpCalloutV6Reg;
-    BOOLEAN         WfpProviderAdded;
-    BOOLEAN         WfpSubLayerAdded;
-    BOOLEAN         WfpCalloutV4Added;    /* FwpmCalloutAdd0 done                 */
-    BOOLEAN         WfpCalloutV6Added;
-    BOOLEAN         WfpFilterV4Added;     /* FwpmFilterAdd0 done                  */
-    BOOLEAN         WfpFilterV6Added;
 
     /* Process-notify registration (PsSetCreateProcessNotifyRoutineEx). */
     BOOLEAN         ProcNotifyRegistered;
@@ -521,11 +420,6 @@ NTSTATUS DlpQueryVerdict(_In_ PUNICODE_STRING Path,
 /* Read FailMode from the driver's service registry path (DriverEntry). */
 VOID     DlpReadFailMode(_In_ PUNICODE_STRING RegistryPath);
 
-/* Read the read-taint knobs (ReadTaintEnabled, TaintedEgressPolicy) from the
- * service registry path (DriverEntry). Same pattern as DlpReadFailMode; both
- * default to disabled/block-all and are only overridden if present + valid. */
-VOID     DlpReadTaintPolicy(_In_ PUNICODE_STRING RegistryPath);
-
 /* Read the read-deny knobs (ExfilReadBlockEnabled, ExfilReadFailBlock) from the
  * service registry path (DriverEntry). Defaults: disabled + fail-block. */
 VOID     DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath);
@@ -552,15 +446,9 @@ BOOLEAN  DlpConfigScanFixed(VOID);
 BOOLEAN  DlpConfigPathIsWatched(_In_ PCUNICODE_STRING Path);
 
 
-/* ---- Read-taint: taint table + sensfile cache (dlpflt.c) -------------- *
- * All four taint functions mirror the BadHash ring (KSPIN_LOCK, epoch stamp,
- * ring cursor, dedup). DlpTaintLookup is the ONLY one called at <= DISPATCH
- * (from the WFP callout); the rest run at PASSIVE (worker / process-notify). */
-BOOLEAN  DlpTaintLookup(_In_ ULONG Pid);
-VOID     DlpTaintAdd(_In_ ULONG Pid);
-VOID     DlpTaintRemove(_In_ ULONG Pid);
-VOID     DlpTaintResetAll(VOID);           /* admin "reset taint": epoch bump   */
-
+/* ---- Read-deny: known-sensitive file-id cache (dlpflt.c) -------------- *
+ * Mirrors the BadHash ring (KSPIN_LOCK, epoch stamp, ring cursor, dedup).
+ * PASSIVE-level callers only. */
 BOOLEAN  DlpSensFileLookup(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpSensFileInsert(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 
@@ -577,23 +465,12 @@ BOOLEAN  DlpExfilLookup(_In_ ULONG Pid);
 VOID     DlpExfilReplace(_In_reads_(Count) const ULONG *Pids, _In_ ULONG Count);
 VOID     DlpExfilRemove(_In_ ULONG Pid);
 
-/* ---- Read-taint: async scan worker + process-notify (dlpflt.c) -------- */
-NTSTATUS DlpStartScanWorker(VOID);
-VOID     DlpStopScanWorker(VOID);
-VOID     DlpScanEnqueue(_Inout_ __drv_aliasesMem PDLP_SCAN_JOB Job);
-
-/* Process-create/-exit notify: untaint a PID on process exit. Registered with
+/* Process-create/-exit notify: drop an exited PID from the exfil set (closes
+ * the PID-reuse window between agent pushes). Registered with
  * PsSetCreateProcessNotifyRoutineEx (needs /INTEGRITYCHECK, already present). */
 VOID     DlpCreateProcessNotify(_In_ PEPROCESS Process,
                                 _In_ HANDLE ProcessId,
                                 _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
-
-/* ---- Read-taint: WFP callout (wfpcallout.c) --------------------------- *
- * Register in DriverEntry AFTER FltStartFiltering (gated on ReadTaintEnabled);
- * unregister in Unload with the filters-first / callout-drain ordering. A
- * registration failure is non-fatal to the driver (FS protection survives). */
-NTSTATUS DlpWfpRegister(VOID);
-VOID     DlpWfpUnregister(VOID);
 
 #endif /* _KERNEL_MODE */
 

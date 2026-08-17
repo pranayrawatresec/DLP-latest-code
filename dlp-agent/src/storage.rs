@@ -13,6 +13,7 @@ const POLICY_FILE: &str = "cached-policy.json";
 const INDEX_FILE: &str = "index.dlpx"; // latest VERIFIED detection index bundle
 const KEYRING_FILE: &str = "keyring.sealed"; // DPAPI-sealed (machine scope) KEK keyring
 const TRUSTED_DEST_FILE: &str = "trusted-destinations.json"; // METADATA ONLY — never key bytes
+const TRUSTED_READERS_FILE: &str = "trusted-readers.json"; // sanctioned-reader allowlist (metadata)
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentMeta {
@@ -149,6 +150,24 @@ impl Storage {
     /// the agent has never synced one. Parsed by `trustsync::parse_destinations`.
     pub fn load_trusted_destinations(&self) -> Option<Vec<u8>> {
         std::fs::read(self.path(TRUSTED_DEST_FILE)).ok()
+    }
+
+    /// Persist the synced sanctioned-reader allowlist (read-deny allowlist
+    /// posture). `json` is `trustedreaders::serialize_readers` output —
+    /// `{matchType, value}` metadata only, no secrets. Stored in the clear like
+    /// the cached policy. Fail-soft: on an unreachable server the agent reuses
+    /// this last-persisted list, so a curated allowlist keeps enforcing offline.
+    pub fn store_trusted_readers(&self, json: &[u8]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        std::fs::write(self.path(TRUSTED_READERS_FILE), json)
+            .context("writing trusted readers")
+    }
+
+    /// Raw bytes of the last-persisted trusted-readers file, or `None` when the
+    /// agent has never synced one. Parsed by `trustedreaders::parse_readers`.
+    pub fn load_trusted_readers(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.path(TRUSTED_READERS_FILE)).ok()
     }
 }
 

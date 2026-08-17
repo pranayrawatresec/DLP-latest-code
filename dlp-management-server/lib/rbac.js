@@ -16,6 +16,7 @@ const ROLE_PERMISSIONS = {
     'protect:read', // view protected-document registry (metadata, never content)
     'encryption_keys:manage', // create/rotate/destroy KEKs (metadata only — never plaintext key material)
     'trusted_destinations:read', // see which destinations reference which key
+    'trusted_readers:read', // review the sanctioned-reader allowlist (read-deny policy)
   ],
   policy_author: [
     'policies.read',
@@ -24,6 +25,8 @@ const ROLE_PERMISSIONS = {
     'protect:read',
     'trusted_destinations:read', // encrypt-on-write whitelist is policy
     'trusted_destinations:write',
+    'trusted_readers:read', // the sanctioned-reader allowlist is policy
+    'trusted_readers:write',
   ],
   incident_reviewer: [
     'incidents.read',
@@ -39,6 +42,7 @@ const ROLE_PERMISSIONS = {
     'license.read',
     'protect:read',
     'trusted_destinations:read', // review the whitelist + key states (metadata only)
+    'trusted_readers:read', // review the sanctioned-reader allowlist (metadata only)
   ],
 };
 
