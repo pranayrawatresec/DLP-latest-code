@@ -1,0 +1,161 @@
+<title>DLP Setup &amp; Deployment</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#EBEEF3; --surface:#FFFFFF; --surface-2:#F4F6FA; --code-bg:#EEF1F6;
+    --ink:#1B2130; --muted:#565F70; --faint:#828C9C; --border:#DCE2EB;
+    --accent:#2E57D0; --accent-ink:#20439E; --good:#238059; --good-bg:#E7F3ED;
+    --warn:#B5720F; --warn-bg:#FAF1E2;
+    --shadow:0 1px 2px rgba(20,28,45,.04),0 3px 12px rgba(20,28,45,.05);
+    --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,"Cascadia Code","SFMono-Regular","Consolas","Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+    --bg:#0F131A; --surface:#181D26; --surface-2:#1E242E; --code-bg:#12161E;
+    --ink:#E6EBF2; --muted:#9AA4B4; --faint:#69737F; --border:#2A313D;
+    --accent:#7396F2; --accent-ink:#9DB4F6; --good:#57C08C; --good-bg:#132219;
+    --warn:#E0A54A; --warn-bg:#271F13; --shadow:0 1px 2px rgba(0,0,0,.25),0 3px 14px rgba(0,0,0,.28);
+  }}
+  :root[data-theme="dark"]{
+    --bg:#0F131A; --surface:#181D26; --surface-2:#1E242E; --code-bg:#12161E;
+    --ink:#E6EBF2; --muted:#9AA4B4; --faint:#69737F; --border:#2A313D;
+    --accent:#7396F2; --accent-ink:#9DB4F6; --good:#57C08C; --good-bg:#132219;
+    --warn:#E0A54A; --warn-bg:#271F13; --shadow:0 1px 2px rgba(0,0,0,.25),0 3px 14px rgba(0,0,0,.28);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-sans);line-height:1.62}
+  .wrap{max-width:880px;margin:0 auto;padding:clamp(20px,4vw,52px) clamp(14px,4vw,36px) 96px}
+  header.mast{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:8px}
+  .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  h1{font-size:clamp(1.8rem,4vw,2.5rem);line-height:1.08;margin:.35em 0 .3em;letter-spacing:-.02em;font-weight:700}
+  .lede{font-size:1.03rem;color:var(--muted);max-width:68ch;margin:0}
+  .lede strong{color:var(--ink)}
+  .callout{margin:22px 0 6px;padding:16px 18px;border-radius:12px;background:var(--good-bg);border:1px solid color-mix(in srgb,var(--good) 30%,transparent);box-shadow:var(--shadow)}
+  .callout h2{margin:0 0 5px;font-size:1.05rem;color:var(--good)}
+  .callout p{margin:0;font-size:.95rem;color:var(--ink)}
+  .callout.warn{background:var(--warn-bg);border-color:color-mix(in srgb,var(--warn) 32%,transparent)}
+  .callout.warn h2{color:var(--warn)}
+  h2.sec{font-size:1.3rem;margin:40px 0 6px;letter-spacing:-.01em;display:flex;align-items:baseline;gap:11px}
+  h2.sec .n{font-family:var(--font-mono);font-size:.82rem;color:var(--faint)}
+  .sub{color:var(--muted);font-size:.93rem;margin:0 0 16px;max-width:72ch}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:6px 22px;box-shadow:var(--shadow);margin-bottom:14px}
+  ol.steps{margin:0;padding:0;list-style:none;counter-reset:s}
+  ol.steps>li{counter-increment:s;padding:18px 0 18px 46px;position:relative;border-bottom:1px solid var(--border)}
+  ol.steps>li:last-child{border-bottom:none}
+  ol.steps>li::before{content:counter(s);position:absolute;left:0;top:16px;width:30px;height:30px;border-radius:50%;background:var(--accent);color:#fff;font-family:var(--font-mono);font-weight:700;font-size:.85rem;display:flex;align-items:center;justify-content:center}
+  .st{font-weight:650;font-size:1rem;margin-bottom:4px}
+  ol.steps p{margin:5px 0;font-size:.93rem;color:var(--muted)}
+  ol.steps p .ui{color:var(--ink);font-weight:600}
+  code{font-family:var(--font-mono);font-size:.84em;background:var(--code-bg);padding:1.5px 6px;border-radius:5px;border:1px solid var(--border)}
+  pre{background:var(--code-bg);border:1px solid var(--border);border-radius:9px;padding:12px 14px;overflow-x:auto;font-family:var(--font-mono);font-size:.8rem;line-height:1.5;color:var(--ink);margin:8px 0}
+  .pill{display:inline-block;font-family:var(--font-mono);font-size:.66rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;border-radius:6px;background:var(--surface-2);border:1px solid var(--border);color:var(--muted)}
+  .pill.dev{background:var(--warn-bg);color:var(--warn);border-color:transparent}
+  .pill.auto{background:var(--good-bg);color:var(--good);border-color:transparent}
+  ul.plain{margin:6px 0;padding-left:20px;font-size:.93rem;color:var(--muted)}
+  ul.plain li{margin:4px 0}
+  ul.plain b{color:var(--ink)}
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--border);color:var(--faint);font-size:.8rem;font-family:var(--font-mono)}
+  a{color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">Deployment &amp; Operations</div>
+    <h1>DLP Setup &amp; Deployment</h1>
+    <p class="lede">How the endpoint DLP is deployed and operated. The guiding rule: <strong>the administrator only ever uses the console — never a command line.</strong> This guide covers the one-time setup, how an endpoint self-configures, and how to turn on read-deny safely.</p>
+  </header>
+
+  <div class="callout">
+    <h2>The operating model in one line</h2>
+    <p>The admin sets policy in the <strong>console</strong> → the server stores it → each endpoint's agent (running as <strong>LocalSystem</strong>) pulls it at check-in and <strong>applies it to the kernel driver itself</strong> — registry mode/fail knobs and the volume attach. No <code>reg add</code>, no <code>fltmc</code>, no editing files on endpoints.</p>
+  </div>
+
+  <!-- 1. SERVER -->
+  <h2 class="sec"><span class="n">01</span> Management server (one-time, on-premises)</h2>
+  <p class="sub">Runs on the customer's premises; works fully air-gapped. Node + PostgreSQL.</p>
+  <div class="card">
+    <ol class="steps">
+      <li><div class="st">Start PostgreSQL &amp; run migrations</div>
+        <p>The database schema (including the read-deny policy and trusted-applications tables) is created by the migration runner.</p>
+        <pre>docker compose up -d        # PostgreSQL 17 (dev)
+npm run migrate             # apply schema migrations</pre></li>
+      <li><div class="st">Create the first administrator</div>
+        <p>No open signup ever — the first <span class="ui">sysadmin</span> is created by a CLI command on the server box, then everyone else is managed in the console under <span class="ui">Administrators</span>.</p></li>
+      <li><div class="st">Start the server</div>
+        <p>It hosts the admin console (browser) and the agents' mutual-TLS endpoint. <code>npm start</code>.</p></li>
+    </ol>
+  </div>
+
+  <!-- 2. ENDPOINT -->
+  <h2 class="sec"><span class="n">02</span> Enrolling an endpoint</h2>
+  <p class="sub">Done once per PC, at install time. After this the machine is fully console-managed.</p>
+  <div class="card">
+    <ol class="steps">
+      <li><div class="st">Create an enrollment token in the console</div>
+        <p><span class="ui">Enrollment tokens → Create</span> — one token per rollout wave, sized to the number of PCs.</p></li>
+      <li><div class="st">Install the agent on the PC <span class="pill">installer</span></div>
+        <p>The MSI drops the agent, the CA certificate, and the signed driver; registers the driver and the <b>DLPAgent LocalSystem service</b>; and enrolls using the token (exchanges it for a client certificate). This is the only step that runs on the PC, and the installer does it — the operator does not open a shell.</p></li>
+      <li><div class="st">The agent self-configures <span class="pill auto">automatic</span></div>
+        <p>On first check-in the service pulls the fingerprint bundle, the trusted-applications list, and the <b>read-deny policy</b>, and applies them. From here everything is driven from the console.</p></li>
+    </ol>
+  </div>
+
+  <!-- 3. READ-DENY -->
+  <h2 class="sec"><span class="n">03</span> Turning on read-deny (all in the console)</h2>
+  <p class="sub">Read-deny ships <b>off</b> — protection is inert until an admin turns it on. Roll it out safely, monitor → measure → enforce.</p>
+  <div class="callout warn">
+    <h2>Important: read-deny is off until you enable it</h2>
+    <p>The seeded read-deny policy is <code>mode = off</code>. The agent applies whatever the console says — so on a fresh system, read-deny does nothing until an admin sets the mode. (This is why setting a driver registry knob by hand has no lasting effect: the agent re-applies the console policy at the next check-in.)</p>
+  </div>
+  <div class="card">
+    <ol class="steps">
+      <li><div class="st">Curate <span class="ui">Trusted applications</span></div>
+        <p>Add the apps allowed to read sensitive files: Windows (path <code>C:\Windows</code>), Office, your PDF reader/browser, antivirus, backup, the DLP agent. Anything not listed is treated as untrusted under the allowlist posture.</p></li>
+      <li><div class="st">Open <span class="ui">Read-deny policy</span> and set the scope</div>
+        <p>Choose the <span class="ui">posture</span> (Allowlist recommended) and the <span class="ui">scope</span> — removable USB is always protected; toggle the fixed drive and pick watched folders (e.g. <code>\Users</code> = all user files, or the whole <code>\</code>).</p></li>
+      <li><div class="st">Set mode to <span class="ui">Monitor</span></div>
+        <p>The endpoints detect and <b>report what they would block, but allow it</b> — nothing breaks. Watch the incident feed for <code>exfil-read-would-block</code> entries.</p></li>
+      <li><div class="st">Review, fill gaps, then switch to <span class="ui">Enforce</span></div>
+        <p>Every would-block that is a legitimate app → add it to Trusted applications. When the would-block feed is quiet, flip the mode to <b>Enforce</b>. The agent applies the change; no reboot or shell.</p></li>
+    </ol>
+  </div>
+
+  <!-- 4. WHAT THE AGENT DOES -->
+  <h2 class="sec"><span class="n">04</span> What the agent does for you (no CLI)</h2>
+  <p class="sub">The manual commands used during development map to these automatic agent actions in production.</p>
+  <div class="card" style="padding:18px 22px">
+    <ul class="plain">
+      <li><b>Sets the driver mode / fail behaviour</b> — the agent writes the driver's registry values from the console policy (replaces <code>reg add … ExfilReadBlockEnabled</code>).</li>
+      <li><b>Sends the watched folders</b> to the driver over its config channel.</li>
+      <li><b>Attaches the driver to C:</b> via the filter-manager API when fixed-drive scope is on (replaces <code>fltmc attach dlpflt C:</code>).</li>
+      <li><b>Runs as LocalSystem</b>, so it can see SYSTEM-context processes (a remote tool's privileged helper) and set the driver — this is why the service, not a hand-run guard, is the production form.</li>
+      <li><b>Fails secure offline</b> — if the server is briefly unreachable, the agent keeps enforcing the last policy it saw.</li>
+    </ul>
+  </div>
+
+  <!-- 5. DEV/TEST -->
+  <h2 class="sec"><span class="n">05</span> Developer / test signing <span class="pill dev">dev only</span></h2>
+  <p class="sub">For a test VM only — NOT production. Production drivers are signed through the Windows Hardware Dev Center (attestation/EV), not a self-signed cert.</p>
+  <div class="card" style="padding:18px 22px">
+    <ul class="plain">
+      <li>Create + trust a test code-signing cert on the test machine (<code>tools\make-testcert.ps1</code>), then <code>bcdedit /set testsigning on</code> and reboot.</li>
+      <li>Build + sign the driver (<code>build\build-driver.bat</code>, <code>tools\sign-driver.ps1</code>); load it with <code>fltmc load dlpflt</code>.</li>
+      <li>These CLI steps exist so engineers can verify the kernel engine in isolation. <b>On a customer PC the installer + agent do all of this</b> — the admin never touches the command line.</li>
+    </ul>
+  </div>
+
+  <!-- KEY NOTES -->
+  <h2 class="sec"><span class="n">06</span> Operational notes to remember</h2>
+  <div class="card" style="padding:18px 22px">
+    <ul class="plain">
+      <li><b>Policy default is off.</b> A freshly enrolled PC does not enforce read-deny until an admin sets the mode in the console.</li>
+      <li><b>Curate the allowlist before enforcing.</b> Too narrow a list denies legitimate apps their own reads — always run Monitor first.</li>
+      <li><b>One global policy today.</b> The read-deny policy currently applies to every endpoint; per-machine / per-group targeting is a planned addition.</li>
+      <li><b>Live-apply timing.</b> A mid-run mode change applies at the endpoint's next check-in / service cycle (making it instant is a small planned refinement).</li>
+      <li><b>Everything is audited.</b> Every console policy change and every endpoint block (including repeat blocks) is written to the tamper-evident audit log.</li>
+    </ul>
+  </div>
+
+  <footer>DLP setup &amp; deployment · console-driven, zero-CLI operating model · dev signing is test-only</footer>
+</div>
