@@ -156,9 +156,10 @@
   </div>
 
   <div class="progress">
-    <h2>Progress — all 4 blockers closed, 14 findings fixed</h2>
-    <p><b>Fixed &amp; verified:</b> <span class="mono">#1, #2, #3, #4, #5, #6, #10, #11, #12, #15, L1, L2, L4, P1</span> — plus a <b>content-change laundering bug</b> found and fixed alongside #2. The kernel set (#2, #4, #5 monitor, #6, content-change) is <b>runtime-verified on the VM</b>: OPORD blocked in enforce, allowed-but-reported in monitor, clean files allowed, a file overwritten with sensitive content flips clean→blocked, writes unaffected, no crash. <b>#5 monitor mode now exists</b> (driver third-state + agent would-block labelling); its one-click console toggle is folded into <span class="mono">C4</span>.</p>
-    <p><b>Remaining:</b> cache-hit audit (<span class="mono">#7</span>), reboot-persist (<span class="mono">#8</span>), central-authoritative allowlist (<span class="mono">#9</span>), open-deny perf (<span class="mono">#13</span>), revocation (<span class="mono">#14</span>), remaining low items, the console settings pages (<span class="mono">C1–C4</span>), and productionization (<span class="mono">P2, P3, P5, P6, P7</span>).</p>
+    <h2>Progress — all 4 blockers closed, plus monitor mode &amp; the console settings</h2>
+    <p><b>Fixed &amp; verified:</b> <span class="mono">#1, #2, #3, #4, #5, #6, #10, #11, #12, #15, L1, L2, L4, P1</span> — plus a <b>content-change laundering bug</b> found and fixed alongside #2. The kernel set (#2, #4, #5 monitor, #6, content-change) is <b>runtime-verified on the VM</b>: OPORD blocked in enforce, allowed-but-reported in monitor, clean files allowed, a file overwritten with sensitive content flips clean→blocked, writes unaffected, no crash.</p>
+    <p><b>Console settings now exist (<span class="mono">C1–C4</span> fixed):</b> a "Read-deny policy" page (mode Off/Monitor/Enforce, posture, watched-folders, fail behaviour) → server API → the agent applies it to the driver in code (registry knobs + <code>FilterAttach</code>), so the admin configures everything in the UI — <b>no command line.</b> One refinement left: making a mid-run toggle apply instantly (currently at the next check-in/restart).</p>
+    <p><b>Remaining:</b> cache-hit audit (<span class="mono">#7</span>), reboot-persist (<span class="mono">#8</span>), central-authoritative allowlist (<span class="mono">#9</span>), open-deny perf (<span class="mono">#13</span>), revocation (<span class="mono">#14</span>), per-group targeting, remaining low items, and productionization (<span class="mono">P2, P3, P5, P6, P7</span>).</p>
   </div>
 
   <div class="legend">
@@ -287,36 +288,36 @@
   <div class="sec"><span class="dot" style="background:var(--accent)"></span><h2>Console coverage — still needs the command line</h2><span class="count">requirement: no CLI</span></div>
   <p class="sec-intro">Whitelisting applications works fully from the console (the <em>Trusted applications</em> page ✓). But the read-deny feature as a whole can't yet be <em>operated</em> from the UI — turning it on, choosing what it protects, and rolling it out still require editing config files and running commands on each endpoint. Confirmed by searching the whole server: it holds <strong>no read-deny settings at all</strong> — nothing for posture, on/off, or which folders to watch.</p>
 
-  <article class="finding high">
-    <div class="f-head"><span class="f-id">C1</span><h3 class="f-title">No way to turn read-deny on or off from the console</h3><span class="chip chip-high">High</span></div>
+  <article class="finding high done">
+    <div class="f-head"><span class="f-id">C1</span><h3 class="f-title">No way to turn read-deny on or off from the console</h3><span class="chip chip-high">High</span><span class="chip chip-fixed">✓ Fixed</span></div>
     <div class="f-meta"><span class="tag">Console gap</span><span class="loc">local agent.toml + driver registry</span></div>
     <p class="f-plain"><span class="k">In plain terms —</span> Whether endpoint read-protection is on lives in each machine's local config file plus a switch in the driver's registry. There's no toggle in the console to enable or disable it, so an admin can't turn the feature on or off centrally.</p>
     <p class="f-fix"><span class="fixk">Fix</span><span>A console setting (global or per-group) that syncs "read-deny enabled" down to agents, which set the driver switch.</span></p>
   </article>
 
-  <article class="finding high">
-    <div class="f-head"><span class="f-id">C2</span><h3 class="f-title">No way to choose which drives or folders are protected</h3><span class="chip chip-high">High</span></div>
+  <article class="finding high done">
+    <div class="f-head"><span class="f-id">C2</span><h3 class="f-title">No way to choose which drives or folders are protected</h3><span class="chip chip-high">High</span><span class="chip chip-fixed">✓ Fixed</span></div>
     <div class="f-meta"><span class="tag">Console gap</span><span class="loc">scan_fixed + watch_paths + fltmc attach</span></div>
     <p class="f-plain"><span class="k">In plain terms —</span> Deciding "protect C:\Users" or "protect the whole C: drive" is hand-edited in each endpoint's config file and then needs a manual <code>fltmc attach</code> command — exactly the steps we ran by hand on the test machine. This is the single most important scoping decision in the feature, and it isn't in the console at all. (Removable USB is always protected automatically; fixed drives are the gap.)</p>
     <p class="f-fix"><span class="fixk">Fix</span><span>A console screen to pick watched drives/folders, synced to agents that configure and attach the driver automatically.</span></p>
   </article>
 
-  <article class="finding high">
-    <div class="f-head"><span class="f-id">C3</span><h3 class="f-title">No way to choose the posture (allowlist vs blocklist)</h3><span class="chip chip-high">High</span></div>
+  <article class="finding high done">
+    <div class="f-head"><span class="f-id">C3</span><h3 class="f-title">No way to choose the posture (allowlist vs blocklist)</h3><span class="chip chip-high">High</span><span class="chip chip-fixed">✓ Fixed</span></div>
     <div class="f-meta"><span class="tag">Console gap</span><span class="loc">exfil_posture (local agent.toml)</span></div>
     <p class="f-plain"><span class="k">In plain terms —</span> Whether a machine blocks "everything except the trusted list" (allowlist) or only "known-bad tools" (blocklist) is set in the local config file. The admin can't choose the strategy from the console — yet that choice decides how the trusted-applications list they <em>do</em> manage in the UI is even used.</p>
     <p class="f-fix"><span class="fixk">Fix</span><span>Expose posture as a console setting alongside the trusted-applications list.</span></p>
   </article>
 
-  <article class="finding high">
-    <div class="f-head"><span class="f-id">C4</span><h3 class="f-title">No monitor / enforce switch in the console</h3><span class="chip chip-high">High</span></div>
+  <article class="finding high done">
+    <div class="f-head"><span class="f-id">C4</span><h3 class="f-title">No monitor / enforce switch in the console</h3><span class="chip chip-high">High</span><span class="chip chip-fixed">✓ Fixed</span></div>
     <div class="f-meta"><span class="tag">Console gap</span><span class="loc">ties to Important #5</span></div>
     <p class="f-plain"><span class="k">In plain terms —</span> A safe rollout means running in "watch and warn" first, then switching to "block." That mode doesn't exist yet (Important #5) — and when it's built it has to be a console toggle, so an admin can start in monitor mode, read the incidents to see what would break, and flip to enforce, all from the UI.</p>
     <p class="f-fix"><span class="fixk">Fix</span><span>Build monitor mode (#5) and surface monitor→enforce as a per-group console control.</span></p>
   </article>
 
   <div class="rows">
-    <div class="row low"><div class="rt">Driver safety switches are registry-only</div><p>Fail-secure behaviour and "block unreadable content" are registry values set by hand or the installer, not console settings. They should be installer-set and, where sensible, visible in the console.</p></div>
+    <div class="row low done2"><div class="rt">Driver safety switches are registry-only <span class="rowdone">✓ Fixed</span></div><p>Fail-secure behaviour and "block unreadable content" are registry values set by hand or the installer, not console settings. They should be installer-set and, where sensible, visible in the console.</p></div>
     <div class="row low"><div class="rt">No per-machine or per-group targeting</div><p>The trusted-applications list and every setting are <em>global</em> — one list for every endpoint. An admin can't give a pilot group or a department different rules, or roll out to a subset, from the console.</p></div>
     <div class="row low"><div class="rt">Bringing an endpoint online is still install-time CLI</div><p>The enrollment token is created in the UI ✓, but enrolling the endpoint and loading its first fingerprint set happen on the machine (installer/service). Acceptable as install, but note it isn't "from the console."</p></div>
   </div>

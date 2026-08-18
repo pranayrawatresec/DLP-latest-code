@@ -170,6 +170,27 @@ typedef struct _DLP_EXFIL_UPDATE {
     ULONG Pids[DLP_EXFIL_MSG_MAX];        /* the exfil-channel PIDs              */
 } DLP_EXFIL_UPDATE, *PDLP_EXFIL_UPDATE;
 
+/* Read-deny AUDIT drain. The guard sends a request whose first ULONG is
+ * DLP_DRAIN_VERSION; the driver replies (output buffer) with buffered cache-hit
+ * deny events. Distinct from DLP_CONFIG_VERSION (1) and DLP_EXFIL_VERSION. */
+#define DLP_DRAIN_VERSION    0x796E6544u   /* 'D''e''n''y' */
+#define DLP_DENYRING_MAX     256
+
+/* One denied (process, file) event captured on the hot path; drained by the guard. */
+typedef struct _DLP_DENY_EVENT {
+    ULONG     Pid;
+    ULONG     Reason;                       /* DLP_REASON_*                        */
+    ULONGLONG FileId;
+} DLP_DENY_EVENT, *PDLP_DENY_EVENT;
+
+/* Drain reply written into the guard's output buffer:
+ * [ULONG Count][ULONG Dropped][DLP_DENY_EVENT Events[Count]]. */
+typedef struct _DLP_DENY_DRAIN_REPLY {
+    ULONG          Count;
+    ULONG          Dropped;
+    DLP_DENY_EVENT Events[DLP_DENYRING_MAX];
+} DLP_DENY_DRAIN_REPLY, *PDLP_DENY_DRAIN_REPLY;
+
 #pragma pack(pop)
 
 
@@ -235,6 +256,10 @@ typedef struct _DLP_STREAM_CONTEXT {
      * re-scores the new content. Ensures a file cached CLEAN then overwritten with
      * sensitive content is re-classified, not served the stale verdict. */
     volatile LONG WriteEvicted;
+    /* Read-deny audit dedup: set once this open's deny has been surfaced (via an
+     * up-call incident or a ring event), so repeat reads on the same open don't
+     * re-notify. One incident per distinct (process, file) open. */
+    volatile LONG Reported;
 } DLP_STREAM_CONTEXT, *PDLP_STREAM_CONTEXT;
 
 /* DLP_STREAM_CONTEXT.ExfilVerdict states. */
@@ -383,6 +408,18 @@ typedef struct _DLP_FLT_DATA {
     /* Process-notify registration (PsSetCreateProcessNotifyRoutineEx). */
     BOOLEAN         ProcNotifyRegistered;
 
+    /* ---- Read-deny AUDIT ring (cache-hit deny notifications) ------------- *
+     * A cache-hit deny (a sensitive file re-denied from the SensFile cache, e.g.
+     * by a SECOND untrusted process) never up-calls, so it would otherwise be
+     * unaudited. The classifier records one event per distinct open here; the
+     * guard DRAINS the ring each cycle (DLP_DRAIN request) and raises an incident,
+     * so every distinct denied (process, file) is auditable without re-up-calling
+     * on the hot path. Coalesced per open by DLP_STREAM_CONTEXT.Reported. */
+    KSPIN_LOCK      DenyRingLock;
+    DLP_DENY_EVENT  DenyRing[DLP_DENYRING_MAX];
+    volatile LONG   DenyRingCount;          /* valid entries [0..DLP_DENYRING_MAX]  */
+    volatile LONG   DenyRingDropped;        /* events lost to a full ring (surfaced) */
+
     /* ---- Read-deny (content-aware exfil-tool read blocking) -------------- *
      * Gated by ExfilReadBlockEnabled. The exfil-PID set is agent-pushed
      * (DLP_EXFIL_UPDATE); DlpPreRead consults it, then content-classifies +
@@ -457,6 +494,11 @@ VOID     DlpSensFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 BOOLEAN  DlpCleanFileLookup(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpCleanFileInsert(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpCleanFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
+
+/* Record a cache-hit deny (a sensitive file re-denied without an up-call) into the
+ * audit ring for the guard to drain. Caller coalesces per open (stream ctx
+ * Reported). Takes DenyRingLock; safe at PASSIVE. */
+VOID     DlpDenyReport(_In_ ULONG Pid, _In_ ULONGLONG FileId, _In_ ULONG Reason);
 
 /* ---- Read-deny: exfil-PID set (dlpflt.c) ----------------------------- *
  * DlpExfilLookup is called on the read hot path (DlpPreRead, PASSIVE) under the

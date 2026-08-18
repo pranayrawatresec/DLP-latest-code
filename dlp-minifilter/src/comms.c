@@ -246,6 +246,56 @@ DlpPortMessage(_In_opt_ PVOID PortCookie,
         return STATUS_INVALID_USER_BUFFER;
     }
 
+    /* ---- DLP_DRAIN_VERSION (read-deny audit drain: kernel -> user reply) --- *
+     * The guard pulls buffered cache-hit deny events. Snapshot + clear the ring
+     * under its spinlock into a NonPaged copy (no user memory touched at raised
+     * IRQL), then copy to the user output buffer at PASSIVE under SEH. */
+    if (version == DLP_DRAIN_VERSION) {
+        KIRQL oldIrql;
+        LONG count, i;
+        ULONG needed;
+        PDLP_DENY_DRAIN_REPLY snap;
+
+        if (OutputBuffer == NULL || OutputBufferLength < sizeof(DLP_DENY_DRAIN_REPLY)) {
+            return STATUS_BUFFER_TOO_SMALL;   /* don't drain if the guard can't hold it */
+        }
+#pragma warning(suppress: 4996)
+        snap = (PDLP_DENY_DRAIN_REPLY)ExAllocatePoolWithTag(
+            NonPagedPoolNx, sizeof(DLP_DENY_DRAIN_REPLY), DLP_GENERAL_TAG);
+        if (snap == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        KeAcquireSpinLock(&gDlpData.DenyRingLock, &oldIrql);
+        count = gDlpData.DenyRingCount;
+        if (count < 0) {
+            count = 0;
+        }
+        if (count > DLP_DENYRING_MAX) {
+            count = DLP_DENYRING_MAX;
+        }
+        snap->Count = (ULONG)count;
+        snap->Dropped = (ULONG)gDlpData.DenyRingDropped;
+        for (i = 0; i < count; i++) {
+            snap->Events[i] = gDlpData.DenyRing[i];
+        }
+        gDlpData.DenyRingCount = 0;
+        gDlpData.DenyRingDropped = 0;
+        KeReleaseSpinLock(&gDlpData.DenyRingLock, oldIrql);
+
+        needed = (ULONG)FIELD_OFFSET(DLP_DENY_DRAIN_REPLY, Events) +
+                 snap->Count * (ULONG)sizeof(DLP_DENY_EVENT);
+        __try {
+            ProbeForWrite(OutputBuffer, needed, __alignof(ULONG));
+            RtlCopyMemory(OutputBuffer, snap, needed);
+            *ReturnOutputBufferLength = needed;
+        } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
+            ExFreePoolWithTag(snap, DLP_GENERAL_TAG);
+            return STATUS_INVALID_USER_BUFFER;
+        }
+        ExFreePoolWithTag(snap, DLP_GENERAL_TAG);
+        return STATUS_SUCCESS;
+    }
+
     /* ---- DLP_EXFIL_UPDATE (read-deny exfil-PID full-replace) --------------- */
     if (version == DLP_EXFIL_VERSION) {
         ULONG count = 0;

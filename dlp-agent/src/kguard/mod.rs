@@ -699,6 +699,89 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
     }
 }
 
+/// Drain the driver's read-deny AUDIT ring (cache-hit denies that never up-call,
+/// e.g. a SECOND untrusted process reading an already-flagged file) and hand each
+/// event to `report`. Opens its OWN push-only connection (like the pusher) so it
+/// never blocks the scanner's `FilterGetMessage`. Exits on `stop` or a send error.
+/// `report` runs in THIS thread (no `Send` bound), so the caller can raise a full
+/// incident with its own storage/queue.
+#[cfg(windows)]
+pub fn deny_drain_loop(
+    stop: &std::sync::atomic::AtomicBool,
+    interval_ms: u64,
+    mut report: impl FnMut(u32, u64, u32),
+) {
+    use std::sync::atomic::Ordering;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::InstallableFileSystems::{
+        FilterConnectCommunicationPort, FilterSendMessage,
+    };
+
+    let port_name: Vec<u16> = "\\DlpFltPort".encode_utf16().chain(std::iter::once(0)).collect();
+    let ctx: u32 = crate::exfil::DLP_EXFIL_VERSION; // push-only connection (never ClientPort)
+    let port: HANDLE = match unsafe {
+        FilterConnectCommunicationPort(
+            PCWSTR(port_name.as_ptr()),
+            0,
+            Some(&ctx as *const u32 as *const core::ffi::c_void),
+            core::mem::size_of::<u32>() as u16,
+            None,
+        )
+    } {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "deny-drain: could not connect \\DlpFltPort — cache-hit denies won't be audited");
+            return;
+        }
+    };
+
+    let req = crate::exfil::DlpDrainRequest { version: crate::exfil::DLP_DRAIN_VERSION };
+    let steps = (interval_ms / 100).max(1);
+    while !stop.load(Ordering::Relaxed) {
+        for _ in 0..steps {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut reply: crate::exfil::DlpDenyDrainReply = unsafe { std::mem::zeroed() };
+        let mut returned: u32 = 0;
+        let rc = unsafe {
+            FilterSendMessage(
+                port,
+                &req as *const crate::exfil::DlpDrainRequest as *const core::ffi::c_void,
+                core::mem::size_of::<crate::exfil::DlpDrainRequest>() as u32,
+                Some(&mut reply as *mut crate::exfil::DlpDenyDrainReply as *mut core::ffi::c_void),
+                core::mem::size_of::<crate::exfil::DlpDenyDrainReply>() as u32,
+                &mut returned,
+            )
+        };
+        if let Err(e) = rc {
+            tracing::warn!(error = %e, "deny-drain: send failed (driver unloaded?) — ending");
+            break;
+        }
+        let count = (reply.count as usize).min(crate::exfil::DLP_DENYRING_MAX);
+        if reply.dropped > 0 {
+            tracing::warn!(
+                dropped = reply.dropped,
+                "deny-drain: audit ring overflowed — some repeat-deny events were lost"
+            );
+        }
+        for i in 0..count {
+            let ev = reply.events[i];
+            report(ev.pid, ev.file_id, ev.reason);
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(port);
+    }
+}
+
 /// Send the `DLP_CONFIG` watch-set to the driver (spec §3.0). Best-effort: a
 /// failure is logged, not fatal — the driver keeps its current (removable-only)
 /// scope. The message is one-shot at connect; the driver's `MessageNotifyCallback`

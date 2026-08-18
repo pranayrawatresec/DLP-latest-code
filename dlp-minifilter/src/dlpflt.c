@@ -268,6 +268,9 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     RtlZeroMemory(gDlpData.Exfil, sizeof(gDlpData.Exfil));
     gDlpData.ExfilEpoch = 1;                                /* 0 reserved       */
     gDlpData.ExfilCount = 0;
+    KeInitializeSpinLock(&gDlpData.DenyRingLock);          /* read-deny audit ring */
+    gDlpData.DenyRingCount = 0;
+    gDlpData.DenyRingDropped = 0;
     gDlpData.ProcNotifyRegistered = FALSE;
 
     /* Scan-scope config lock. Initialize BEFORE FltStartFiltering so any early
@@ -733,6 +736,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;   /* contexts are NOT zeroed by FltMgr */
         ctx->WriteEvicted = 0;
+        ctx->Reported = 0;
 
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
@@ -1651,6 +1655,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
         ctx->WriteEvicted = 0;
+        ctx->Reported = 0;
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
                                      (PFLT_CONTEXT)ctx, NULL);
@@ -1711,6 +1716,13 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         }
     }
     if (fileId != 0 && DlpSensFileLookup(fileId, 0)) {
+        /* Cache-hit deny (no up-call): record it for the guard to audit, ONCE per
+         * open (Reported). This is the "a second untrusted process reads an
+         * already-flagged sensitive file" case the up-call path would otherwise
+         * miss, so the audit undercounts distinct attempts. */
+        if (InterlockedCompareExchange(&ctx->Reported, 1, 0) == 0) {
+            DlpDenyReport(Pid, fileId, DLP_REASON_READ);
+        }
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
         FltReleaseFileNameInformation(nameInfo);
         FltReleaseContext((PFLT_CONTEXT)ctx);
@@ -1790,6 +1802,10 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     InterlockedExchange(&ctx->WriteEvicted, 0);
 
     if (block) {
+        /* This open's deny is surfaced by the up-call incident the guard just
+         * raised (success verdict) — mark it reported so repeat reads on this open
+         * don't also ring-notify. */
+        InterlockedExchange(&ctx->Reported, 1);
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         if (Positive != NULL) {
@@ -2130,6 +2146,29 @@ DlpCleanFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId)
         }
     }
     KeReleaseSpinLock(&gDlpData.CleanFileLock, oldIrql);
+}
+
+
+/* ------------------------------------------------------------------------- *
+ *  Read-deny AUDIT ring — record a cache-hit deny for the guard to drain    *
+ * ------------------------------------------------------------------------- */
+VOID
+DlpDenyReport(_In_ ULONG Pid, _In_ ULONGLONG FileId, _In_ ULONG Reason)
+{
+    KIRQL oldIrql;
+    LONG count;
+
+    KeAcquireSpinLock(&gDlpData.DenyRingLock, &oldIrql);
+    count = gDlpData.DenyRingCount;
+    if (count >= 0 && count < DLP_DENYRING_MAX) {
+        gDlpData.DenyRing[count].Pid = Pid;
+        gDlpData.DenyRing[count].Reason = Reason;
+        gDlpData.DenyRing[count].FileId = FileId;
+        gDlpData.DenyRingCount = count + 1;
+    } else {
+        gDlpData.DenyRingDropped++;             /* full — surfaced via the drain    */
+    }
+    KeReleaseSpinLock(&gDlpData.DenyRingLock, oldIrql);
 }
 
 

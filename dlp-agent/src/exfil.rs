@@ -45,6 +45,37 @@ impl DlpExfilUpdate {
 // Size-lock: the kernel struct is 8 + 1024*4 = 4104 bytes.
 const _: () = assert!(core::mem::size_of::<DlpExfilUpdate>() == 8 + DLP_EXFIL_MSG_MAX * 4);
 
+// ---- Read-deny AUDIT drain (cache-hit deny notifications) ------------------
+pub const DLP_DRAIN_VERSION: u32 = 0x796E_6544; // 'D''e''n''y' — MUST match dlpflt.h
+pub const DLP_DENYRING_MAX: usize = 256;
+
+/// Wire mirror of the kernel `DLP_DENY_EVENT` (`#[repr(C)]`, size-locked).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DlpDenyEvent {
+    pub pid: u32,
+    pub reason: u32,
+    pub file_id: u64,
+}
+
+/// The drain REQUEST the guard sends (first ULONG discriminates it in the driver).
+#[repr(C)]
+pub struct DlpDrainRequest {
+    pub version: u32,
+}
+
+/// Wire mirror of the kernel `DLP_DENY_DRAIN_REPLY` — the driver fills this.
+#[repr(C)]
+pub struct DlpDenyDrainReply {
+    pub count: u32,
+    pub dropped: u32,
+    pub events: [DlpDenyEvent; DLP_DENYRING_MAX],
+}
+
+// Size-lock the reply: 8 header + 256 * 16 = 4104 bytes (matches dlpflt.h).
+const _: () = assert!(core::mem::size_of::<DlpDenyEvent>() == 16);
+const _: () = assert!(core::mem::size_of::<DlpDenyDrainReply>() == 8 + DLP_DENYRING_MAX * 16);
+
 // ---------------------------------------------------------------------------
 // Locality classifiers (pure; unit-tested). "Public" = not loopback / RFC1918 /
 // link-local / ULA / multicast / unspecified. A public established peer is the

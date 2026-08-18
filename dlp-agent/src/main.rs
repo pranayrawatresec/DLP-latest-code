@@ -825,6 +825,45 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
         });
     }
 
+    // (a2) DENY-DRAIN — pull the driver's read-deny audit ring (cache-hit denies
+    // that never up-call — e.g. a SECOND untrusted process reading an already-
+    // flagged file) and raise one incident per distinct denied (process, file), so
+    // the audit trail counts every attempt, not just the first.
+    {
+        let shared = shared.clone();
+        let stop_w = stop.clone();
+        let state_dir = state_dir.clone();
+        handles.push(supervised_thread("deny-drain", stop.clone(), Duration::from_secs(3), move || {
+            let storage = Storage::new(state_dir.clone());
+            let queue = usb::queue::IncidentQueue::new(&state_dir);
+            let report = |pid: u32, file_id: u64, _reason: u32| {
+                let snap = supervise::snapshot_config(&shared);
+                let inc = UsbIncident {
+                    kind: usb::IncidentKind::Match,
+                    channel: snap.kguard.channel_label.clone(),
+                    file_name: format!("read-deny (file id 0x{file_id:x})"),
+                    file_sha256: String::new(),
+                    verdict: None,
+                    device: usb::device::DeviceIdentity {
+                        drive_letter: String::new(),
+                        vendor_id: String::new(),
+                        product_id: String::new(),
+                        serial: String::new(),
+                        product_name: String::new(),
+                        bus_type: "fixed".into(),
+                        removable: false,
+                    },
+                    action_taken: ActionTaken::Blocked,
+                    note: Some(format!("exfil-read-denied-repeat pid={pid}")),
+                    key_id: None,
+                    sealed_sha256: None,
+                };
+                deliver_incident(&snap, &storage, &queue, &inc);
+            };
+            kguard::deny_drain_loop(&stop_w, 2000, report);
+        }));
+    }
+
     // (b) SEALER — usb volume poll+seal loop; marks liveness each poll.
     {
         let shared = shared.clone();
