@@ -87,7 +87,13 @@ DlpCreateCommunicationPort(_In_ PFLT_FILTER Filter)
         DlpPortConnect,
         DlpPortDisconnect,
         DlpPortMessage,             /* user->kernel: DLP_CONFIG + DLP_EXFIL_UPDATE */
-        2);                         /* scanner (receive/reply) + push-only exfil conn */
+        4);                         /* scanner (recv/reply) + exfil-push + deny-drain
+                                     * pull + 1 headroom. Each agent worker uses its
+                                     * OWN connection so FilterSendMessage never shares
+                                     * a handle with the scanner's FilterGetMessage;
+                                     * with only 2 the deny-drain starved the pusher
+                                     * (0x800704D6) and the driver lost the untrusted
+                                     * PID set, so nothing got denied. */
 
     FltFreeSecurityDescriptor(sd);
     return status;

@@ -89,16 +89,17 @@ impl Config {
 
 /// Apply the driver-side knobs this policy implies — with NO command line:
 ///   * write the read-deny mode + fail behaviour to the driver's registry key
-///     (the `reg add` an operator would otherwise run), and
-///   * attach the filter to C: when fixed-drive scanning is on (the `fltmc attach`).
+///     (the `reg add` an operator would otherwise run).
+/// The fixed-volume *attach* (the `fltmc attach`) is NOT done here: it must run
+/// AFTER the driver has the watch-set (ScanFixed=1/WatchCount>0), otherwise the
+/// driver's InstanceSetup answers STATUS_FLT_DO_NOT_ATTACH. The guard owns the
+/// single \DlpFltPort connection and performs the attach right after it sends the
+/// config, in the correct order — see [crate::kguard::run] / [attach_fixed_volume].
 /// Requires the agent to run elevated / as SYSTEM (the LocalSystem service does).
 /// Best-effort: each step logs on failure and the guard still runs.
 #[cfg(windows)]
 pub fn apply_to_driver(p: &ReadDenyPolicy) {
     write_driver_knobs(p.driver_mode(), p.fail_block);
-    if p.scan_fixed {
-        attach_filter_to_volume("dlpflt", "C:");
-    }
 }
 
 #[cfg(not(windows))]
@@ -133,14 +134,17 @@ fn write_driver_knobs(mode: u32, fail_block: bool) {
     tracing::info!(mode, fail_block, "applied read-deny driver knobs from console policy");
 }
 
-/// Attach the minifilter to a fixed volume via the FltMgr API — the programmatic
-/// equivalent of `fltmc attach dlpflt C:`. "Already attached" is success.
+/// Attach the `dlpflt` minifilter to a fixed volume via the FltMgr API — the
+/// programmatic equivalent of `fltmc attach dlpflt C:`. "Already attached" is
+/// success. MUST be called only after the driver has the fixed-volume watch-set
+/// (see the call site in [crate::kguard::run], right after `send_config`), or the
+/// driver's InstanceSetup returns STATUS_FLT_DO_NOT_ATTACH.
 #[cfg(windows)]
-fn attach_filter_to_volume(filter: &str, volume: &str) {
+pub fn attach_fixed_volume(volume: &str) {
     use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Storage::InstallableFileSystems::FilterAttach;
 
-    let f = HSTRING::from(filter);
+    let f = HSTRING::from("dlpflt");
     let v = HSTRING::from(volume);
     match unsafe { FilterAttach(&f, &v, PCWSTR::null(), 0, PWSTR::null()) } {
         Ok(()) => tracing::info!(volume, "attached read-deny filter to fixed volume"),

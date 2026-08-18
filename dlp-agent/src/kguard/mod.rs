@@ -560,6 +560,18 @@ where
     // watch-set leaves the driver in removable-only mode (backward compatible).
     send_config(port, &initial.kguard);
 
+    // Fixed-volume attach (console read-deny policy, scan_fixed=on). The driver's
+    // InstanceSetup only accepts a FIXED volume once its config says ScanFixed=1
+    // AND WatchCount>0 — so this attach MUST follow send_config above, or it comes
+    // back STATUS_FLT_DO_NOT_ATTACH. Doing it here (on the guard's own single
+    // \DlpFltPort connection, in the correct order) is what actually puts an
+    // instance on C:; the run-endpoint apply path only writes the registry knobs.
+    // Idempotent: "already attached" is success. Runs each (re)start of the guard.
+    if initial.kguard.exfil_read_block && initial.kguard.scan_fixed {
+        #[cfg(windows)]
+        crate::readdenypolicy::attach_fixed_volume("C:");
+    }
+
     // Read-deny: run a background tracker that pushes the exfil-channel PID set so
     // the driver's DlpPreRead can DENY sensitive reads by exfil processes. Only
     // when [kguard] exfil_read_block is set; the driver still gates on its own
