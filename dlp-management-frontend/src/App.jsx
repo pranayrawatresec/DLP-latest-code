@@ -10,6 +10,7 @@ import Incidents from './pages/Incidents'
 import ProtectedDocuments from './pages/ProtectedDocuments'
 import TrustedDestinations from './pages/TrustedDestinations'
 import TrustedReaders from './pages/TrustedReaders'
+import ReadDenyPolicy from './pages/ReadDenyPolicy'
 import AppLayout from './components/layout/AppLayout'
 import ProtectedRoute from './components/ProtectedRoute'
 import RequirePermission from './components/RequirePermission'
@@ -54,6 +55,10 @@ function App() {
         <Route
           path="trusted-readers"
           element={<RequirePermission permission="trusted_readers:read"><TrustedReaders /></RequirePermission>}
+        />
+        <Route
+          path="read-deny-policy"
+          element={<RequirePermission permission="read_deny_policy:read"><ReadDenyPolicy /></RequirePermission>}
         />
         <Route
           path="sessions"

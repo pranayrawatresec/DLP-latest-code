@@ -19,7 +19,7 @@ const baseQuery = async (args, apiCtx, extra) => {
 export const apiSlice = createApi({
   reducerPath: 'api',
   baseQuery,
-  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader'],
+  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy'],
   endpoints: (b) => ({
     // Enrollment tokens
     getEnrollmentTokens: b.query({
@@ -177,6 +177,20 @@ export const apiSlice = createApi({
       query: (id) => ({ url: `/trusted-readers/${id}`, method: 'DELETE' }),
       invalidatesTags: ['TrustedReader'],
     }),
+
+    // Read-deny policy — the endpoint mode/posture/scope the agent applies to the
+    // kernel driver. The console is the single source of truth; agents pull + apply
+    // it, so the admin never touches the command line.
+    getReadDenyPolicy: b.query({
+      query: () => '/read-deny-policy',
+      transformResponse: (res) => res?.policy || null,
+      providesTags: ['ReadDenyPolicy'],
+    }),
+    updateReadDenyPolicy: b.mutation({
+      // body: { mode, posture, scanFixed, watchPaths, failBlock }
+      query: (body) => ({ url: '/read-deny-policy', method: 'PUT', body }),
+      invalidatesTags: ['ReadDenyPolicy'],
+    }),
   }),
 })
 
@@ -210,4 +224,6 @@ export const {
   useGetTrustedReadersQuery,
   useCreateTrustedReaderMutation,
   useDeleteTrustedReaderMutation,
+  useGetReadDenyPolicyQuery,
+  useUpdateReadDenyPolicyMutation,
 } = apiSlice

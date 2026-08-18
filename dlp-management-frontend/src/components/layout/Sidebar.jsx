@@ -10,6 +10,7 @@ const NAV = [
   { to: '/protected-documents', label: 'Protected documents', icon: DocumentIcon, permission: 'protect:read' },
   { to: '/trusted-destinations', label: 'Trusted USB devices', icon: UsbIcon, permission: 'trusted_destinations:read' },
   { to: '/trusted-readers', label: 'Trusted applications', icon: AppWindowIcon, permission: 'trusted_readers:read' },
+  { to: '/read-deny-policy', label: 'Read-deny policy', icon: ShieldIcon, permission: 'read_deny_policy:read' },
   { to: '/agents', label: 'Agents', icon: MonitorIcon, permission: 'agents.read' },
   { to: '/enrollment-tokens', label: 'Enrollment tokens', icon: KeyIcon, permission: 'enrollment.manage' },
   { to: '/administrators', label: 'Administrators', icon: UsersIcon, permission: 'users.manage' },
