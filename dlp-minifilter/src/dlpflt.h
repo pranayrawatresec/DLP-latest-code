@@ -236,6 +236,7 @@ typedef struct _DLP_DENY_DRAIN_REPLY {
 /* Stream-context pool tag ('DlpS' -> 'SplD' on a little-endian dump). */
 #define DLP_STREAM_CONTEXT_TAG   'SplD'
 #define DLP_INSTANCE_CONTEXT_TAG 'IplD'
+#define DLP_HANDLE_CONTEXT_TAG   'HplD'
 #define DLP_GENERAL_TAG          'GplD'
 
 /* Per-stream state (SPEC 2.2). Allocated from NonPagedPoolNx. A stream becomes
@@ -256,10 +257,9 @@ typedef struct _DLP_STREAM_CONTEXT {
      * re-scores the new content. Ensures a file cached CLEAN then overwritten with
      * sensitive content is re-classified, not served the stale verdict. */
     volatile LONG WriteEvicted;
-    /* Read-deny audit dedup: set once this open's deny has been surfaced (via an
-     * up-call incident or a ring event), so repeat reads on the same open don't
-     * re-notify. One incident per distinct (process, file) open. */
-    volatile LONG Reported;
+    /* NOTE: repeat-deny audit dedup is NOT here — a stream context is shared across
+     * every open of a file, so it cannot count distinct opens/processes. That lives
+     * in the per-open DLP_HANDLE_CONTEXT (DenyReported) instead. */
 } DLP_STREAM_CONTEXT, *PDLP_STREAM_CONTEXT;
 
 /* DLP_STREAM_CONTEXT.ExfilVerdict states. */
@@ -287,6 +287,16 @@ typedef struct _DLP_BADHASH_ENTRY {
 typedef struct _DLP_INSTANCE_CONTEXT {
     ULONG VolumeClass;              /* DLP_VOL_REMOVABLE | _NETWORK | _FIXED */
 } DLP_INSTANCE_CONTEXT, *PDLP_INSTANCE_CONTEXT;
+
+/* Per-OPEN context: one per FILE_OBJECT (stream handle). Unlike DLP_STREAM_CONTEXT
+ * (shared across every open of a file), this is unique to a single open — so a
+ * cache-served read-deny is audited exactly once per open, and thus once per
+ * distinct requesting process/attempt. Solves the repeat-deny undercount where
+ * the shared stream-context verdict (step B) served later untrusted opens
+ * silently, never reaching the audit ring. */
+typedef struct _DLP_HANDLE_CONTEXT {
+    volatile LONG DenyReported;     /* 0 -> this open's deny not yet audited */
+} DLP_HANDLE_CONTEXT, *PDLP_HANDLE_CONTEXT;
 
 /* ========================================================================= *
  *  Read-deny file-id caches (read-deny-LLD)                                 *
@@ -409,12 +419,13 @@ typedef struct _DLP_FLT_DATA {
     BOOLEAN         ProcNotifyRegistered;
 
     /* ---- Read-deny AUDIT ring (cache-hit deny notifications) ------------- *
-     * A cache-hit deny (a sensitive file re-denied from the SensFile cache, e.g.
-     * by a SECOND untrusted process) never up-calls, so it would otherwise be
-     * unaudited. The classifier records one event per distinct open here; the
-     * guard DRAINS the ring each cycle (DLP_DRAIN request) and raises an incident,
-     * so every distinct denied (process, file) is auditable without re-up-calling
-     * on the hot path. Coalesced per open by DLP_STREAM_CONTEXT.Reported. */
+     * A cache-served deny (a sensitive file re-denied from the stream-context or
+     * SensFile cache, e.g. by a SECOND untrusted process) never up-calls, so it
+     * would otherwise be unaudited. The classifier records one event per distinct
+     * OPEN here; the guard DRAINS the ring each cycle (DLP_DRAIN request) and raises
+     * an incident, so every distinct denied (process, file) is auditable without
+     * re-up-calling on the hot path. Coalesced per open by DLP_HANDLE_CONTEXT
+     * (DenyReported) — NOT the shared stream context, which cannot count opens. */
     KSPIN_LOCK      DenyRingLock;
     DLP_DENY_EVENT  DenyRing[DLP_DENYRING_MAX];
     volatile LONG   DenyRingCount;          /* valid entries [0..DLP_DENYRING_MAX]  */
@@ -495,9 +506,9 @@ BOOLEAN  DlpCleanFileLookup(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpCleanFileInsert(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpCleanFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 
-/* Record a cache-hit deny (a sensitive file re-denied without an up-call) into the
- * audit ring for the guard to drain. Caller coalesces per open (stream ctx
- * Reported). Takes DenyRingLock; safe at PASSIVE. */
+/* Record a cache-served deny (a sensitive file re-denied without an up-call) into
+ * the audit ring for the guard to drain. Callers coalesce per open via
+ * DlpAuditSilentDeny (handle-context DenyReported). Takes DenyRingLock; PASSIVE. */
 VOID     DlpDenyReport(_In_ ULONG Pid, _In_ ULONGLONG FileId, _In_ ULONG Reason);
 
 /* ---- Read-deny: exfil-PID set (dlpflt.c) ----------------------------- *

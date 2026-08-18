@@ -114,6 +114,13 @@ static LONG DlpExfilClassifyAndCache(
     _In_ ULONG Pid,
     _Out_opt_ PBOOLEAN Positive);
 
+/* Record a SILENT (cache-served, no up-call) read-deny into the audit ring, at
+ * most once per OPEN. Uses a per-FILE_OBJECT stream-handle context so distinct
+ * untrusted processes reading the same already-flagged file each produce exactly
+ * one audit event — the shared stream context cannot distinguish opens. Best-
+ * effort: any context or file-id failure just skips the audit (never the deny). */
+static VOID DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid);
+
 /* Per-thread re-entrancy guard. Our own cached FltReadFile (in the classifier)
  * lazily creates the file's data section, re-entering DlpPreAcquireForSection on
  * the SAME thread; the guard lets that internal section through so we never deny
@@ -202,6 +209,12 @@ CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
       DlpContextCleanup,
       sizeof(DLP_INSTANCE_CONTEXT),
       DLP_INSTANCE_CONTEXT_TAG,
+      NULL, NULL, NULL },
+    { FLT_STREAMHANDLE_CONTEXT,
+      0,
+      NULL,                             /* no cleanup: holds no references */
+      sizeof(DLP_HANDLE_CONTEXT),
+      DLP_HANDLE_CONTEXT_TAG,
       NULL, NULL, NULL },
     { FLT_CONTEXT_END }
 };
@@ -736,7 +749,6 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;   /* contexts are NOT zeroed by FltMgr */
         ctx->WriteEvicted = 0;
-        ctx->Reported = 0;
 
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
@@ -1602,6 +1614,52 @@ DlpDenyRead(_Inout_ PFLT_CALLBACK_DATA Data)
     return FLT_PREOP_COMPLETE;
 }
 
+/* Audit a cache-served deny once per OPEN (see the forward-decl comment). Runs at
+ * PASSIVE from the classifier. Grabs/creates the per-FILE_OBJECT handle context,
+ * flips DenyReported 0->1 exactly once, then resolves the file id and rings it. */
+static VOID
+DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid)
+{
+    PDLP_HANDLE_CONTEXT hctx = NULL;
+    NTSTATUS status;
+
+    status = FltGetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject,
+                                       (PFLT_CONTEXT *)&hctx);
+    if (!NT_SUCCESS(status)) {
+        status = FltAllocateContext(gDlpData.Filter, FLT_STREAMHANDLE_CONTEXT,
+                                    sizeof(DLP_HANDLE_CONTEXT), NonPagedPoolNx,
+                                    (PFLT_CONTEXT *)&hctx);
+        if (!NT_SUCCESS(status) || hctx == NULL) {
+            return;                         /* best-effort: skip audit, never deny */
+        }
+        hctx->DenyReported = 0;
+        status = FltSetStreamHandleContext(FltObjects->Instance, FltObjects->FileObject,
+                                           FLT_SET_CONTEXT_KEEP_IF_EXISTS,
+                                           (PFLT_CONTEXT)hctx, NULL);
+        if (!NT_SUCCESS(status)) {
+            /* Another thread set it first (or the FO rejects handle contexts). */
+            FltReleaseContext((PFLT_CONTEXT)hctx);
+            hctx = NULL;
+            if (!NT_SUCCESS(FltGetStreamHandleContext(FltObjects->Instance,
+                    FltObjects->FileObject, (PFLT_CONTEXT *)&hctx)) || hctx == NULL) {
+                return;
+            }
+        }
+    }
+
+    if (InterlockedCompareExchange(&hctx->DenyReported, 1, 0) == 0) {
+        ULONGLONG fileId = 0;
+        FILE_INTERNAL_INFORMATION intInfo;
+        RtlZeroMemory(&intInfo, sizeof(intInfo));
+        if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance, FltObjects->FileObject,
+                &intInfo, sizeof(intInfo), FileInternalInformation, NULL))) {
+            fileId = (ULONGLONG)intInfo.IndexNumber.QuadPart;
+        }
+        DlpDenyReport(Pid, fileId, DLP_REASON_READ);
+    }
+    FltReleaseContext((PFLT_CONTEXT)hctx);
+}
+
 /* Shared read-deny classifier. Returns DLP_EXFIL_DENY or DLP_EXFIL_ALLOW and
  * caches the verdict in the stream context + the cross-open SensFile/CleanFile
  * rings so neither the buffered pre-op nor the section-sync pre-op re-reads. The
@@ -1627,6 +1685,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     BOOLEAN truncated = FALSE;
     BOOLEAN block = FALSE;
     BOOLEAN positiveMatch = FALSE;           /* TRUE only on a real sensitive hit */
+    BOOLEAN upCalled = FALSE;                /* TRUE once a real verdict up-call ran */
     BOOLEAN guardHeld;
     UCHAR sha[DLP_SHA256_LEN];
 
@@ -1655,7 +1714,6 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
         ctx->WriteEvicted = 0;
-        ctx->Reported = 0;
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
                                      (PFLT_CONTEXT)ctx, NULL);
@@ -1670,9 +1728,16 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         }
     }
 
-    /* B. Verdict already decided for this file (any prior open)? O(1). */
+    /* B. Verdict already decided for this file (any prior open)? O(1). This is the
+     *    path that serves EVERY untrusted open after the first classification, so a
+     *    cached DENY here is the repeat attempt to audit — once per open. */
     cached = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
     if (cached == DLP_EXFIL_DENY || cached == DLP_EXFIL_ALLOW) {
+        if (cached == DLP_EXFIL_DENY) {
+            /* Audit-only: leave *Positive FALSE so the OPEN-vs-READ deny behaviour
+             * is byte-for-byte what it was before (no new open cancellations). */
+            DlpAuditSilentDeny(FltObjects, Pid);
+        }
         FltReleaseContext((PFLT_CONTEXT)ctx);
         return cached;
     }
@@ -1716,13 +1781,11 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         }
     }
     if (fileId != 0 && DlpSensFileLookup(fileId, 0)) {
-        /* Cache-hit deny (no up-call): record it for the guard to audit, ONCE per
-         * open (Reported). This is the "a second untrusted process reads an
-         * already-flagged sensitive file" case the up-call path would otherwise
-         * miss, so the audit undercounts distinct attempts. */
-        if (InterlockedCompareExchange(&ctx->Reported, 1, 0) == 0) {
-            DlpDenyReport(Pid, fileId, DLP_REASON_READ);
-        }
+        /* Cross-open cache-hit deny (no up-call) with a FRESH stream context: audit
+         * it once per open. (When the stream context persists instead, step B above
+         * serves the same file and audits there — the per-open handle context keeps
+         * either path to exactly one event per attempt.) */
+        DlpAuditSilentDeny(FltObjects, Pid);
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
         FltReleaseFileNameInformation(nameInfo);
         FltReleaseContext((PFLT_CONTEXT)ctx);
@@ -1779,6 +1842,9 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
          * AND poison the SensFile cache. On any non-SUCCESS, fail-safe per
          * ExfilReadFailBlock and seed NOTHING. */
         if (vstatus == STATUS_SUCCESS) {
+            /* Genuine verdict -> the guard raised an incident for THIS attempt, so
+             * it must NOT also be ring-audited (that would double-count). */
+            upCalled = TRUE;
             /* Genuine verdict -> seed the matching cross-open cache. */
             if (block) {
                 positiveMatch = TRUE;          /* real sensitive match            */
@@ -1802,10 +1868,12 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     InterlockedExchange(&ctx->WriteEvicted, 0);
 
     if (block) {
-        /* This open's deny is surfaced by the up-call incident the guard just
-         * raised (success verdict) — mark it reported so repeat reads on this open
-         * don't also ring-notify. */
-        InterlockedExchange(&ctx->Reported, 1);
+        /* A real up-call verdict is already surfaced by the guard's incident; a
+         * known-bad-hash or fail-secure deny (no up-call) is NOT, so ring-audit
+         * those — once per open via the handle context. */
+        if (!upCalled) {
+            DlpAuditSilentDeny(FltObjects, Pid);
+        }
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         if (Positive != NULL) {

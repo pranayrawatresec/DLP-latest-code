@@ -838,12 +838,30 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
             let queue = usb::queue::IncidentQueue::new(&state_dir);
             let report = |pid: u32, file_id: u64, _reason: u32| {
                 let snap = supervise::snapshot_config(&shared);
+                let file_name = format!("read-deny (file id 0x{file_id:x})");
+                // A synthetic verdict so this repeat-deny POSTS to the console
+                // incident feed (like the first attempt) rather than only logging
+                // locally: incident_wire_body drops verdict-less incidents. The file
+                // is served from the kernel cache and deliberately NOT re-scanned on
+                // the hot path, so there is no content/hash/match detail to carry —
+                // extraction is Unreadable and the match lists are empty (the same
+                // shape the server already accepts for UnreadableOnRemovable). The
+                // first attempt's incident holds the full detection detail; this one
+                // records that ANOTHER process (pid) was blocked reading the file.
                 let inc = UsbIncident {
                     kind: usb::IncidentKind::Match,
                     channel: snap.kguard.channel_label.clone(),
-                    file_name: format!("read-deny (file id 0x{file_id:x})"),
+                    file_name: file_name.clone(),
                     file_sha256: String::new(),
-                    verdict: None,
+                    verdict: Some(detect::Verdict {
+                        file_name,
+                        file_sha256: String::new(),
+                        extraction: detect::Extraction::Unreadable {
+                            reason: "repeat deny served from kernel cache (not re-scanned)".into(),
+                        },
+                        idm: Vec::new(),
+                        edm: Vec::new(),
+                    }),
                     device: usb::device::DeviceIdentity {
                         drive_letter: String::new(),
                         vendor_id: String::new(),

@@ -747,6 +747,7 @@ pub fn deny_drain_loop(
             return;
         }
     };
+    tracing::info!(interval_ms, "deny-drain: connected to \\DlpFltPort — auditing cache-hit repeat denies");
 
     let req = crate::exfil::DlpDrainRequest { version: crate::exfil::DLP_DRAIN_VERSION };
     let steps = (interval_ms / 100).max(1);
@@ -778,6 +779,9 @@ pub fn deny_drain_loop(
             break;
         }
         let count = (reply.count as usize).min(crate::exfil::DLP_DENYRING_MAX);
+        if count > 0 {
+            tracing::info!(count, "deny-drain: pulled cache-hit deny events from driver ring");
+        }
         if reply.dropped > 0 {
             tracing::warn!(
                 dropped = reply.dropped,
