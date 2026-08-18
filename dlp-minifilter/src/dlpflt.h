@@ -474,6 +474,15 @@ VOID     DlpReadFailMode(_In_ PUNICODE_STRING RegistryPath);
  * service registry path (DriverEntry). Defaults: disabled + fail-block. */
 VOID     DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath);
 
+/* Seed the fixed-volume scan scope (ScanFixed + watch prefixes) from the service
+ * registry path at DriverEntry, BEFORE volumes mount — so DlpInstanceSetup attaches
+ * fixed volumes (C:) from the first moment of boot rather than only after the agent
+ * later sends a DLP_CONFIG message. Registry values (agent-written on each policy
+ * apply): ExfilScanFixed (REG_DWORD) + ExfilWatchPaths (REG_MULTI_SZ). Absent
+ * watch paths => the removable-only default stands. The runtime message still
+ * full-replaces this seed. */
+VOID     DlpReadScanScope(_In_ PUNICODE_STRING RegistryPath);
+
 /* ---- comms.c: scan-scope config accessors (Tier-1 extension) ---------- *
  * All read the config stored by the DLP_CONFIG message-notify callback.
  * Safe to call at PASSIVE_LEVEL (they take ConfigLock shared). Before any

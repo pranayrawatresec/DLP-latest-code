@@ -303,6 +303,11 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
      * the first read. Absent key => stays OFF (today's behavior). */
     DlpReadExfilPolicy(RegistryPath);
 
+    /* Seed the fixed-volume scan scope from the registry BEFORE FltStartFiltering,
+     * so InstanceSetup attaches C: at mount time on boot — closing the window where
+     * a reboot left fixed volumes unwatched until the agent reconnected (item #8). */
+    DlpReadScanScope(RegistryPath);
+
     status = FltRegisterFilter(DriverObject, &FilterRegistration, &gDlpData.Filter);
     if (!NT_SUCCESS(status)) {
         ExDeleteResourceLite(&gDlpData.ConfigLock);

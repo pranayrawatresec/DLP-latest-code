@@ -100,6 +100,11 @@ impl Config {
 #[cfg(windows)]
 pub fn apply_to_driver(p: &ReadDenyPolicy) {
     write_driver_knobs(p.driver_mode(), p.fail_block);
+    // Persist the fixed-volume scope so the driver can seed it at boot and attach
+    // C: at mount time (before the agent is up) — otherwise a reboot leaves fixed
+    // volumes unwatched until the guard reconnects (audit item #8). The runtime
+    // DLP_CONFIG message (guard startup) remains the live-update path.
+    write_scan_scope(p.scan_fixed, &p.watch_paths);
 }
 
 #[cfg(not(windows))]
@@ -132,6 +137,68 @@ fn write_driver_knobs(mode: u32, fail_block: bool) {
     set(w!("ExfilReadBlockEnabled"), mode);
     set(w!("ExfilReadFailBlock"), if fail_block { 1 } else { 0 });
     tracing::info!(mode, fail_block, "applied read-deny driver knobs from console policy");
+}
+
+/// Persist the fixed-volume scan scope to the driver's registry key so the driver
+/// seeds it at boot (DlpReadScanScope) and attaches C: at mount time — the boot-
+/// persistence half of the fixed-volume attach. Writes `ExfilScanFixed` (DWORD)
+/// and `ExfilWatchPaths` (REG_MULTI_SZ, one string per prefix). When fixed scanning
+/// is off (or no paths), writes an EMPTY MULTI_SZ so a previously-seeded value can
+/// never re-attach C: at the next boot. Requires SYSTEM/elevated (the service).
+#[cfg(windows)]
+fn write_scan_scope(scan_fixed: bool, watch_paths: &[String]) {
+    use windows::core::w;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD, REG_MULTI_SZ,
+    };
+
+    let svc = w!("SYSTEM\\CurrentControlSet\\Services\\dlpflt");
+
+    // ExfilScanFixed (DWORD).
+    let sf: u32 = if scan_fixed { 1 } else { 0 };
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            svc,
+            w!("ExfilScanFixed"),
+            REG_DWORD.0,
+            Some(&sf as *const u32 as *const core::ffi::c_void),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        tracing::warn!(rc = rc.0, "could not write ExfilScanFixed (needs SYSTEM/elevated)");
+    }
+
+    // ExfilWatchPaths (REG_MULTI_SZ): each prefix as a NUL-terminated UTF-16 string,
+    // then a final NUL. An empty list is a single NUL (clears any stale seed). Only
+    // emit real prefixes when fixed scanning is actually on.
+    let mut buf: Vec<u16> = Vec::new();
+    if scan_fixed {
+        for prefix in watch_paths.iter().take(16) {
+            if prefix.is_empty() {
+                continue;
+            }
+            buf.extend(prefix.encode_utf16());
+            buf.push(0);
+        }
+    }
+    buf.push(0); // final terminator (also the whole value when the list is empty)
+    let bytes = (buf.len() * std::mem::size_of::<u16>()) as u32;
+    let rc = unsafe {
+        RegSetKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            svc,
+            w!("ExfilWatchPaths"),
+            REG_MULTI_SZ.0,
+            Some(buf.as_ptr() as *const core::ffi::c_void),
+            bytes,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        tracing::warn!(rc = rc.0, "could not write ExfilWatchPaths (needs SYSTEM/elevated)");
+    }
 }
 
 /// Attach the `dlpflt` minifilter to a fixed volume via the FltMgr API — the

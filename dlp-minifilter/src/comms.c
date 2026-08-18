@@ -52,6 +52,7 @@ static NTSTATUS FLTAPI DlpPortMessage(
 #pragma alloc_text(PAGE, DlpReadFailMode)
 #pragma alloc_text(PAGE, DlpReadDword)
 #pragma alloc_text(PAGE, DlpReadExfilPolicy)
+#pragma alloc_text(PAGE, DlpReadScanScope)
 #endif
 
 
@@ -777,4 +778,114 @@ DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath)
       : (enabled == DLP_EXFILREAD_MONITOR) ? DLP_EXFILREAD_MONITOR
                                            : DLP_EXFILREAD_DISABLED;
     gDlpData.ExfilReadFailBlock = (failBlock != 0) ? 1u : 0u;
+}
+
+/* ------------------------------------------------------------------------- *
+ *  Fixed-volume scan scope from the service registry key (audit item #8)    *
+ *                                                                           *
+ *  Seeds gDlpData.Config from the registry at DriverEntry, BEFORE any volume *
+ *  mounts, so DlpInstanceSetup attaches fixed volumes (C:) from the first    *
+ *  instant of boot — not only after the agent later sends a DLP_CONFIG       *
+ *  message (which never re-runs InstanceSetup for an already-mounted C:).    *
+ *  The agent writes these values on every read-deny policy apply, so the     *
+ *  registry is the boot-time mirror of the live watch-set. The runtime       *
+ *  DLP_CONFIG message still full-replaces this seed.                         *
+ *                                                                           *
+ *    ExfilScanFixed   REG_DWORD      0|1                                     *
+ *    ExfilWatchPaths  REG_MULTI_SZ   folder prefixes, e.g. "\Users"          *
+ *                                                                           *
+ *  Absent/empty ExfilWatchPaths => leave the removable-only default          *
+ *  (ConfigValid stays 0). PASSIVE_LEVEL (DriverEntry); paged. Takes          *
+ *  ConfigLock exclusive for symmetry with the message path (no concurrency   *
+ *  yet — filtering has not started). */
+VOID
+DlpReadScanScope(_In_ PUNICODE_STRING RegistryPath)
+{
+    NTSTATUS status;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE key = NULL;
+    UNICODE_STRING valueName;
+    ULONG scanFixed = 0;
+    ULONG resultLength = 0;
+    ULONG infoSize;
+    PKEY_VALUE_PARTIAL_INFORMATION info;
+
+    PAGED_CODE();
+
+    InitializeObjectAttributes(&oa, RegistryPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    status = ZwOpenKey(&key, KEY_READ, &oa);
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+
+    DlpReadDword(key, L"ExfilScanFixed", &scanFixed);
+
+    /* Room for the whole MULTI_SZ: DLP_MAX_WATCH strings of up to
+     * DLP_WATCH_PATH_CHARS chars, each null-terminated, plus the final null. */
+    infoSize = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data)
+             + (DLP_MAX_WATCH * (DLP_WATCH_PATH_CHARS + 1) + 1) * (ULONG)sizeof(WCHAR);
+#pragma warning(suppress: 4996)
+    info = (PKEY_VALUE_PARTIAL_INFORMATION)ExAllocatePoolWithTag(PagedPool, infoSize,
+                                                                 DLP_GENERAL_TAG);
+    if (info == NULL) {
+        ZwClose(key);
+        return;
+    }
+
+    RtlInitUnicodeString(&valueName, L"ExfilWatchPaths");
+    status = ZwQueryValueKey(key, &valueName, KeyValuePartialInformation,
+                             info, infoSize, &resultLength);
+    ZwClose(key);
+
+    if (!NT_SUCCESS(status) || info->Type != REG_MULTI_SZ ||
+        info->DataLength < sizeof(WCHAR)) {
+        ExFreePoolWithTag(info, DLP_GENERAL_TAG);
+        return;                     /* no watch-set => removable-only default */
+    }
+
+    {
+        PCWSTR p = (PCWSTR)info->Data;
+        ULONG dataChars = info->DataLength / (ULONG)sizeof(WCHAR);
+        ULONG consumed = 0;
+        ULONG count = 0;
+
+        KeEnterCriticalRegion();
+        ExAcquireResourceExclusiveLite(&gDlpData.ConfigLock, TRUE);
+
+        RtlZeroMemory(&gDlpData.Config, sizeof(gDlpData.Config));
+        gDlpData.Config.Version = DLP_CONFIG_VERSION;
+        gDlpData.Config.ScanFixed = (scanFixed != 0) ? 1u : 0u;
+        gDlpData.Config.ScanNetwork = 0;
+
+        while (consumed < dataChars && count < DLP_MAX_WATCH) {
+            ULONG full = 0;         /* full length of this MULTI_SZ string */
+            ULONG copy;
+            while (consumed + full < dataChars && p[consumed + full] != L'\0') {
+                full++;
+            }
+            if (full == 0) {
+                break;              /* empty string == MULTI_SZ terminator */
+            }
+            copy = (full > DLP_WATCH_PATH_CHARS - 1) ? (DLP_WATCH_PATH_CHARS - 1) : full;
+            RtlCopyMemory(gDlpData.Config.Watch[count], &p[consumed], copy * sizeof(WCHAR));
+            gDlpData.Config.Watch[count][copy] = L'\0';
+            gDlpData.Config.WatchLen[count] = (USHORT)copy;
+            count++;
+            consumed += full + 1;   /* advance past the FULL string + its null */
+        }
+        gDlpData.Config.WatchCount = count;
+
+        /* Mirror the runtime rule: empty watch-set == removable-only. Only a
+         * non-empty set makes the config "valid" so DlpConfigScanFixed can arm. */
+        if (count > 0) {
+            InterlockedExchange(&gDlpData.ConfigValid, 1);
+        }
+
+        ExReleaseResourceLite(&gDlpData.ConfigLock);
+        KeLeaveCriticalRegion();
+    }
+
+    ExFreePoolWithTag(info, DLP_GENERAL_TAG);
 }
