@@ -17,6 +17,7 @@ const ROLE_PERMISSIONS = {
     'encryption_keys:manage', // create/rotate/destroy KEKs (metadata only — never plaintext key material)
     'trusted_destinations:read', // see which destinations reference which key
     'trusted_readers:read', // review the sanctioned-reader allowlist (read-deny policy)
+    'read_deny_policy:read', // review the endpoint read-deny policy (mode/scope/posture)
   ],
   policy_author: [
     'policies.read',
@@ -27,6 +28,8 @@ const ROLE_PERMISSIONS = {
     'trusted_destinations:write',
     'trusted_readers:read', // the sanctioned-reader allowlist is policy
     'trusted_readers:write',
+    'read_deny_policy:read', // the endpoint read-deny policy is policy
+    'read_deny_policy:write',
   ],
   incident_reviewer: [
     'incidents.read',
@@ -43,6 +46,7 @@ const ROLE_PERMISSIONS = {
     'protect:read',
     'trusted_destinations:read', // review the whitelist + key states (metadata only)
     'trusted_readers:read', // review the sanctioned-reader allowlist (metadata only)
+    'read_deny_policy:read', // review the endpoint read-deny policy (metadata only)
   ],
 };
 

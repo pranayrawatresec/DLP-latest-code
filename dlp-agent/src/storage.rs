@@ -14,6 +14,7 @@ const INDEX_FILE: &str = "index.dlpx"; // latest VERIFIED detection index bundle
 const KEYRING_FILE: &str = "keyring.sealed"; // DPAPI-sealed (machine scope) KEK keyring
 const TRUSTED_DEST_FILE: &str = "trusted-destinations.json"; // METADATA ONLY — never key bytes
 const TRUSTED_READERS_FILE: &str = "trusted-readers.json"; // sanctioned-reader allowlist (metadata)
+const READ_DENY_POLICY_FILE: &str = "read-deny-policy.json"; // endpoint read-deny policy (metadata)
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentMeta {
@@ -168,6 +169,19 @@ impl Storage {
     /// agent has never synced one. Parsed by `trustedreaders::parse_readers`.
     pub fn load_trusted_readers(&self) -> Option<Vec<u8>> {
         std::fs::read(self.path(TRUSTED_READERS_FILE)).ok()
+    }
+
+    /// Persist the last-synced read-deny policy (metadata only) so the agent keeps
+    /// enforcing it if the server is briefly unreachable (fail-secure offline).
+    pub fn store_read_deny_policy(&self, json: &[u8]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        std::fs::write(self.path(READ_DENY_POLICY_FILE), json).context("writing read-deny policy")
+    }
+
+    /// Raw bytes of the last-persisted read-deny policy, or `None` when never synced.
+    pub fn load_read_deny_policy(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.path(READ_DENY_POLICY_FILE)).ok()
     }
 }
 

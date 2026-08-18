@@ -20,5 +20,6 @@ pub mod storage;
 pub mod supervise;
 pub mod trustdest;
 pub mod trustedreaders;
+pub mod readdenypolicy;
 pub mod trustsync;
 pub mod usb;

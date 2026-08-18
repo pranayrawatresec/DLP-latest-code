@@ -1,6 +1,7 @@
 //! Check-in: the mutual-TLS heartbeat. Proves identity with the client
 //! certificate, refreshes state, and (Phase 3) will receive the licensed
 //! entitlement token and signed policy bundle.
+use crate::readdenypolicy::{self, ReadDenyPolicy};
 use crate::trustedreaders::{self, SyncedReader};
 use crate::trustsync::{self, SyncedDestination, TrustedConfig};
 use crate::{client, config::Config, storage::Storage};
@@ -218,6 +219,67 @@ fn fetch_trusted_readers(cfg: &Config, storage: &Storage) -> Result<Vec<SyncedRe
         .json::<ReadersResponse>()
         .context("parsing trusted-readers response")?
         .readers)
+}
+
+/// Fetch the read-deny policy from the console, PERSIST + APPLY it (driver registry
+/// knobs + volume attach — no CLI), and return it for the `[kguard]` config
+/// override. On an unreachable server, reuse the last-persisted policy (fail-secure
+/// offline); the driver already holds the last-applied knobs from a prior success.
+pub fn sync_read_deny_policy(cfg: &Config, storage: &Storage) -> ReadDenyPolicy {
+    match fetch_read_deny_policy(cfg, storage) {
+        Ok(policy) => {
+            if let Ok(json) = serde_json::to_vec(&policy) {
+                if let Err(e) = storage.store_read_deny_policy(&json) {
+                    tracing::warn!(error = %e, "could not persist read-deny policy");
+                }
+            }
+            tracing::info!(
+                mode = %policy.mode,
+                posture = %policy.posture,
+                scan_fixed = policy.scan_fixed,
+                "synced read-deny policy from server"
+            );
+            readdenypolicy::apply_to_driver(&policy);
+            policy
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "read-deny policy sync failed — using last-persisted policy (offline, fail secure)"
+            );
+            load_read_deny_policy(storage)
+        }
+    }
+}
+
+fn fetch_read_deny_policy(cfg: &Config, storage: &Storage) -> Result<ReadDenyPolicy> {
+    #[derive(Deserialize)]
+    struct PolicyResponse {
+        policy: ReadDenyPolicy,
+    }
+    let (identity_pem, ca_pem) = storage.load_identity()?;
+    let client = client::checkin_client(&ca_pem, &identity_pem)?;
+    let resp = client
+        .get(cfg.read_deny_policy_url())
+        .send()
+        .context("read-deny-policy request failed")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        bail!("read-deny-policy refused [{status}]: {body}");
+    }
+    Ok(resp
+        .json::<PolicyResponse>()
+        .context("parsing read-deny-policy response")?
+        .policy)
+}
+
+/// The last-persisted read-deny policy, or the default (off) when never synced.
+pub fn load_read_deny_policy(storage: &Storage) -> ReadDenyPolicy {
+    match storage.load_read_deny_policy() {
+        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        None => ReadDenyPolicy::default(),
+    }
 }
 
 /// The last-persisted sanctioned-reader allowlist (metadata only). Empty when

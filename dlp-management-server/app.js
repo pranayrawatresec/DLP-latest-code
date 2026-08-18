@@ -15,6 +15,7 @@ var protectedRouter = require('./routes/protected');
 var incidentsRouter = require('./routes/incidents');
 var encryptionRouter = require('./routes/encryption');
 var trustedReadersRouter = require('./routes/trustedReaders');
+var readDenyPolicyRouter = require('./routes/readDenyPolicy');
 var { attachUser } = require('./middleware/auth');
 
 var app = express();
@@ -44,6 +45,7 @@ app.use('/api/protected', protectedRouter);
 app.use('/api/incidents', incidentsRouter);
 app.use('/api/encryption', encryptionRouter);
 app.use('/api/trusted-readers', trustedReadersRouter);
+app.use('/api/read-deny-policy', readDenyPolicyRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

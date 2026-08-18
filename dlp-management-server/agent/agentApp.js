@@ -371,6 +371,44 @@ app.get('/agent/trusted-readers', async (req, res, next) => {
   }
 });
 
+// --- GET /agent/read-deny-policy ---------------------------------------
+// The endpoint read-deny policy (mode / posture / scope / fail behaviour). The
+// agent applies this to the kernel driver programmatically — mode knob, watch
+// config, volume attach — so the operator never touches a command line. Metadata
+// only, no secrets (independent of the Org Root Key).
+app.get('/agent/read-deny-policy', async (req, res, next) => {
+  try {
+    const agent = await requireKnownAgent(req, res, 'agent-policy');
+    if (!agent) return;
+
+    const { rows } = await pool.query('select * from read_deny_policy where id = 1');
+    const p = rows[0] || {
+      mode: 'off',
+      posture: 'blocklist',
+      scan_fixed: false,
+      watch_paths: [],
+      fail_block: false,
+    };
+    const policy = {
+      mode: p.mode,
+      posture: p.posture,
+      scanFixed: p.scan_fixed,
+      watchPaths: p.watch_paths,
+      failBlock: p.fail_block,
+    };
+
+    await audit('agent-policy', 'agent.policy_delivered', agent.id, {
+      mode: policy.mode,
+      posture: policy.posture,
+      scanFixed: policy.scanFixed,
+    });
+
+    return res.status(200).json({ policy });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- POST /agent/incidents ---------------------------------------------
 // An agent reports a detection. The verdict carries hashes and ids ONLY —
 // never captured file content (evidence blobs are a later phase). Identity

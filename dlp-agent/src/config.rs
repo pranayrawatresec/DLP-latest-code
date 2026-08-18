@@ -690,6 +690,12 @@ impl Config {
         format!("{}/agent/trusted-readers", self.server_url.trim_end_matches('/'))
     }
 
+    /// Agent-facing read-deny policy endpoint (mode/posture/scope/fail). Served
+    /// over the same mTLS listener as check-in; the agent applies it to the driver.
+    pub fn read_deny_policy_url(&self) -> String {
+        format!("{}/agent/read-deny-policy", self.server_url.trim_end_matches('/'))
+    }
+
     /// Produce an effective config whose `[usb]` section has the synced
     /// trusted destinations merged in (encrypt-on-write M6). The
     /// console-authored whitelist takes precedence (first-match-wins) and any

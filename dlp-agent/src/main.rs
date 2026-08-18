@@ -22,8 +22,8 @@ mod service;
 // modules at the crate root so the binary submodules keep addressing them as
 // `crate::config` / `crate::storage`.
 use dlp_agent::{
-    browser_host, clipboard, config, crypto, decrypt, detect, exfil, netfilter, notify, storage,
-    supervise, trustdest, trustedreaders, trustsync, usb,
+    browser_host, clipboard, config, crypto, decrypt, detect, exfil, netfilter, notify,
+    readdenypolicy, storage, supervise, trustdest, trustedreaders, trustsync, usb,
 };
 
 use anyhow::{Context, Result};
@@ -780,7 +780,14 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
     // Read-deny allowlist posture: pull the sanctioned-reader allowlist too, so
     // the guard's exfil pusher classifies against the console-authored list.
     let readers = checkin::sync_trusted_readers(cfg, storage);
-    let effective = cfg.with_synced_destinations(&synced).with_synced_readers(&readers);
+    // Read-deny POLICY: pull the console-managed mode/posture/scope/fail, APPLY the
+    // driver knobs + volume attach (no CLI), and override the local [kguard] fields
+    // so the console is the single source of truth for read-deny.
+    let policy = checkin::sync_read_deny_policy(cfg, storage);
+    let effective = cfg
+        .with_synced_destinations(&synced)
+        .with_synced_readers(&readers)
+        .with_read_deny_policy(&policy);
     let shared: Arc<RwLock<Config>> = Arc::new(RwLock::new(effective));
 
     // Sealer liveness: keyring presence is the strong startup signal; liveness is
@@ -904,9 +911,11 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                 let _ = checkin::sync_trusted_config(&base_cfg, &storage);
                 let synced = checkin::load_synced_destinations(&storage);
                 let readers = checkin::sync_trusted_readers(&base_cfg, &storage);
+                let policy = checkin::sync_read_deny_policy(&base_cfg, &storage);
                 let new_effective = base_cfg
                     .with_synced_destinations(&synced)
-                    .with_synced_readers(&readers);
+                    .with_synced_readers(&readers)
+                    .with_read_deny_policy(&policy);
                 health.set_keyring_present(build_sealer_keyring(&base_cfg, &storage).is_some());
                 match shared.write() {
                     Ok(mut w) => *w = new_effective,
