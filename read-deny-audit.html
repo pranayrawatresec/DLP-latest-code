@@ -1,0 +1,383 @@
+<title>Read-Deny Audit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#EBEEF3; --surface:#FFFFFF; --surface-2:#F4F6FA; --code-bg:#EEF1F6;
+    --ink:#1B2130; --muted:#565F70; --faint:#828C9C; --border:#DCE2EB;
+    --accent:#2E57D0; --accent-ink:#20439E;
+    --crit:#CB3450; --crit-bg:#FBECEF; --crit-stripe:#CB3450;
+    --high:#B5720F; --high-bg:#FAF1E2; --high-stripe:#D08A1C;
+    --low:#66717F; --low-bg:#EFF1F4; --low-stripe:#8B95A3;
+    --prod:#6250BE; --prod-bg:#EFECFA; --prod-stripe:#6250BE;
+    --good:#238059; --good-bg:#E7F3ED; --good-stripe:#2E9E6B;
+    --shadow:0 1px 2px rgba(20,28,45,.04),0 3px 12px rgba(20,28,45,.05);
+    --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,"Cascadia Code","SFMono-Regular","Consolas","Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#0F131A; --surface:#181D26; --surface-2:#1E242E; --code-bg:#12161E;
+      --ink:#E6EBF2; --muted:#9AA4B4; --faint:#69737F; --border:#2A313D;
+      --accent:#7396F2; --accent-ink:#9DB4F6;
+      --crit:#F06880; --crit-bg:#2A1820; --crit-stripe:#EC5A76;
+      --high:#E0A54A; --high-bg:#271F13; --high-stripe:#E0A54A;
+      --low:#93A0B0; --low-bg:#1B2029; --low-stripe:#7B8797;
+      --prod:#A492F2; --prod-bg:#1E1A2B; --prod-stripe:#9E8BF0;
+      --good:#57C08C; --good-bg:#132219; --good-stripe:#56C08C;
+      --shadow:0 1px 2px rgba(0,0,0,.25),0 3px 14px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0F131A; --surface:#181D26; --surface-2:#1E242E; --code-bg:#12161E;
+    --ink:#E6EBF2; --muted:#9AA4B4; --faint:#69737F; --border:#2A313D;
+    --accent:#7396F2; --accent-ink:#9DB4F6;
+    --crit:#F06880; --crit-bg:#2A1820; --crit-stripe:#EC5A76;
+    --high:#E0A54A; --high-bg:#271F13; --high-stripe:#E0A54A;
+    --low:#93A0B0; --low-bg:#1B2029; --low-stripe:#7B8797;
+    --prod:#A492F2; --prod-bg:#1E1A2B; --prod-stripe:#9E8BF0;
+    --good:#57C08C; --good-bg:#132219; --good-stripe:#56C08C;
+    --shadow:0 1px 2px rgba(0,0,0,.25),0 3px 14px rgba(0,0,0,.28);
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--font-sans);line-height:1.62;
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  }
+  .wrap{max-width:920px;margin:0 auto;padding:clamp(20px,4vw,56px) clamp(16px,4vw,40px) 96px}
+
+  /* ---- header ---- */
+  header.masthead{border-bottom:1px solid var(--border);padding-bottom:28px;margin-bottom:8px}
+  .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  h1{font-size:clamp(1.9rem,4.5vw,2.7rem);line-height:1.08;margin:.35em 0 .3em;letter-spacing:-.02em;text-wrap:balance;font-weight:700}
+  .lede{font-size:1.06rem;color:var(--muted);max-width:64ch;margin:0}
+  .lede strong{color:var(--ink);font-weight:600}
+  .meta-line{margin-top:18px;font-family:var(--font-mono);font-size:.76rem;color:var(--faint);display:flex;flex-wrap:wrap;gap:6px 18px}
+
+  /* ---- theme banner ---- */
+  .theme-note{
+    margin:26px 0 6px;padding:16px 18px;border-radius:12px;
+    background:var(--crit-bg);border:1px solid color-mix(in srgb,var(--crit) 30%,transparent);
+    box-shadow:var(--shadow)}
+  .theme-note h2{margin:0 0 4px;font-size:1rem;color:var(--crit);letter-spacing:-.01em}
+  .theme-note p{margin:0;color:var(--ink);font-size:.95rem}
+
+  /* ---- legend ---- */
+  .legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin:26px 0 40px}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--s)}
+  .stat .n{font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums;line-height:1;color:var(--ink)}
+  .stat .l{font-size:.78rem;color:var(--muted);margin-top:5px;letter-spacing:.01em}
+  .stat.crit{--s:var(--crit-stripe)} .stat.high{--s:var(--high-stripe)}
+  .stat.low{--s:var(--low-stripe)} .stat.prod{--s:var(--prod-stripe)} .stat.good{--s:var(--good-stripe)}
+  .stat.ui{--s:var(--accent)}
+
+  /* ---- section headers ---- */
+  .sec{margin:44px 0 18px;display:flex;align-items:center;gap:12px}
+  .sec .dot{width:11px;height:11px;border-radius:50%;background:var(--sc);flex:none}
+  .sec h2{font-size:1.28rem;margin:0;letter-spacing:-.01em}
+  .sec .count{font-family:var(--font-mono);font-size:.78rem;color:var(--faint);margin-left:auto}
+  .sec.crit{--sc:var(--crit-stripe)} .sec.high{--sc:var(--high-stripe)}
+  .sec.low{--sc:var(--low-stripe)} .sec.prod{--sc:var(--prod-stripe)} .sec.good{--sc:var(--good-stripe)}
+  .sec-intro{color:var(--muted);font-size:.95rem;margin:-6px 0 20px;max-width:70ch}
+
+  /* ---- finding cards ---- */
+  .finding{
+    background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--stripe);
+    border-radius:12px;padding:18px 20px 16px;margin-bottom:14px;box-shadow:var(--shadow)}
+  .finding.crit{--stripe:var(--crit-stripe)} .finding.high{--stripe:var(--high-stripe)}
+  .finding.low{--stripe:var(--low-stripe)} .finding.prod{--stripe:var(--prod-stripe)}
+  .finding.good{--stripe:var(--good-stripe)}
+  .f-head{display:flex;align-items:baseline;gap:11px;flex-wrap:wrap}
+  .f-id{font-family:var(--font-mono);font-size:.82rem;font-weight:600;color:var(--faint);flex:none;min-width:1.6em}
+  .f-title{font-size:1.06rem;font-weight:650;margin:0;letter-spacing:-.01em;flex:1 1 300px;line-height:1.3}
+  .chip{font-size:.68rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:3px 9px;border-radius:999px;flex:none;white-space:nowrap}
+  .chip-crit{background:var(--crit-bg);color:var(--crit)} .chip-high{background:var(--high-bg);color:var(--high)}
+  .chip-low{background:var(--low-bg);color:var(--low)} .chip-prod{background:var(--prod-bg);color:var(--prod)}
+  .chip-good{background:var(--good-bg);color:var(--good)}
+  .chip-fixed{background:var(--good-bg);color:var(--good)}
+  .chip-partial{background:var(--high-bg);color:var(--high)}
+  .finding.done{background:color-mix(in srgb,var(--good-bg) 45%,var(--surface))}
+  .row.done2{background:color-mix(in srgb,var(--good-bg) 45%,var(--surface))}
+  .rowdone{color:var(--good);font-weight:700;font-size:.68rem;font-family:var(--font-mono);letter-spacing:.04em;margin-left:8px;white-space:nowrap}
+  .progress{margin:26px 0 8px;padding:16px 18px;border-radius:12px;background:var(--good-bg);border:1px solid color-mix(in srgb,var(--good) 30%,transparent);box-shadow:var(--shadow)}
+  .progress h2{margin:0 0 6px;font-size:1rem;color:var(--good);letter-spacing:-.01em}
+  .progress p{margin:0 0 6px;color:var(--ink);font-size:.93rem}
+  .progress p:last-child{margin-bottom:0}
+  .progress b{color:var(--good)}
+  .progress .mono{font-family:var(--font-mono);font-size:.86em}
+  .f-meta{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:11px 0 12px}
+  .tag{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);background:var(--surface-2);border:1px solid var(--border);padding:2px 8px;border-radius:6px}
+  code,.loc{font-family:var(--font-mono);font-size:.82em}
+  .loc{background:var(--code-bg);color:var(--muted);padding:2px 7px;border-radius:6px;border:1px solid var(--border)}
+  .f-plain{margin:0 0 10px;font-size:.97rem;color:var(--ink)}
+  .f-plain .k{color:var(--muted);font-weight:600}
+  .f-fix{margin:0;font-size:.9rem;color:var(--muted);padding-top:10px;border-top:1px dashed var(--border);display:flex;gap:9px;align-items:baseline}
+  .fixk{font-family:var(--font-mono);font-size:.66rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);flex:none;padding-top:1px}
+  .f-fix b{color:var(--ink);font-weight:600}
+
+  /* compact rows for low + productionization + good */
+  .rows{display:flex;flex-direction:column;gap:9px}
+  .row{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--stripe);border-radius:10px;padding:12px 15px;box-shadow:var(--shadow)}
+  .row.low{--stripe:var(--low-stripe)} .row.prod{--stripe:var(--prod-stripe)} .row.good{--stripe:var(--good-stripe)}
+  .row .rt{font-weight:600;font-size:.95rem;margin-bottom:3px}
+  .row .rt .must{font-family:var(--font-mono);font-size:.62rem;font-weight:700;letter-spacing:.05em;color:var(--prod);border:1px solid color-mix(in srgb,var(--prod) 40%,transparent);border-radius:5px;padding:1px 6px;margin-left:8px;text-transform:uppercase;vertical-align:middle}
+  .row p{margin:0;font-size:.9rem;color:var(--muted)}
+  .row.good .rt{color:var(--good)}
+
+  /* fix-order strip */
+  .order{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin-top:16px;box-shadow:var(--shadow)}
+  .order h3{margin:0 0 12px;font-size:1.05rem}
+  .steps{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:.9rem}
+  .step{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:6px 11px}
+  .step b{color:var(--accent-ink)}
+  .arrow{color:var(--faint);font-family:var(--font-mono)}
+
+  footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--border);color:var(--faint);font-size:.8rem;font-family:var(--font-mono)}
+  a{color:var(--accent);text-underline-offset:2px}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <div class="eyebrow">Production-Readiness Audit</div>
+    <h1>Read-Deny &amp; Trusted-Reader Allowlist</h1>
+    <p class="lede">Every finding that stands between the working RustDesk/AnyDesk block and a shippable feature — across the kernel driver, the Windows agent, and the management console. Each is explained in plain terms: <strong>what it is, and what actually goes wrong</strong> — including what still can't be done from the console.</p>
+    <div class="meta-line">
+      <span>scope: dlpflt.sys · dlp-agent · management-server + console</span>
+      <span>method: code read + 2 parallel auditors</span>
+    </div>
+  </header>
+
+  <div class="theme-note">
+    <h2>The one pattern to remember</h2>
+    <p>Both auditors landed on the same theme independently: the allowlist is supposed to <em>block anything not explicitly trusted</em>, but in several places it quietly does the opposite — it lets things through and gives <strong>no warning that protection just switched off</strong>. That "fail-open" behaviour is the through-line of the red items below, and it's the exact opposite of the project's fail-secure rule.</p>
+  </div>
+
+  <div class="progress">
+    <h2>Progress — all 4 blockers closed, 14 findings fixed</h2>
+    <p><b>Fixed &amp; verified:</b> <span class="mono">#1, #2, #3, #4, #5, #6, #10, #11, #12, #15, L1, L2, L4, P1</span> — plus a <b>content-change laundering bug</b> found and fixed alongside #2. The kernel set (#2, #4, #5 monitor, #6, content-change) is <b>runtime-verified on the VM</b>: OPORD blocked in enforce, allowed-but-reported in monitor, clean files allowed, a file overwritten with sensitive content flips clean→blocked, writes unaffected, no crash. <b>#5 monitor mode now exists</b> (driver third-state + agent would-block labelling); its one-click console toggle is folded into <span class="mono">C4</span>.</p>
+    <p><b>Remaining:</b> cache-hit audit (<span class="mono">#7</span>), reboot-persist (<span class="mono">#8</span>), central-authoritative allowlist (<span class="mono">#9</span>), open-deny perf (<span class="mono">#13</span>), revocation (<span class="mono">#14</span>), remaining low items, the console settings pages (<span class="mono">C1–C4</span>), and productionization (<span class="mono">P2, P3, P5, P6, P7</span>).</p>
+  </div>
+
+  <div class="legend">
+    <div class="stat crit"><div class="n">4</div><div class="l">Release-blockers</div></div>
+    <div class="stat high"><div class="n">11</div><div class="l">Important</div></div>
+    <div class="stat ui"><div class="n">7</div><div class="l">Console gaps</div></div>
+    <div class="stat low"><div class="n">11</div><div class="l">Low / polish</div></div>
+    <div class="stat prod"><div class="n">6</div><div class="l">Productionization</div></div>
+    <div class="stat good"><div class="n">7</div><div class="l">Confirmed sound</div></div>
+  </div>
+
+  <!-- ============ BLOCKERS ============ -->
+  <div class="sec crit"><span class="dot"></span><h2>Release-blockers</h2><span class="count">must fix before shipping</span></div>
+  <p class="sec-intro">These either break normal use, silently turn protection off, or let a sensitive file leak. Nothing ships until these are closed.</p>
+
+  <article class="finding crit done">
+    <div class="f-head"><span class="f-id">1</span><h3 class="f-title">Protection silently fails "open" in several situations</h3><span class="chip chip-crit">Blocker</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Agent</span><span class="loc">exfil.rs:195, 290-300, 162-168, 242-272</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The system is meant to block every program that isn't on the trusted list. But in four situations it does the reverse and lets everything through, with nothing telling the operator the machine is now unprotected: (a) if the guard can't identify a program, it treats it as <em>trusted</em> instead of untrusted; (b) if listing the running programs briefly fails, it sends the driver an <em>empty</em> set, which wipes out all blocking; (c) if the trusted list is empty, it blocks nothing; (d) if the guard isn't running with full privileges, it can't even see system-level programs (this was the original RustDesk-helper gap) — and it never checks or logs whether it actually has those privileges.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span><b>Fail secure:</b> unidentifiable → treat as untrusted; on an enumeration failure keep the previous set instead of clearing it; warn loudly on an empty list; verify + log elevation and privilege state at startup.</span></p>
+  </article>
+
+  <article class="finding crit done">
+    <div class="f-head"><span class="f-id">2</span><h3 class="f-title">A file opened during startup can be marked "safe" forever</h3><span class="chip chip-crit">Blocker</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="tag">Agent</span><span class="loc">kguard/mod.rs:927-933, 816-820 · dlpflt.c:1755</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> When the agent first starts, there's a brief window before it has loaded its "what counts as sensitive" fingerprints. During that window it can't recognise anything, so it answers the driver with "this file is fine." The driver <em>remembers that answer permanently</em>. So a classified document that happens to be read in those first few seconds gets stamped safe — and stays safe even after the agent knows better. Confirmed on both sides: the agent sends a success+allow reply, and the driver caches it as a clean verdict.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>When the agent can't actually classify, reply with a distinct "couldn't scan — don't cache" status; invalidate cached verdicts when the fingerprint bundle loads.</span></p>
+  </article>
+
+  <article class="finding crit done">
+    <div class="f-head"><span class="f-id">3</span><h3 class="f-title">One over-broad rule turns the whole feature off</h3><span class="chip chip-crit">Blocker</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Server</span><span class="tag">Agent</span><span class="loc">trustedReaders.js:31-46 · trustedreaders.rs:104-123</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> An admin can add a trusted rule like <code>C:\</code> or <code>C:\Users</code> — a folder so broad it covers everything. That single rule marks <em>every program on the computer</em> as trusted, which switches read-deny entirely off. The server accepts it with no breadth check, the agent happily matches every program against it, and nothing warns the admin they just disabled the control they were configuring.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Server rejects drive-roots and too-shallow paths and validates each rule type properly; the agent defensively ignores drive-root path rules.</span></p>
+  </article>
+
+  <article class="finding crit done">
+    <div class="f-head"><span class="f-id">4</span><h3 class="f-title">Open-time blocking breaks creating new / empty files</h3><span class="chip chip-crit">Blocker</span><span class="chip chip-fixed">✓ Verified on VM</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="loc">dlpflt.c:1720-1734 (DlpExfilClassifyAndCache)</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The new open-time block reads a file to decide if it's sensitive <em>before</em> letting a program open it. But an empty or brand-new file has nothing to read yet — so the fail-safe assumes the worst and blocks the open. The result: once the C: drive is watched, ordinary untrusted programs can't create or open their own new files, so normal apps start failing. (The old read-time path didn't have this problem because it skipped empty reads.)</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>At open, block only on a <b>positive</b> sensitive match (known-bad hash or a real fingerprint hit); let genuinely unreadable/empty content pass and be judged on the real read.</span></p>
+  </article>
+
+  <!-- ============ IMPORTANT ============ -->
+  <div class="sec high"><span class="dot"></span><h2>Important</h2><span class="count">fix before a real rollout</span></div>
+  <p class="sec-intro">Not instant showstoppers, but each is a real gap that will bite in a live deployment — missing safety rails, blind spots in the audit trail, or operational dead-ends.</p>
+
+  <article class="finding high done">
+    <div class="f-head"><span class="f-id">5</span><h3 class="f-title">No "watch without blocking" (monitor) mode</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Verified on VM</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="tag">Agent</span><span class="tag">UI</span><span class="loc">config.rs:316-323 · TrustedReaders.jsx:197</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Blocking is only fully on or fully off. There's no mode that <em>watches and reports</em> what it <em>would</em> block without actually blocking. So you can't safely find out which legitimate apps you forgot to add to the trusted list — you discover them by breaking people's machines the moment you turn it on. Worse, the admin screen already tells operators to "roll out in monitor mode first" — a mode that doesn't exist.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Add a monitor posture (log + raise incidents, but allow) end-to-end; fix the UI copy until it exists.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">6</span><h3 class="f-title">Watched-folder check matches text anywhere in the path</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Verified on VM</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="loc">comms.c:424 (DlpUnicodeContainsCI)</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The driver decides whether a file is in a watched folder by checking if the folder text appears <em>anywhere</em> in the file's path, not whether the path actually starts with it. So watching <code>\Users</code> also accidentally covers unrelated folders that merely contain the letters "Users." Scope becomes broader and fuzzier than intended — and could be gamed. (The agent's own path logic is correct here; the driver's isn't.)</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Match on a real path prefix at a folder boundary, not a substring.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">7</span><h3 class="f-title">Repeat blocks aren't written to the audit log</h3><span class="chip chip-high">Important</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="tag">Agent</span><span class="loc">kguard/mod.rs:831-833</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The first time a file is blocked, it's logged. Every block after that is handled instantly inside the driver and never reaches the logging code. So if a program hammers a sensitive file fifty times, the security log shows one attempt, not fifty — the audit trail under-counts exactly the events an investigator cares about. For a product whose selling point is a complete tamper-proof audit, that's a real gap.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Have the driver emit lightweight, coalesced "denied" notifications so cached blocks are still auditable.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">8</span><h3 class="f-title">A reboot silently leaves the C: drive unprotected</h3><span class="chip chip-high">Important</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="loc">dlpflt.c:481 (DlpInstanceSetup)</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Watching the C: drive is set up at run time, after the guard connects. But on a reboot the driver attaches to drives <em>before</em> the guard is up — sees no watch config — so it skips C: and never retries. Every restart quietly leaves the C: drive unwatched until someone manually re-runs the attach command. (Removable USB drives are unaffected — they're always watched.)</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Store the fixed-drive watch settings in the driver's registry keys so they're read at boot, before any drive attaches.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">9</span><h3 class="f-title">Rules typed on an endpoint can't be removed centrally</h3><span class="chip chip-high">Important</span></div>
+    <div class="f-meta"><span class="tag">Agent</span><span class="loc">config.rs:711-718 · main.rs:907-909</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Trusted rules written directly in a machine's local config are <em>merged</em> with the central list, and the console can only ever <em>add</em> trust, never subtract it. So if a bad or over-broad rule (like #3) is sitting in a local file, an admin can't revoke it from headquarters — they'd have to physically touch every affected machine.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Support a server-authoritative mode (central list wins) or a central override that can suppress a local rule.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">10</span><h3 class="f-title">The agent's own encryption helper gets blocked</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Agent</span><span class="loc">exfil.rs:181 · kguard/mod.rs:26-37</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The agent has a separate helper process that legitimately reads files in order to encrypt them. Only the <em>main</em> agent process is exempted from blocking, so this helper is treated as untrusted and denied the reads it needs — quietly breaking the encrypt-on-write feature unless someone remembers to add the agent to its own trusted list.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Automatically trust the agent's own installed binaries, independent of the admin-authored list.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">11</span><h3 class="f-title">A change can be saved without its audit record</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Server</span><span class="loc">trustedReaders.js:84-103, 115-124</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> When an admin adds or removes a trusted rule, the change is saved to the database first and the tamper-proof log entry is written second, as a separate step. If the server crashes in between, the change is done but there's no record of who made it — a hole in the "every change is logged" guarantee. Deleting a rule is the worst case: the rule vanishes with no trail.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Write the change and its audit entry in a single database transaction so they succeed or fail together.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">12</span><h3 class="f-title">Publisher cache grows forever and can be tricked</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Agent</span><span class="loc">exfil.rs:339-357</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The agent remembers each program's publisher and never forgets, so memory grows without limit — and an attacker can inflate it on purpose by launching many oddly-named programs. It also remembers by file location, so if a trusted program's file is swapped for a malicious one at the same path, the agent keeps trusting the old, good identity.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Cap the cache (evict oldest) and key it on the file's identity (size/timestamp/hash) so a swapped file is re-checked.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">13</span><h3 class="f-title">Checking every file at open time adds overhead</h3><span class="chip chip-high">Important</span></div>
+    <div class="f-meta"><span class="tag">Kernel</span><span class="loc">dlpflt.c (DlpPostCreate open-deny)</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The old design inspected a file only when it was actually read. The new open-time block inspects every file an untrusted program <em>opens</em> — which is far more often. On a broadly-watched folder, an untrusted app that touches many files pays a cost on each one's first touch, which can noticeably slow it (and the machine) down.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>At open, act on already-known verdicts (cache hits) and let the first encounter be judged on the read; or classify off the hot path.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">14</span><h3 class="f-title">A stolen or revoked signing certificate is still trusted</h3><span class="chip chip-high">Important</span></div>
+    <div class="f-meta"><span class="tag">Agent</span><span class="loc">exfil.rs:526 (WTD_REVOKE_NONE)</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Programs are trusted by their software publisher's signature, but revocation checking is turned off. If a trusted vendor's signing certificate is stolen or revoked, the agent still trusts anything signed with it — which is exactly the supply-chain / insider scenario this product is built to stop. (There's real tension with the air-gapped requirement, but it should at least be surfaced.)</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Use offline revocation lists where available; at minimum, document and surface that revocation isn't checked.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">15</span><h3 class="f-title">Duplicate-rule prevention ignores capitalisation</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Fixed</span></div>
+    <div class="f-meta"><span class="tag">Server</span><span class="loc">008_trusted_readers.sql:26</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> The "no duplicates" guard on the list is case-sensitive, but Windows matching ignores case. So <code>winword.exe</code> and <code>WINWORD.EXE</code> are stored as two separate rules that mean the identical thing — the list fills with confusing near-duplicates and the duplicate-blocker doesn't actually work.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Normalise (lower-case, trim trailing slash) before saving and enforce uniqueness on the normalised value.</span></p>
+  </article>
+
+  <!-- ============ CONSOLE COVERAGE ============ -->
+  <div class="sec"><span class="dot" style="background:var(--accent)"></span><h2>Console coverage — still needs the command line</h2><span class="count">requirement: no CLI</span></div>
+  <p class="sec-intro">Whitelisting applications works fully from the console (the <em>Trusted applications</em> page ✓). But the read-deny feature as a whole can't yet be <em>operated</em> from the UI — turning it on, choosing what it protects, and rolling it out still require editing config files and running commands on each endpoint. Confirmed by searching the whole server: it holds <strong>no read-deny settings at all</strong> — nothing for posture, on/off, or which folders to watch.</p>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">C1</span><h3 class="f-title">No way to turn read-deny on or off from the console</h3><span class="chip chip-high">High</span></div>
+    <div class="f-meta"><span class="tag">Console gap</span><span class="loc">local agent.toml + driver registry</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Whether endpoint read-protection is on lives in each machine's local config file plus a switch in the driver's registry. There's no toggle in the console to enable or disable it, so an admin can't turn the feature on or off centrally.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>A console setting (global or per-group) that syncs "read-deny enabled" down to agents, which set the driver switch.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">C2</span><h3 class="f-title">No way to choose which drives or folders are protected</h3><span class="chip chip-high">High</span></div>
+    <div class="f-meta"><span class="tag">Console gap</span><span class="loc">scan_fixed + watch_paths + fltmc attach</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Deciding "protect C:\Users" or "protect the whole C: drive" is hand-edited in each endpoint's config file and then needs a manual <code>fltmc attach</code> command — exactly the steps we ran by hand on the test machine. This is the single most important scoping decision in the feature, and it isn't in the console at all. (Removable USB is always protected automatically; fixed drives are the gap.)</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>A console screen to pick watched drives/folders, synced to agents that configure and attach the driver automatically.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">C3</span><h3 class="f-title">No way to choose the posture (allowlist vs blocklist)</h3><span class="chip chip-high">High</span></div>
+    <div class="f-meta"><span class="tag">Console gap</span><span class="loc">exfil_posture (local agent.toml)</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> Whether a machine blocks "everything except the trusted list" (allowlist) or only "known-bad tools" (blocklist) is set in the local config file. The admin can't choose the strategy from the console — yet that choice decides how the trusted-applications list they <em>do</em> manage in the UI is even used.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Expose posture as a console setting alongside the trusted-applications list.</span></p>
+  </article>
+
+  <article class="finding high">
+    <div class="f-head"><span class="f-id">C4</span><h3 class="f-title">No monitor / enforce switch in the console</h3><span class="chip chip-high">High</span></div>
+    <div class="f-meta"><span class="tag">Console gap</span><span class="loc">ties to Important #5</span></div>
+    <p class="f-plain"><span class="k">In plain terms —</span> A safe rollout means running in "watch and warn" first, then switching to "block." That mode doesn't exist yet (Important #5) — and when it's built it has to be a console toggle, so an admin can start in monitor mode, read the incidents to see what would break, and flip to enforce, all from the UI.</p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>Build monitor mode (#5) and surface monitor→enforce as a per-group console control.</span></p>
+  </article>
+
+  <div class="rows">
+    <div class="row low"><div class="rt">Driver safety switches are registry-only</div><p>Fail-secure behaviour and "block unreadable content" are registry values set by hand or the installer, not console settings. They should be installer-set and, where sensible, visible in the console.</p></div>
+    <div class="row low"><div class="rt">No per-machine or per-group targeting</div><p>The trusted-applications list and every setting are <em>global</em> — one list for every endpoint. An admin can't give a pilot group or a department different rules, or roll out to a subset, from the console.</p></div>
+    <div class="row low"><div class="rt">Bringing an endpoint online is still install-time CLI</div><p>The enrollment token is created in the UI ✓, but enrolling the endpoint and loading its first fingerprint set happen on the machine (installer/service). Acceptable as install, but note it isn't "from the console."</p></div>
+  </div>
+
+  <!-- ============ LOW ============ -->
+  <div class="sec low"><span class="dot"></span><h2>Low / polish</h2><span class="count">11 items</span></div>
+  <div class="rows">
+    <div class="row low"><div class="rt">Name-only rules are easy to fake</div><p>A "trust by program name" rule trusts anything with that name — rename malware to <code>winword.exe</code> and it's trusted. Warn when a name rule has no path/publisher constraint.</p></div>
+    <div class="row low"><div class="rt">~2-second gap for brand-new programs</div><p>A freshly launched untrusted program has up to ~2s before it lands in the block set. Inherent to the polling design — document the window rather than claim "instant."</p></div>
+    <div class="row low done2"><div class="rt">Only the first 4096 programs are checked <span class="rowdone">✓ Fixed</span></div><p>On a very busy machine, programs beyond a fixed 4096 buffer are never listed, so never blocked. Grow-and-retry the buffer.</p></div>
+    <div class="row low"><div class="rt">Accented publisher names may not match</div><p>Publisher comparison only case-folds plain English letters, so an accented vendor name typed in a different case can miss. Use full Unicode case-folding.</p></div>
+    <div class="row low done2"><div class="rt">Noisy logging of every process ID <span class="rowdone">✓ Fixed</span></div><p>The agent logs the full list of hundreds of process IDs every ~2s at normal log level — noisy and exposes system layout. Drop to debug / rate-limit.</p></div>
+    <div class="row low"><div class="rt">Reported content size is trusted blindly</div><p>The agent trusts the byte-count the driver reports without confirming the bytes arrived. Low risk (the kernel is trusted) but worth validating.</p></div>
+    <div class="row low done2"><div class="rt">Bad delete-id returns a server error <span class="rowdone">✓ Fixed</span></div><p>An out-of-range id in a delete request produces a 500 instead of a clean "not found." Cap the numeric range.</p></div>
+    <div class="row low"><div class="rt">Length limits live only in app code</div><p>The value/note length caps are enforced in the route, not the database, so any other write path is unbounded. Add database length checks.</p></div>
+    <div class="row low"><div class="rt">List endpoints have no size limit</div><p>Both the admin and agent list endpoints return the entire table with no paging. Fine while small; note it before the list can grow large.</p></div>
+    <div class="row low"><div class="rt">Recycled file IDs could carry a stale verdict</div><p>Rare: Windows can reuse an internal file id, and a cached sensitive/clean verdict could briefly apply to the wrong file. Mitigated by the epoch reset.</p></div>
+    <div class="row low"><div class="rt">Confirm cancelling an open is always safe</div><p>Verify the open-cancel call behaves for every open type (create/overwrite, oplocks, transactions) — pairs with blocker #4's scoping.</p></div>
+  </div>
+
+  <!-- ============ PRODUCTIONIZATION ============ -->
+  <div class="sec prod"><span class="dot"></span><h2>Productionization</h2><span class="count">process, not code bugs</span></div>
+  <p class="sec-intro">These aren't defects in the logic — they're the work of turning a working demo into something that installs, runs, and rolls out on its own.</p>
+  <div class="rows">
+    <div class="row prod done2"><div class="rt">Remove the demo debug code <span class="must">Must</span> <span class="rowdone">✓ Fixed</span></div><p>The driver still writes process IDs and filenames into the registry on every access to a file named "OPORD" — leftover test scaffolding that leaks information and slows the hot path. Strip it and re-sign.</p></div>
+    <div class="row prod"><div class="rt">Installer sets everything up + runs as SYSTEM <span class="must">Must</span></div><p>Today it only works with hand-typed commands. The installer must set the registry switches, persist the watch settings, and run the guard as the SYSTEM service so it can see privileged programs — no manual steps.</p></div>
+    <div class="row prod"><div class="rt">Ship a real starter trusted-list <span class="must">Must</span></div><p>Windows, Office, the PDF viewer/browser, antivirus, backup, and the agent itself — plus curation guidance. Without it, the machine is unusable the moment protection turns on (every app blocked from its own files).</p></div>
+    <div class="row prod"><div class="rt">Automated tests + updated runbook</div><p>A documented test matrix (read, memory-map, open-deny, empty file, trusted flip, no-bundle) instead of manual VM poking.</p></div>
+    <div class="row prod"><div class="rt">Production driver signing</div><p>Sign with a real attestation/EV certificate, not the self-signed test certificate.</p></div>
+    <div class="row prod"><div class="rt">Stop committing build output</div><p>Compiled <code>.obj</code>/<code>.sys</code> files are checked into git; add them to gitignore.</p></div>
+  </div>
+
+  <!-- ============ CONFIRMED SOUND ============ -->
+  <div class="sec good"><span class="dot"></span><h2>Confirmed sound</h2><span class="count">no action needed</span></div>
+  <p class="sec-intro">Checked and found correct — worth knowing what you <em>don't</em> have to touch.</p>
+  <div class="rows">
+    <div class="row good"><div class="rt">Publisher verification fails closed</div><p>Any error verifying a signature results in "not trusted" — an unverifiable program is never trusted by publisher.</p></div>
+    <div class="row good"><div class="rt">The agent's path-prefix logic is correct</div><p>It correctly distinguishes <code>\App</code> from <code>\Application</code> and handles slashes/case/trailing separators (this is the driver's weak spot, #6 — but the agent is right).</p></div>
+    <div class="row good"><div class="rt">No crashes on hostile input</div><p>No panics/unwraps found on attacker- or environment-controlled data; buffer copies are length-capped.</p></div>
+    <div class="row good"><div class="rt">Two-gate authorization is correct</div><p>Every console route authenticates then checks the right permission; no separation-of-duties violation.</p></div>
+    <div class="row good"><div class="rt">Denied attempts are audited</div><p>A blocked authorization attempt is written to the audit log before the 403 is returned.</p></div>
+    <div class="row good"><div class="rt">The agent endpoint leaks nothing</div><p>The mTLS trusted-readers endpoint rejects unknown/unauthenticated callers, returns metadata only, and audits delivery.</p></div>
+    <div class="row good"><div class="rt">Safe SQL + no XSS + correct UI gating</div><p>Parameterised queries throughout, React auto-escaping on all user values, and add/remove controls gated on write permission.</p></div>
+  </div>
+
+  <!-- ============ FIX ORDER ============ -->
+  <div class="sec"><span class="dot" style="background:var(--accent)"></span><h2>Suggested fix order</h2></div>
+  <div class="order">
+    <h3>Work the blast radius down</h3>
+    <div class="steps">
+      <span class="step"><b>#1–#4</b> fail-secure + open-deny breakage + the bypass rule</span>
+      <span class="arrow">→</span>
+      <span class="step"><b>#2</b> cache poisoning</span>
+      <span class="arrow">→</span>
+      <span class="step"><b>P1 · P4 · #5</b> strip debug code + monitor mode</span>
+      <span class="arrow">→</span>
+      <span class="step"><b>#6 · #8 · server #3</b> scope + reboot + validation</span>
+      <span class="arrow">→</span>
+      <span class="step">everything else</span>
+    </div>
+  </div>
+
+  <footer>Read-Deny &amp; Trusted-Reader Allowlist · production-readiness audit · kernel + agent + console</footer>
+</div>

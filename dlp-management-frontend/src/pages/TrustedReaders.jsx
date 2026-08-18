@@ -194,7 +194,7 @@ export default function TrustedReaders() {
           <EmptyState
             icon={<AppWindowIcon className="h-6 w-6" />}
             title="No trusted applications yet"
-            description="Add the applications allowed to read sensitive content (Office, your PDF reader, antivirus, backup, the DLP agent). Roll out in monitor mode first, then enforce."
+            description="Add the applications allowed to read sensitive content (Office, your PDF reader/browser, antivirus, backup, the DLP agent). Curate this list before enforcement — every process not listed is denied the read of sensitive files on endpoints."
             action={
               canWrite && (
                 <Button onClick={() => setShowAdd(true)}>

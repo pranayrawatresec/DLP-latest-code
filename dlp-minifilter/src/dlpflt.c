@@ -111,7 +111,8 @@ FLT_PREOP_CALLBACK_STATUS FLTAPI DlpPreAcquireForSection(
 static LONG DlpExfilClassifyAndCache(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ ULONG Pid);
+    _In_ ULONG Pid,
+    _Out_opt_ PBOOLEAN Positive);
 
 /* Per-thread re-entrancy guard. Our own cached FltReadFile (in the classifier)
  * lazily creates the file's data section, re-entering DlpPreAcquireForSection on
@@ -121,10 +122,6 @@ static VOID    DlpClassifyGuardInit(VOID);
 static BOOLEAN DlpClassifyEnter(VOID);
 static VOID    DlpClassifyExit(VOID);
 static BOOLEAN DlpClassifyActive(VOID);
-
-/* TEMP-DIAGNOSTIC forward decls (OPORD access trace). */
-static BOOLEAN DlpNameHas(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Sub);
-static BOOLEAN DlpIsOpord(_Inout_ PFLT_CALLBACK_DATA Data);
 
 /* Shared stream-read helper (used by DlpInspectStream and the read-deny
  * classifier). Reads offset 0..min(EOF,DLP_MAX_CONTENT) into a fresh
@@ -282,16 +279,6 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     }
     gDlpData.ConfigLockInit = TRUE;
 
-    /* TEMP-DIAGNOSTIC: save the service registry path for the OPORD trace. */
-    gDlpData.SvcRegPathValid = FALSE;
-    if (RegistryPath != NULL && RegistryPath->Buffer != NULL &&
-        RegistryPath->Length > 0 &&
-        RegistryPath->Length < sizeof(gDlpData.SvcRegPath)) {
-        RtlCopyMemory(gDlpData.SvcRegPath, RegistryPath->Buffer, RegistryPath->Length);
-        gDlpData.SvcRegPathBytes = RegistryPath->Length;
-        gDlpData.SvcRegPathValid = TRUE;
-    }
-
     /* Read the deployment's FailMode from the service registry key. */
     DlpReadFailMode(RegistryPath);
 
@@ -346,7 +333,7 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
      * PID-reuse window between agent pushes). Registered AFTER FltStartFiltering,
      * only when read-deny is live. Non-fatal: the agent's next full-replace still
      * bounds the exfil table without it. */
-    if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
+    if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_DISABLED) {
         if (NT_SUCCESS(PsSetCreateProcessNotifyRoutineEx(DlpCreateProcessNotify,
                                                          FALSE))) {
             gDlpData.ProcNotifyRegistered = TRUE;
@@ -675,13 +662,6 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
-    /* TEMP-DIAGNOSTIC: record every OPORD open (pid, exfil, would-skip). */
-    if (KeGetCurrentIrql() == PASSIVE_LEVEL && DlpIsOpord(Data)) {
-        ULONG p = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-        DlpTraceCre(p, DlpExfilLookup(p) ? 1u : 0u,
-                    DlpShouldSkip(Data, FltObjects) ? 1u : 0u);
-    }
-
     /* Item 1: single top-of-callback gate (self-skip / paging / FileObject /
      * IRQL / re-entrancy). Same discipline as the up-call sites so the bypass
      * logic cannot drift between callbacks. */
@@ -707,12 +687,21 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
      * DlpPreRead (read-deny enabled + exfil PID + a read-capable open); scope and
      * sensitivity come from the shared classifier, whose SensFile/CleanFile cache
      * makes repeat opens O(1). A non-read open falls through to the write path. */
-    if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED &&
+    if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_DISABLED &&
         (desiredAccess & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ |
                           GENERIC_ALL | MAXIMUM_ALLOWED)) != 0) {
         ULONG exfilPid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
+        BOOLEAN positive = FALSE;
+        /* The classify runs in BOTH monitor and enforce (its up-call is what raises
+         * the would-block / block incident); only ENFORCE cancels the open. */
         if (DlpExfilLookup(exfilPid) &&
-            DlpExfilClassifyAndCache(FltObjects, Data, exfilPid) == DLP_EXFIL_DENY) {
+            DlpExfilClassifyAndCache(FltObjects, Data, exfilPid, &positive) == DLP_EXFIL_DENY &&
+            positive &&
+            gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
+            /* Cancel the OPEN only on a POSITIVE sensitive match — never on the
+             * fail-safe (empty/new/unreadable) path, which would otherwise break
+             * the creation of ordinary files by untrusted apps. Fail-safe reads
+             * are still denied on the READ path (DlpPreRead). MONITOR: allow. */
             FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
             Data->IoStatus.Information = 0;
@@ -743,6 +732,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         ctx->Inspected = 0;
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;   /* contexts are NOT zeroed by FltMgr */
+        ctx->WriteEvicted = 0;
 
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
@@ -783,6 +773,34 @@ DlpPreWrite(_Inout_ PFLT_CALLBACK_DATA Data,
                                  (PFLT_CONTEXT *)&ctx);
     if (NT_SUCCESS(status)) {
         InterlockedExchange(&ctx->Dirty, 1);
+
+        /* Read-deny cache coherence: a CONTENT change must invalidate any cached
+         * read-deny verdict for this file, or a file cached CLEAN and then
+         * overwritten with sensitive content would keep sailing through. On the
+         * FIRST write to this stream since it was last classified (WriteEvicted
+         * 0->1; re-armed by the classifier), drop the stream verdict and evict the
+         * cross-open file-id caches so the next read re-classifies the new content.
+         * Gated once per write-burst so the file-id query is not paid per write;
+         * only when read-deny is enabled (when off, this is a no-op and DlpPreWrite
+         * behaves exactly as before). PASSIVE + non-paging is guaranteed by
+         * DlpShouldSkip above, so FltQueryInformationFile is safe here. */
+        if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_DISABLED &&
+            InterlockedCompareExchange(&ctx->WriteEvicted, 1, 0) == 0) {
+            FILE_INTERNAL_INFORMATION intInfo;
+            ULONGLONG fileId = 0;
+            InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_UNKNOWN);
+            RtlZeroMemory(&intInfo, sizeof(intInfo));
+            if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
+                    FltObjects->FileObject, &intInfo, sizeof(intInfo),
+                    FileInternalInformation, NULL))) {
+                fileId = (ULONGLONG)intInfo.IndexNumber.QuadPart;
+            }
+            if (fileId != 0) {
+                DlpSensFileRemove(fileId, 0);
+                DlpCleanFileRemove(fileId, 0);
+            }
+        }
+
         FltReleaseContext((PFLT_CONTEXT)ctx);
     }
 
@@ -1580,44 +1598,6 @@ DlpDenyRead(_Inout_ PFLT_CALLBACK_DATA Data)
     return FLT_PREOP_COMPLETE;
 }
 
-/* TEMP-DIAGNOSTIC: case-insensitive ASCII substring test on a UNICODE_STRING. */
-static BOOLEAN
-DlpNameHas(_In_ PCUNICODE_STRING Name, _In_ PCWSTR Sub)
-{
-    USHORT nLen = (USHORT)(Name->Length / sizeof(WCHAR));
-    USHORT sLen = 0, i, j;
-    while (Sub[sLen] != 0) { sLen++; }
-    if (sLen == 0 || nLen < sLen || Name->Buffer == NULL) { return FALSE; }
-    for (i = 0; (USHORT)(i + sLen) <= nLen; i++) {
-        for (j = 0; j < sLen; j++) {
-            WCHAR a = Name->Buffer[i + j], b = Sub[j];
-            if (a >= L'A' && a <= L'Z') a = (WCHAR)(a + 32);
-            if (b >= L'A' && b <= L'Z') b = (WCHAR)(b + 32);
-            if (a != b) { break; }
-        }
-        if (j == sLen) { return TRUE; }
-    }
-    return FALSE;
-}
-
-/* TEMP-DIAGNOSTIC: if this operation targets OPORD, resolve its name and return
- * TRUE (caller then records the access). Safe at PASSIVE. */
-static BOOLEAN
-DlpIsOpord(_Inout_ PFLT_CALLBACK_DATA Data)
-{
-    PFLT_FILE_NAME_INFORMATION ni = NULL;
-    BOOLEAN hit = FALSE;
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
-    if (NT_SUCCESS(FltGetFileNameInformation(
-            Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &ni)) &&
-        ni != NULL) {
-        (VOID)FltParseFileNameInformation(ni);
-        hit = DlpNameHas(&ni->Name, L"OPORD");
-        FltReleaseFileNameInformation(ni);
-    }
-    return hit;
-}
-
 /* Shared read-deny classifier. Returns DLP_EXFIL_DENY or DLP_EXFIL_ALLOW and
  * caches the verdict in the stream context + the cross-open SensFile/CleanFile
  * rings so neither the buffered pre-op nor the section-sync pre-op re-reads. The
@@ -1628,7 +1608,8 @@ DlpIsOpord(_Inout_ PFLT_CALLBACK_DATA Data)
 static LONG
 DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
                          _Inout_ PFLT_CALLBACK_DATA Data,
-                         _In_ ULONG Pid)
+                         _In_ ULONG Pid,
+                         _Out_opt_ PBOOLEAN Positive)
 {
     NTSTATUS status;
     PDLP_STREAM_CONTEXT ctx = NULL;
@@ -1641,8 +1622,18 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     ULONG contentBytes = 0;
     BOOLEAN truncated = FALSE;
     BOOLEAN block = FALSE;
+    BOOLEAN positiveMatch = FALSE;           /* TRUE only on a real sensitive hit */
     BOOLEAN guardHeld;
     UCHAR sha[DLP_SHA256_LEN];
+
+    /* `Positive` separates a genuine sensitive match (known-bad hash / real
+     * verdict / SensFile hit) from a fail-safe DENY (unreadable / timeout). The
+     * OPEN-deny path (DlpPostCreate) cancels a create only on a positive match,
+     * so it never blocks creation of empty/new/unparseable files; DlpPreRead
+     * passes NULL and denies on ANY DENY (reads fail secure). */
+    if (Positive != NULL) {
+        *Positive = FALSE;
+    }
 
     /* A. Get/attach the cross-open verdict cache (stream context). */
     status = FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
@@ -1659,6 +1650,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         ctx->Inspected = 0;
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
+        ctx->WriteEvicted = 0;
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
                                      (PFLT_CONTEXT)ctx, NULL);
@@ -1722,6 +1714,9 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
         FltReleaseFileNameInformation(nameInfo);
         FltReleaseContext((PFLT_CONTEXT)ctx);
+        if (Positive != NULL) {
+            *Positive = TRUE;                  /* known-sensitive (cross-open)    */
+        }
         return DLP_EXFIL_DENY;
     }
     if (fileId != 0 && DlpCleanFileLookup(fileId, 0)) {
@@ -1761,6 +1756,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     DlpComputeSha256((const UCHAR *)content, contentBytes, sha);
     if (DlpBadHashLookup(sha)) {
         block = TRUE;                          /* known-bad content -> deny       */
+        positiveMatch = TRUE;
     } else {
         NTSTATUS vstatus =
             DlpQueryVerdict(&nameInfo->Name, fileId, Pid, content, contentBytes,
@@ -1773,6 +1769,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         if (vstatus == STATUS_SUCCESS) {
             /* Genuine verdict -> seed the matching cross-open cache. */
             if (block) {
+                positiveMatch = TRUE;          /* real sensitive match            */
                 DlpBadHashInsert(sha);         /* seed the fast path              */
                 DlpSensFileInsert(fileId, 0);
             } else {
@@ -1787,9 +1784,17 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     ExFreePoolWithTag(content, DLP_GENERAL_TAG);
     FltReleaseFileNameInformation(nameInfo);
 
+    /* A fresh verdict was just produced for the CURRENT content and seeded into the
+     * cross-open caches. Re-arm the write-eviction gate so the NEXT write to this
+     * stream invalidates this verdict (handles repeated overwrite/read cycles). */
+    InterlockedExchange(&ctx->WriteEvicted, 0);
+
     if (block) {
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
         FltReleaseContext((PFLT_CONTEXT)ctx);
+        if (Positive != NULL) {
+            *Positive = positiveMatch;
+        }
         return DLP_EXFIL_DENY;
     }
     InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_ALLOW);
@@ -1807,15 +1812,10 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
 
     *CompletionContext = NULL;
 
-    /* 1. Kill-switch (default OFF). */
-    if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_ENABLED) {
+    /* 1. Kill-switch (default OFF). Monitor AND enforce both classify here; only
+     *    enforce denies (step 5). */
+    if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_DISABLED) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-    /* TEMP-DIAGNOSTIC: record every OPORD read (pid, exfil, would-skip). */
-    if (KeGetCurrentIrql() == PASSIVE_LEVEL && DlpIsOpord(Data)) {
-        ULONG p = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-        DlpTraceRd(p, DlpExfilLookup(p) ? 1u : 0u,
-                   DlpShouldSkip(Data, FltObjects) ? 1u : 0u);
     }
     /* 2. Top-of-callback gate: PASSIVE + no re-entrancy + skip agent/System. */
     if (DlpShouldSkip(Data, FltObjects)) {
@@ -1834,9 +1834,10 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
 
     /* 5. Classify (cache-first; reads + up-calls at most once per file/epoch).
      *    DlpDenyRead completes the buffered read as STATUS_ACCESS_DENIED. */
-    verdict = DlpExfilClassifyAndCache(FltObjects, Data, pid);
-    if (verdict == DLP_EXFIL_DENY) {
-        return DlpDenyRead(Data);
+    verdict = DlpExfilClassifyAndCache(FltObjects, Data, pid, NULL);
+    if (verdict == DLP_EXFIL_DENY &&
+        gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
+        return DlpDenyRead(Data);   /* MONITOR: classify ran (would-block reported); allow */
     }
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
@@ -1867,14 +1868,6 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
     /* 1. Kill-switch. */
     if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_ENABLED) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-    /* TEMP-DIAGNOSTIC: record every OPORD section-sync (pid, exfil, sync type).
-     * SyncType: 0 = SyncTypeOther, 1 = SyncTypeCreateSection. */
-    if (KeGetCurrentIrql() == PASSIVE_LEVEL &&
-        FltObjects->FileObject != NULL && DlpIsOpord(Data)) {
-        ULONG p = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-        DlpTraceSec(p, DlpExfilLookup(p) ? 1u : 0u,
-                    (ULONG)Data->Iopb->Parameters.AcquireForSectionSynchronization.SyncType);
     }
     /* 2. Our OWN classification read lazily creates this file's data section on
      *    the same thread -- wave it through, or we would deny our own read. */
@@ -2088,6 +2081,54 @@ DlpCleanFileInsert(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId)
     gDlpData.CleanFile[slot].Epoch = epoch;
     gDlpData.CleanFile[slot].Valid = TRUE;
     gDlpData.CleanFileNext = (slot + 1) % DLP_CLEANFILE_MAX;
+    KeReleaseSpinLock(&gDlpData.CleanFileLock, oldIrql);
+}
+
+
+/* ------------------------------------------------------------------------- *
+ *  Read-deny file-id cache eviction (content change, DlpPreWrite)           *
+ *                                                                           *
+ *  Drop ALL entries for a file id (any epoch) so an overwritten file is      *
+ *  re-classified on the next read instead of served a stale verdict. Same    *
+ *  spinlocks as the lookup/insert; PASSIVE-level callers.                    *
+ * ------------------------------------------------------------------------- */
+VOID
+DlpSensFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId)
+{
+    KIRQL oldIrql;
+    ULONG i;
+
+    if (FileId == 0) {
+        return;
+    }
+    KeAcquireSpinLock(&gDlpData.SensFileLock, &oldIrql);
+    for (i = 0; i < DLP_SENSFILE_MAX; i++) {
+        if (gDlpData.SensFile[i].Valid &&
+            gDlpData.SensFile[i].FileId == FileId &&
+            gDlpData.SensFile[i].VolumeId == VolumeId) {
+            gDlpData.SensFile[i].Valid = FALSE;
+        }
+    }
+    KeReleaseSpinLock(&gDlpData.SensFileLock, oldIrql);
+}
+
+VOID
+DlpCleanFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId)
+{
+    KIRQL oldIrql;
+    ULONG i;
+
+    if (FileId == 0) {
+        return;
+    }
+    KeAcquireSpinLock(&gDlpData.CleanFileLock, &oldIrql);
+    for (i = 0; i < DLP_CLEANFILE_MAX; i++) {
+        if (gDlpData.CleanFile[i].Valid &&
+            gDlpData.CleanFile[i].FileId == FileId &&
+            gDlpData.CleanFile[i].VolumeId == VolumeId) {
+            gDlpData.CleanFile[i].Valid = FALSE;
+        }
+    }
     KeReleaseSpinLock(&gDlpData.CleanFileLock, oldIrql);
 }
 

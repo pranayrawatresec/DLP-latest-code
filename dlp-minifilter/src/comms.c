@@ -324,9 +324,14 @@ DlpPortMessage(_In_opt_ PVOID PortCookie,
  *  no-config case (removable-only) without touching the lock.               *
  * ------------------------------------------------------------------------- */
 
-/* Case-insensitive test: does haystack contain the needle substring?
- * RtlUpcaseUnicodeChar is a table lookup callable at any IRQL, so this is safe
- * under the shared lock. Bounded by path length * needle length. */
+/* Case-insensitive watch-prefix test: does the path contain the needle (a watch
+ * prefix that itself begins with '\') at a COMPONENT BOUNDARY? The needle's
+ * leading '\' anchors the left boundary; here we additionally require the match
+ * to be followed by end-of-path or a '\', so "\Users" matches "...\Users" and
+ * "...\Users\file" but NOT "...\UsersData" (a loose substring would wrongly match
+ * the latter). This makes watch_paths a folder-path match, not a substring.
+ * RtlUpcaseUnicodeChar is a table lookup callable at any IRQL, safe under the
+ * shared lock. Bounded by path length * needle length. */
 static BOOLEAN
 DlpUnicodeContainsCI(_In_ PCUNICODE_STRING Haystack,
                      _In_reads_(NeedleChars) PCWSTR Needle,
@@ -352,7 +357,11 @@ DlpUnicodeContainsCI(_In_ PCUNICODE_STRING Haystack,
             }
         }
         if (j == NeedleChars) {
-            return TRUE;
+            /* Right boundary: end-of-path or a path separator. */
+            USHORT after = (USHORT)(start + NeedleChars);
+            if (after == hayChars || Haystack->Buffer[after] == L'\\') {
+                return TRUE;
+            }
         }
     }
     return FALSE;
@@ -600,6 +609,14 @@ DlpQueryVerdict(_In_ PUNICODE_STRING Path,
     if (reply.FileId != FileId) {
         return STATUS_INVALID_PARAMETER;   /* stale/misrouted reply */
     }
+    if (reply.Verdict == DLP_VERDICT_NOVERDICT) {
+        /* The agent has NO verdict for this content (e.g. no verified bundle yet —
+         * the startup blind window). Return a non-success status so the caller
+         * (DlpExfilClassifyAndCache) fails safe per ExfilReadFailBlock AND seeds
+         * NOTHING: an un-scored file must never be cached clean. Does NOT count
+         * toward the IPC timeout breaker (a live reply already cleared it above). */
+        return STATUS_NOT_FOUND;
+    }
     if (reply.Verdict != DLP_VERDICT_ALLOW && reply.Verdict != DLP_VERDICT_BLOCK) {
         return STATUS_INVALID_PARAMETER;   /* unknown verdict -> FailMode */
     }
@@ -701,51 +718,7 @@ DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath)
 
     gDlpData.ExfilReadBlockEnabled =
         (enabled == DLP_EXFILREAD_ENABLED) ? DLP_EXFILREAD_ENABLED
+      : (enabled == DLP_EXFILREAD_MONITOR) ? DLP_EXFILREAD_MONITOR
                                            : DLP_EXFILREAD_DISABLED;
     gDlpData.ExfilReadFailBlock = (failBlock != 0) ? 1u : 0u;
-}
-
-/* TEMP-DIAGNOSTIC: write 3 named DWORDs + a seq to the saved service key. */
-static VOID
-DlpTraceWrite(_In_ PCWSTR N1, _In_ ULONG V1, _In_ PCWSTR N2, _In_ ULONG V2,
-              _In_ PCWSTR N3, _In_ ULONG V3, _In_ PCWSTR NSeq, _In_ volatile LONG *Seq)
-{
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING path, vn;
-    HANDLE key = NULL;
-    ULONG s;
-
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL || !gDlpData.SvcRegPathValid) {
-        return;
-    }
-    path.Buffer = gDlpData.SvcRegPath;
-    path.Length = gDlpData.SvcRegPathBytes;
-    path.MaximumLength = gDlpData.SvcRegPathBytes;
-    InitializeObjectAttributes(&oa, &path,
-                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_SET_VALUE, &oa))) {
-        return;
-    }
-    s = (ULONG)InterlockedIncrement(Seq);
-    RtlInitUnicodeString(&vn, N1);   (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &V1, sizeof(V1));
-    RtlInitUnicodeString(&vn, N2);   (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &V2, sizeof(V2));
-    RtlInitUnicodeString(&vn, N3);   (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &V3, sizeof(V3));
-    RtlInitUnicodeString(&vn, NSeq); (VOID)ZwSetValueKey(key, &vn, 0, REG_DWORD, &s, sizeof(s));
-    ZwClose(key);
-}
-
-VOID DlpTraceCre(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG Skip)
-{
-    DlpTraceWrite(L"CrePid", Pid, L"CreExfil", Exfil, L"CreSkip", Skip,
-                  L"CreSeq", &gDlpData.TrCreSeq);
-}
-VOID DlpTraceRd(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG Skip)
-{
-    DlpTraceWrite(L"RdPid", Pid, L"RdExfil", Exfil, L"RdSkip", Skip,
-                  L"RdSeq", &gDlpData.TrRdSeq);
-}
-VOID DlpTraceSec(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG SyncType)
-{
-    DlpTraceWrite(L"SecPid", Pid, L"SecExfil", Exfil, L"SecSync", SyncType,
-                  L"SecSeq", &gDlpData.TrSecSeq);
 }

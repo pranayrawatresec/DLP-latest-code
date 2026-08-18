@@ -116,6 +116,13 @@ fn path_has_prefix(image_path: &str, prefix: &str) -> bool {
     if pfx.is_empty() {
         return false;
     }
+    // Defensive: a bare drive root ("c:" after the trailing-slash strip) would
+    // match every path on the volume — a catch-all that silently disables read-
+    // deny. The server rejects such rules, but a local agent.toml rule is
+    // unchecked, so never honour a whole-volume path prefix here.
+    if pfx.len() == 2 && pfx.as_bytes()[1] == b':' && pfx.as_bytes()[0].is_ascii_alphabetic() {
+        return false;
+    }
     match path.strip_prefix(&pfx) {
         Some(rest) => rest.is_empty() || rest.starts_with('\\'),
         None => false,

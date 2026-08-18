@@ -38,6 +38,8 @@ and are consumed by dlpflt.c and comms.c only.
 /* Verdict values carried in DLP_SCAN_REPLY.Verdict. */
 #define DLP_VERDICT_ALLOW    0
 #define DLP_VERDICT_BLOCK    1
+#define DLP_VERDICT_NOVERDICT 2  /* agent could not classify (no bundle yet): the
+                                  * caller fails safe AND seeds NOTHING (never clean) */
 
 /* Scan reason carried in DLP_SCAN_REQUEST.Reserved (repurposed as "Reason";
  * NO wire layout change -- offset 4 was already an unused reserved ULONG that
@@ -228,6 +230,11 @@ typedef struct _DLP_STREAM_CONTEXT {
      * so every subsequent read of the same open is an O(1) branch (no re-read, no
      * re-up-call). Interlocked. */
     volatile LONG ExfilVerdict;     /* DLP_EXFIL_UNKNOWN | _DENY | _ALLOW */
+    /* Read-deny cache-coherence gate. Set once when a write to this stream evicts
+     * the file's cached read-deny verdict; re-armed (0) by the classifier after it
+     * re-scores the new content. Ensures a file cached CLEAN then overwritten with
+     * sensitive content is re-classified, not served the stale verdict. */
+    volatile LONG WriteEvicted;
 } DLP_STREAM_CONTEXT, *PDLP_STREAM_CONTEXT;
 
 /* DLP_STREAM_CONTEXT.ExfilVerdict states. */
@@ -273,6 +280,9 @@ typedef struct _DLP_INSTANCE_CONTEXT {
  * Master switch + fail-mode (registry, read in DriverEntry). Default OFF. */
 #define DLP_EXFILREAD_DISABLED   0
 #define DLP_EXFILREAD_ENABLED    1
+#define DLP_EXFILREAD_MONITOR    2   /* classify + report would-block, but ALLOW  *
+                                      * (safe-rollout dry run: measure coverage    *
+                                      * before enforcing). Enforce path unchanged. */
 
 /* Kernel exfil-PID table size (holds the agent-pushed set). Bounded, spinlock,
  * epoch — mirrors the BadHash ring. */
@@ -384,14 +394,6 @@ typedef struct _DLP_FLT_DATA {
     DLP_EXFIL_ENTRY Exfil[DLP_EXFIL_MAX];
     volatile LONG   ExfilEpoch;             /* bumped on each full-replace push       */
     volatile LONG   ExfilCount;             /* live entries (diagnostics)             */
-
-    /* TEMP-DIAGNOSTIC: per-OPORD access trace (create/read/section) -> registry. */
-    WCHAR           SvcRegPath[300];
-    USHORT          SvcRegPathBytes;
-    BOOLEAN         SvcRegPathValid;
-    volatile LONG   TrCreSeq;
-    volatile LONG   TrRdSeq;
-    volatile LONG   TrSecSeq;
 } DLP_FLT_DATA, *PDLP_FLT_DATA;
 
 extern DLP_FLT_DATA gDlpData;
@@ -424,11 +426,6 @@ VOID     DlpReadFailMode(_In_ PUNICODE_STRING RegistryPath);
  * service registry path (DriverEntry). Defaults: disabled + fail-block. */
 VOID     DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath);
 
-/* TEMP-DIAGNOSTIC: record an OPORD access (which callback, pid, gate result). */
-VOID     DlpTraceCre(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG Skip);
-VOID     DlpTraceRd(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG Skip);
-VOID     DlpTraceSec(_In_ ULONG Pid, _In_ ULONG Exfil, _In_ ULONG SyncType);
-
 /* ---- comms.c: scan-scope config accessors (Tier-1 extension) ---------- *
  * All read the config stored by the DLP_CONFIG message-notify callback.
  * Safe to call at PASSIVE_LEVEL (they take ConfigLock shared). Before any
@@ -451,11 +448,15 @@ BOOLEAN  DlpConfigPathIsWatched(_In_ PCUNICODE_STRING Path);
  * PASSIVE-level callers only. */
 BOOLEAN  DlpSensFileLookup(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpSensFileInsert(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
+/* Evict a file id from the cache (content changed): drops ALL entries for the id,
+ * any epoch, so an overwritten file is re-classified on the next read. */
+VOID     DlpSensFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 
 /* Known-clean file-id cache (read-deny). Same ring/epoch discipline as SensFile;
  * bounds content-classify up-calls (a clean file is classified once, cross-open). */
 BOOLEAN  DlpCleanFileLookup(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 VOID     DlpCleanFileInsert(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
+VOID     DlpCleanFileRemove(_In_ ULONGLONG FileId, _In_ ULONGLONG VolumeId);
 
 /* ---- Read-deny: exfil-PID set (dlpflt.c) ----------------------------- *
  * DlpExfilLookup is called on the read hot path (DlpPreRead, PASSIVE) under the

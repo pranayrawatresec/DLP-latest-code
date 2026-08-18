@@ -208,6 +208,10 @@ async function main() {
       { matchType: 'publisher' },                      // missing value
       { matchType: 'name', value: '' },                // empty value
       { matchType: 'path', value: 'x'.repeat(513) },   // too long
+      { matchType: 'path', value: 'C:\\' },            // drive root - too broad (trusts everything)
+      { matchType: 'path', value: 'Adobe' },           // not an absolute path
+      { matchType: 'name', value: 'C:\\x\\y.exe' },     // name must not contain separators
+      { matchType: 'publisher', value: 'C:\\Windows' }, // publisher must not be a path
       { matchType: 'name', value: 'abcd.exe' },  // control character
     ];
     for (let i = 0; i < bads.length; i++) {
@@ -280,12 +284,12 @@ async function main() {
   await check('R10', 'GET /agent/trusted-readers delivers {matchType,value} + audited', async () => {
     await api('/api/trusted-readers', {
       cookie: authorCookie, method: 'POST',
-      body: { matchType: 'path', value: `${TAG}\\Program Files\\Office`, note: `${TAG} office path` },
+      body: { matchType: 'path', value: `C:\\${TAG}\\Program Files\\Office`, note: `${TAG} office path` },
     });
     const res = await request({ pathname: '/agent/trusted-readers', method: 'GET', ...agentTls });
     assert(res.status === 200, `expected 200, got ${res.status}`);
     assert(Array.isArray(res.body.readers), 'missing readers array');
-    const mine = res.body.readers.find((r) => r.value === `${TAG}\\Program Files\\Office`);
+    const mine = res.body.readers.find((r) => r.value === `C:\\${TAG}\\Program Files\\Office`);
     assert(mine && mine.matchType === 'path', 'delivered reader shape wrong');
     assert(mine.id === undefined && mine.createdBy === undefined, 'agent payload should be {matchType,value} only');
     const a = await pool.query(

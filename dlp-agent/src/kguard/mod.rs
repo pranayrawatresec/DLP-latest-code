@@ -72,6 +72,16 @@ pub const DLP_MAX_CONTENT: usize = 4 * 1024 * 1024;
 /// Verdict codes — must equal `DLP_VERDICT_*` in `dlpflt.h`.
 pub const DLP_VERDICT_ALLOW: u32 = 0;
 pub const DLP_VERDICT_BLOCK: u32 = 1;
+/// The agent could not classify this content (e.g. no verified fingerprint bundle
+/// is cached yet — the startup blind window). The driver must fail SAFE and cache
+/// NOTHING: an un-scored file must never be remembered as clean. Must equal
+/// `DLP_VERDICT_NOVERDICT` in `dlpflt.h`.
+pub const DLP_VERDICT_NOVERDICT: u32 = 2;
+
+/// Read-deny mode (driver `ExfilReadBlockEnabled` registry value): 0=off,
+/// 1=enforce, 2=monitor. In MONITOR the driver classifies and reports would-blocks
+/// but ALLOWS (safe-rollout dry run). Must equal `DLP_EXFILREAD_MONITOR` in `dlpflt.h`.
+pub const DLP_EXFILREAD_MONITOR: u32 = 2;
 
 /// Scan reason — must equal `DLP_REASON_*` in `dlpflt.h`. This REPURPOSES the
 /// formerly-unused `ULONG Reserved` at offset 4 of `DLP_SCAN_REQUEST`: no wire
@@ -629,7 +639,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
         // `allowlist` pushes every process NOT on the sanctioned-reader allowlist.
         let snap = snapshot_config(shared_cfg);
         let pids = match snap.kguard.exfil_posture {
-            ExfilPosture::Blocklist => crate::exfil::compute_exfil_pids(self_pid),
+            ExfilPosture::Blocklist => Some(crate::exfil::compute_exfil_pids(self_pid)),
             ExfilPosture::Allowlist => {
                 let rules = crate::trustedreaders::resolve_matches(&snap.trusted_readers);
                 crate::exfil::compute_untrusted_pids(self_pid, &rules)
@@ -638,6 +648,26 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
         let posture = match snap.kguard.exfil_posture {
             ExfilPosture::Blocklist => "blocklist",
             ExfilPosture::Allowlist => "allowlist",
+        };
+        // `None` = the set could not be computed reliably (e.g. process enumeration
+        // failed). The push is a FULL REPLACE, so pushing now would drop the
+        // driver's protection to whatever partial/empty set we have. Skip the push
+        // and retain the driver's previous set — fail secure, never fail open.
+        let pids = match pids {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "untrusted-set computation failed this cycle — retaining the driver's \
+                     previous set (not pushing)"
+                );
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                continue;
+            }
         };
         let msg = crate::exfil::DlpExfilUpdate::new(&pids);
         let rc = unsafe {
@@ -654,7 +684,8 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
             tracing::warn!(error = %e, "exfil-set push failed (port closing?) — ending pusher");
             break;
         }
-        tracing::info!(count = pids.len(), posture, pids = ?pids, "pushed untrusted-reader PID set to driver");
+        tracing::info!(count = pids.len(), posture, "pushed untrusted-reader PID set to driver");
+        tracing::debug!(posture, pids = ?pids, "untrusted-reader PID set (full list)");
         // ~2s cadence, checking stop every 100ms so shutdown is prompt.
         for _ in 0..20 {
             if stop.load(Ordering::Relaxed) {
@@ -702,6 +733,39 @@ fn send_config(port: windows::Win32::Foundation::HANDLE, kg: &KguardConfig) {
 /// The blocking receive/score/reply loop. Split out so the connect/close
 /// bracket stays tidy. Returns Ok when the port closes cleanly.
 #[cfg(windows)]
+/// Read the driver's read-deny mode from its service registry key (0=off,
+/// 1=enforce, 2=monitor). The guard runs as SYSTEM/elevated, so HKLM is readable;
+/// any failure returns 0 (incidents simply aren't relabelled). Windows-only.
+#[cfg(windows)]
+fn driver_read_deny_mode() -> u32 {
+    use windows::core::w;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!("SYSTEM\\CurrentControlSet\\Services\\dlpflt"),
+            w!("ExfilReadBlockEnabled"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut core::ffi::c_void),
+            Some(&mut size),
+        )
+    };
+    if rc == ERROR_SUCCESS {
+        data
+    } else {
+        0
+    }
+}
+
+#[cfg(not(windows))]
+fn driver_read_deny_mode() -> u32 {
+    0
+}
+
 fn message_loop<R>(
     port: windows::Win32::Foundation::HANDLE,
     shared_cfg: &Arc<RwLock<Config>>,
@@ -738,6 +802,16 @@ where
     let total_size = header_size + req_size + DLP_MAX_CONTENT;
     let mut backing: Vec<u64> = vec![0u64; total_size.div_ceil(8)];
     let buf_ptr = backing.as_mut_ptr() as *mut u8;
+
+    // Read-deny mode (once, like the driver reads its knob at load). In MONITOR the
+    // driver classifies + reports but ALLOWS, so a read incident is a WOULD-block,
+    // not a real block — relabel below so the console distinguishes the two.
+    let monitor = driver_read_deny_mode() == DLP_EXFILREAD_MONITOR;
+    if monitor {
+        tracing::info!(
+            "read-deny MONITOR mode — reporting would-block incidents without enforcing"
+        );
+    }
 
     loop {
         // Graceful shutdown: checked after each handled message. Note this cannot
@@ -790,13 +864,13 @@ where
 
         // Guard the wire version: a mismatch means driver/client are out of sync
         // — fail-safe per fail_block rather than misparse the payload.
-        let (block, incident) = if req.version != DLP_MSG_VERSION {
+        let (block_opt, mut incident) = if req.version != DLP_MSG_VERSION {
             tracing::warn!(
                 got = req.version,
                 expected = DLP_MSG_VERSION,
                 "scan request wire-version mismatch — applying fail_block"
             );
-            (kg.fail_block, None)
+            (Some(kg.fail_block), None)
         } else {
             // The content that FOLLOWS the fixed header in the same buffer,
             // bounded to the 4 MiB cap. SAFETY: content occupies
@@ -812,12 +886,32 @@ where
             decide(&cfg, kg, bundle, &device_path, content, truncated, req.reason, sealer_healthy)
         };
 
+        // Monitor mode: a read-reason "block" is really a WOULD-block — the driver
+        // classified and reported it but ALLOWED the read. Relabel the incident so
+        // the console/audit shows measured coverage, not a real block. Only the READ
+        // reason (read-deny) is affected; write-path incidents are untouched.
+        if monitor && req.reason == DLP_REASON_READ {
+            if let Some(inc) = incident.as_mut() {
+                if inc.note.as_deref() == Some("exfil-read-denied") {
+                    inc.note = Some("exfil-read-would-block".to_string());
+                }
+            }
+        }
+
         // Reply to the driver.
         let mut out: ReplyMessage = unsafe { std::mem::zeroed() };
         out.header.MessageId = message_id;
         out.header.Status = windows::Win32::Foundation::NTSTATUS(0); // STATUS_SUCCESS
         out.reply.file_id = req.file_id;
-        out.reply.verdict = if block { DLP_VERDICT_BLOCK } else { DLP_VERDICT_ALLOW };
+        // Some(true)=block, Some(false)=allow, None=could-not-score. The driver reads
+        // the VERDICT field (not the header status); NOVERDICT tells it to fail safe
+        // AND cache nothing, so a file read before the bundle loaded is never cached
+        // clean (startup blind-window fix).
+        out.reply.verdict = match block_opt {
+            Some(true) => DLP_VERDICT_BLOCK,
+            Some(false) => DLP_VERDICT_ALLOW,
+            None => DLP_VERDICT_NOVERDICT,
+        };
 
         let sent = unsafe {
             FilterReplyMessage(port, &out.header, size_of::<ReplyMessage>() as u32)
@@ -866,7 +960,7 @@ fn decide(
     _truncated: bool,
     reason: u32,
     sealer_healthy: bool,
-) -> (bool, Option<UsbIncident>) {
+) -> (Option<bool>, Option<UsbIncident>) {
     // Sealer coexistence, defect 1: a `.dlpenc` envelope passes untouched —
     // both scan reasons, every volume, before any scoring (see the gate's doc).
     if let Some(pass) = envelope_passthrough(content, reason) {
@@ -875,7 +969,7 @@ fn decide(
             path_len = device_path.len(),
             "sealed .dlpenc envelope — passthrough (no scan, no incident)"
         );
-        return pass;
+        return (Some(pass.0), pass.1);
     }
 
     // Derive a synthetic filename (basename of the NT path) so extraction picks
@@ -917,7 +1011,7 @@ fn decide(
             &kg.channel_label,
             sealer_healthy,
         ) {
-            return (block, incident);
+            return (Some(block), incident);
         }
         // None ⇒ no override (unresolved device, non-Encrypt destination, or a
         // block-band verdict under the default `on_block_band = "block"`):
@@ -927,8 +1021,15 @@ fn decide(
     let v = match verdict {
         Some(v) => v,
         None => {
-            // No verified bundle: cannot score. Fail per configuration.
-            return (kg.fail_block, None);
+            // No verified bundle: cannot score. On the READ (read-deny) path return
+            // "no verdict" so the driver fails SAFE and caches NOTHING — never poison
+            // the read-deny cache with a clean verdict we could not actually produce
+            // (the startup blind-window fix). The WRITE path keeps today's
+            // fail-per-config behaviour exactly.
+            if reason == DLP_REASON_READ {
+                return (None, None);
+            }
+            return (Some(kg.fail_block), None);
         }
     };
     let block = if matches!(v.extraction, detect::Extraction::Unreadable { .. }) {
@@ -948,7 +1049,7 @@ fn decide(
         should_block_removable_write(&v, kg)
     };
     let inc = incident_for(device_path, v, block, &kg.channel_label, reason);
-    (block, inc)
+    (Some(block), inc)
 }
 
 /// Resolve the identity of the volume a driver scan-path targets (sealer

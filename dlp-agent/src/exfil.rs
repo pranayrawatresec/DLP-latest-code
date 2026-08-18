@@ -147,12 +147,12 @@ pub fn compute_exfil_pids(_self_pid: u32) -> Vec<u32> {
 use crate::trustedreaders::ReaderMatch;
 
 #[cfg(not(windows))]
-pub fn compute_untrusted_pids(_self_pid: u32, _rules: &[ReaderMatch]) -> Vec<u32> {
-    Vec::new()
+pub fn compute_untrusted_pids(_self_pid: u32, _rules: &[ReaderMatch]) -> Option<Vec<u32>> {
+    Some(Vec::new())
 }
 
 #[cfg(windows)]
-pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Vec<u32> {
+pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Option<Vec<u32>> {
     use std::collections::HashSet;
 
     // Empty allowlist ⇒ fail toward AVAILABILITY, not lockout. An empty list
@@ -164,7 +164,7 @@ pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Vec<u32> 
             "read-deny allowlist posture with an EMPTY sanctioned-reader list — pushing no PIDs \
              (populate the trusted-reader allowlist before it can enforce)"
         );
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     // Enable SeDebugPrivilege once (best-effort): when the guard runs elevated /
@@ -172,27 +172,75 @@ pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Vec<u32> 
     // processes (e.g. a remote-access tool's privileged helper). Without it those
     // come back with an empty image path and are skipped — so they would never be
     // pushed and never denied. No-op when not elevated.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEDEBUG_OK: AtomicBool = AtomicBool::new(false);
     {
         use std::sync::Once;
         static DEBUG_PRIV: Once = Once::new();
-        DEBUG_PRIV.call_once(enable_debug_privilege);
+        DEBUG_PRIV.call_once(|| {
+            let granted = enable_debug_privilege();
+            SEDEBUG_OK.store(granted, Ordering::Relaxed);
+            if granted {
+                tracing::info!(
+                    "guard is elevated — SeDebugPrivilege enabled; SYSTEM/high-integrity \
+                     processes are identifiable and enforced"
+                );
+            } else {
+                tracing::warn!(
+                    "guard is NOT elevated — SeDebugPrivilege was not granted; SYSTEM/high-\
+                     integrity processes cannot be identified and will NOT be enforced. Run the \
+                     guard as the LocalSystem service (run-endpoint) in production."
+                );
+            }
+        });
     }
+    let elevated = SEDEBUG_OK.load(Ordering::Relaxed);
 
     let skip = |pid: u32| pid == 0 || pid == 4 || pid == self_pid;
     let has_publisher_rule = rules.iter().any(ReaderMatch::needs_publisher);
 
+    // Auto-sanction the agent's OWN installed binary, independent of the admin
+    // allowlist. Sibling agent processes (notably the usb-monitor sealer, which
+    // legitimately reads files to seal them) run the SAME binary as a different
+    // subcommand → same image path. Without this they'd be untrusted and the
+    // driver would deny the very reads the sealer needs, breaking encrypt-on-write.
+    let own_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned));
+
     let mut set: HashSet<u32> = HashSet::new();
 
-    // Every process we can identify AND that is NOT sanctioned → untrusted.
-    for (pid, image) in enumerate_processes_with_image() {
+    // Enumeration failure must NOT clear the driver's set (the push is a full
+    // replace). Signal it (None) so the pusher RETAINS the previous set — fail
+    // secure, never drop protection on a transient glitch.
+    let processes = match enumerate_processes_with_image() {
+        Some(p) => p,
+        None => return None,
+    };
+
+    let mut unidentifiable: u32 = 0;
+    // Every process that is NOT sanctioned → untrusted (deny-by-default).
+    for (pid, image) in processes {
         if skip(pid) {
             continue;
         }
-        // Could not resolve the image path (protected OS/AV process we cannot
-        // open, or it exited). Fail toward availability: DON'T push it — the
-        // processes we cannot open are exactly the protected OS/AV ones we want
-        // to trust; a user-mode exfil tool CAN be opened, so it is still judged.
+        // Could not resolve the image path. Under an ALLOWLIST posture an
+        // unidentifiable process is, by definition, not sanctioned. When the guard
+        // is elevated, an unopenable process is genuinely protected/PPL (rare and
+        // suspicious) → treat as UNTRUSTED (fail secure). When NOT elevated we
+        // cannot tell a benign SYSTEM service from a tool and pushing them all
+        // would deny the OS — so we skip them here, and the loud not-elevated
+        // warning above is the signal to fix the deployment.
         if image.is_empty() {
+            unidentifiable += 1;
+            if elevated {
+                set.insert(pid);
+            }
+            continue;
+        }
+
+        // The agent's own binary (main guard + the sealer sibling) is always trusted.
+        if own_exe.as_deref().is_some_and(|own| image.eq_ignore_ascii_case(own)) {
             continue;
         }
 
@@ -231,7 +279,16 @@ pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Vec<u32> 
     // process is denied almost immediately. (If a site allowlists a remote tool
     // or VM host, that is an explicit trust decision — don't.)
 
-    set.into_iter().collect()
+    if unidentifiable > 0 {
+        tracing::warn!(
+            count = unidentifiable,
+            elevated,
+            "processes the guard could not identify this cycle (treated as untrusted when \
+             elevated; not enforced when non-elevated — run as the LocalSystem service)"
+        );
+    }
+
+    Some(set.into_iter().collect())
 }
 
 /// Enable SeDebugPrivilege on the current process token (best-effort). Lets an
@@ -239,8 +296,8 @@ pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Vec<u32> 
 /// for image identification; a no-op (silently) when the token doesn't hold the
 /// privilege (non-elevated). Windows-only.
 #[cfg(windows)]
-fn enable_debug_privilege() {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+fn enable_debug_privilege() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_SUCCESS, HANDLE, LUID};
     use windows::Win32::Security::{
         AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
         SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -256,18 +313,24 @@ fn enable_debug_privilege() {
         )
         .is_err()
         {
-            return;
+            return false;
         }
+        let mut granted = false;
         let mut luid = LUID::default();
         if LookupPrivilegeValueW(None, SE_DEBUG_NAME, &mut luid).is_ok() {
             let tp = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
                 Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
             };
-            // No-op if the token lacks the privilege (non-elevated) — best-effort.
+            // AdjustTokenPrivileges returns Ok even when the token does NOT hold the
+            // privilege — Windows signals that via GetLastError == ERROR_NOT_ALL_
+            // ASSIGNED (i.e. last error != ERROR_SUCCESS). Read it immediately after
+            // so we actually know whether SeDebug was enabled (elevated) or not.
             let _ = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
+            granted = GetLastError() == ERROR_SUCCESS;
         }
         let _ = CloseHandle(token);
+        granted
     }
 }
 
@@ -275,7 +338,7 @@ fn enable_debug_privilege() {
 /// (protected / exited) yields an EMPTY path — the caller treats that as "cannot
 /// identify ⇒ do not push" (fail toward availability). Windows-only.
 #[cfg(windows)]
-fn enumerate_processes_with_image() -> Vec<(u32, String)> {
+fn enumerate_processes_with_image() -> Option<Vec<(u32, String)>> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::EnumProcesses;
@@ -285,20 +348,35 @@ fn enumerate_processes_with_image() -> Vec<(u32, String)> {
     };
 
     let mut out = Vec::new();
-    let mut pids = vec![0u32; 4096];
-    let mut needed = 0u32;
-    let ok = unsafe {
-        EnumProcesses(
-            pids.as_mut_ptr(),
-            (pids.len() * std::mem::size_of::<u32>()) as u32,
-            &mut needed,
-        )
+    // Grow-and-retry: if EnumProcesses fills the entire buffer the list was likely
+    // truncated (busy host), so double the buffer and re-query rather than silently
+    // missing processes beyond the cap — an un-enumerated process is never pushed,
+    // i.e. never enforced.
+    let mut cap = 4096usize;
+    let (pids, count) = loop {
+        let mut pids = vec![0u32; cap];
+        let mut needed = 0u32;
+        let ok = unsafe {
+            EnumProcesses(
+                pids.as_mut_ptr(),
+                (cap * std::mem::size_of::<u32>()) as u32,
+                &mut needed,
+            )
+        };
+        if ok.is_err() {
+            tracing::warn!(
+                "EnumProcesses failed (allowlist reader scan) — signalling failure so the pusher \
+                 retains the driver's previous set instead of clearing it"
+            );
+            return None;
+        }
+        let returned = needed as usize / std::mem::size_of::<u32>();
+        // returned < cap ⇒ the buffer held the whole list; else grow (bounded).
+        if returned < cap || cap >= 1usize << 18 {
+            break (pids, returned);
+        }
+        cap *= 2;
     };
-    if ok.is_err() {
-        tracing::warn!("EnumProcesses failed (allowlist reader scan)");
-        return out;
-    }
-    let count = needed as usize / std::mem::size_of::<u32>();
     for &pid in pids.iter().take(count) {
         if pid == 0 {
             continue;
@@ -328,7 +406,7 @@ fn enumerate_processes_with_image() -> Vec<(u32, String)> {
         };
         out.push((pid, image));
     }
-    out
+    Some(out)
 }
 
 /// Process-wide cache of image-path → Authenticode publisher (signer subject
@@ -341,11 +419,21 @@ fn cached_publisher(image_path: &str) -> Option<String> {
     use std::sync::Mutex;
     static CACHE: Mutex<Option<HashMap<String, Option<String>>>> = Mutex::new(None);
 
+    // Bound the cache so a process spawning many uniquely-named binaries (e.g.
+    // random temp paths) can't grow it without limit. A flat cap + clear is enough
+    // here — this is a verify-once accelerator, not a correctness store. (NOTE:
+    // keyed on path only, so a binary swapped at a cached path keeps its old
+    // verdict until the cap clears; keying on file identity is a follow-up.)
+    const CACHE_CAP: usize = 4096;
+
     let key = image_path.to_ascii_lowercase();
     if let Ok(mut guard) = CACHE.lock() {
         let map = guard.get_or_insert_with(HashMap::new);
         if let Some(hit) = map.get(&key) {
             return hit.clone();
+        }
+        if map.len() >= CACHE_CAP {
+            map.clear();
         }
         let publisher = authenticode_publisher(image_path);
         map.insert(key, publisher.clone());
@@ -902,7 +990,7 @@ mod tests {
         // 3) Sample of live processes: (pid, publisher, image).
         eprintln!("[probe] --- live processes (up to 20) ---");
         let mut shown = 0;
-        for (pid, image) in enumerate_processes_with_image() {
+        for (pid, image) in enumerate_processes_with_image().unwrap_or_default() {
             if image.is_empty() {
                 continue;
             }
@@ -920,7 +1008,8 @@ mod tests {
             ReaderMatch::Publisher("Microsoft Corporation".into()),
             ReaderMatch::Path(format!(r"{sysroot}")),
         ];
-        let untrusted = compute_untrusted_pids(std::process::id(), &rules);
+        let untrusted =
+            compute_untrusted_pids(std::process::id(), &rules).expect("enumeration succeeded");
         eprintln!(
             "[probe] compute_untrusted_pids(Microsoft + {sysroot}) -> {} untrusted PID(s)",
             untrusted.len()

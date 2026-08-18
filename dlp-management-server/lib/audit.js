@@ -41,28 +41,38 @@ function entryString(ts, actor, action, target, detail) {
   return canonicalJson({ ts, actor, action, target, detail });
 }
 
+// Append one hash-chained entry using the caller's client. The caller MUST
+// already be inside a transaction that holds pg_advisory_xact_lock(AUDIT_CHAIN_LOCK)
+// so the chain cannot fork. This lets a state-changing route commit its mutation
+// and its audit entry in ONE transaction (atomic tamper-evidence): if either
+// fails, both roll back — a change can never be recorded without its audit row,
+// nor an audit row without the change.
+async function writeChainEntry(client, actor, action, target = null, detail = {}) {
+  const { rows } = await client.query(
+    'select hash from audit_log order by seq desc limit 1'
+  );
+  const prevHash = rows.length ? rows[0].hash : 'genesis';
+  const ts = new Date().toISOString();
+  // Hash and store the SAME normalized structure so verification matches.
+  const normalized = normalizeDetail(detail);
+  const entry = entryString(ts, actor, action, target, normalized);
+  const hash = crypto
+    .createHash('sha256')
+    .update(prevHash + entry)
+    .digest('hex');
+  await client.query(
+    `insert into audit_log (ts, actor, action, target, detail, prev_hash, hash)
+     values ($1, $2, $3, $4, $5, $6, $7)`,
+    [ts, actor, action, target, JSON.stringify(normalized), prevHash, hash]
+  );
+}
+
 async function audit(actor, action, target = null, detail = {}) {
   const client = await pool.connect();
   try {
     await client.query('begin');
     await client.query('select pg_advisory_xact_lock($1)', [AUDIT_CHAIN_LOCK]);
-    const { rows } = await client.query(
-      'select hash from audit_log order by seq desc limit 1'
-    );
-    const prevHash = rows.length ? rows[0].hash : 'genesis';
-    const ts = new Date().toISOString();
-    // Hash and store the SAME normalized structure so verification matches.
-    const normalized = normalizeDetail(detail);
-    const entry = entryString(ts, actor, action, target, normalized);
-    const hash = crypto
-      .createHash('sha256')
-      .update(prevHash + entry)
-      .digest('hex');
-    await client.query(
-      `insert into audit_log (ts, actor, action, target, detail, prev_hash, hash)
-       values ($1, $2, $3, $4, $5, $6, $7)`,
-      [ts, actor, action, target, JSON.stringify(normalized), prevHash, hash]
-    );
+    await writeChainEntry(client, actor, action, target, detail);
     await client.query('commit');
   } catch (err) {
     await client.query('rollback');
@@ -97,4 +107,4 @@ async function verifyChain() {
   return null;
 }
 
-module.exports = { audit, verifyChain };
+module.exports = { audit, verifyChain, writeChainEntry, AUDIT_CHAIN_LOCK };

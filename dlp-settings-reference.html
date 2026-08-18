@@ -1,0 +1,259 @@
+<title>DLP Settings Reference</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#EBEEF3; --surface:#FFFFFF; --surface-2:#F4F6FA; --code-bg:#EEF1F6;
+    --ink:#1B2130; --muted:#565F70; --faint:#828C9C; --border:#DCE2EB;
+    --accent:#2E57D0; --accent-ink:#20439E;
+    --con:#238059; --con-bg:#E7F3ED;      /* Console-managed */
+    --pol:#2E57D0; --pol-bg:#E9EEFB;      /* Endpoint policy */
+    --drv:#B5720F; --drv-bg:#FAF1E2;      /* Driver knob */
+    --ins:#66717F; --ins-bg:#EFF1F4;      /* Install / auto */
+    --shadow:0 1px 2px rgba(20,28,45,.04),0 3px 12px rgba(20,28,45,.05);
+    --font-sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --font-mono:ui-monospace,"Cascadia Code","SFMono-Regular","Consolas","Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#0F131A; --surface:#181D26; --surface-2:#1E242E; --code-bg:#12161E;
+      --ink:#E6EBF2; --muted:#9AA4B4; --faint:#69737F; --border:#2A313D;
+      --accent:#7396F2; --accent-ink:#9DB4F6;
+      --con:#57C08C; --con-bg:#132219; --pol:#7396F2; --pol-bg:#161E30;
+      --drv:#E0A54A; --drv-bg:#271F13; --ins:#93A0B0; --ins-bg:#1B2029;
+      --shadow:0 1px 2px rgba(0,0,0,.25),0 3px 14px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0F131A; --surface:#181D26; --surface-2:#1E242E; --code-bg:#12161E;
+    --ink:#E6EBF2; --muted:#9AA4B4; --faint:#69737F; --border:#2A313D;
+    --accent:#7396F2; --accent-ink:#9DB4F6;
+    --con:#57C08C; --con-bg:#132219; --pol:#7396F2; --pol-bg:#161E30;
+    --drv:#E0A54A; --drv-bg:#271F13; --ins:#93A0B0; --ins-bg:#1B2029;
+    --shadow:0 1px 2px rgba(0,0,0,.25),0 3px 14px rgba(0,0,0,.28);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font-sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1040px;margin:0 auto;padding:clamp(20px,4vw,52px) clamp(14px,4vw,36px) 96px}
+  header.mast{border-bottom:1px solid var(--border);padding-bottom:24px;margin-bottom:22px}
+  .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:600}
+  h1{font-size:clamp(1.8rem,4vw,2.5rem);line-height:1.08;margin:.35em 0 .3em;letter-spacing:-.02em;font-weight:700;text-wrap:balance}
+  .lede{font-size:1.03rem;color:var(--muted);max-width:70ch;margin:0}
+  .lede strong{color:var(--ink)}
+
+  /* legend */
+  .legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:22px 0 8px}
+  .lg{background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:12px 14px;box-shadow:var(--shadow);display:flex;gap:10px;align-items:flex-start}
+  .lg .sw{width:12px;height:12px;border-radius:4px;flex:none;margin-top:3px}
+  .lg .t{font-weight:650;font-size:.9rem}
+  .lg .d{font-size:.8rem;color:var(--muted);margin-top:2px}
+  .note{margin:16px 0 0;padding:14px 16px;border-radius:11px;background:var(--pol-bg);border:1px solid color-mix(in srgb,var(--pol) 30%,transparent);font-size:.92rem;color:var(--ink)}
+
+  /* section */
+  h2.sec{font-size:1.25rem;margin:40px 0 4px;letter-spacing:-.01em;display:flex;align-items:baseline;gap:10px}
+  h2.sec .n{font-family:var(--font-mono);font-size:.8rem;color:var(--faint)}
+  .sec-sub{color:var(--muted);font-size:.92rem;margin:0 0 14px;max-width:74ch}
+
+  .tblwrap{overflow-x:auto;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)}
+  table{width:100%;border-collapse:collapse;font-size:.9rem;min-width:640px}
+  thead th{text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);font-weight:600;padding:11px 14px;border-bottom:1px solid var(--border);white-space:nowrap}
+  tbody td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:top}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:var(--surface-2)}
+  .set{font-family:var(--font-mono);font-size:.82rem;color:var(--ink);font-weight:600;white-space:nowrap}
+  .desc{color:var(--ink)}
+  .vals{font-family:var(--font-mono);font-size:.78rem;color:var(--muted);white-space:nowrap}
+  .vals b{color:var(--ink)}
+  .toggle{display:inline-block;font-family:var(--font-mono);font-size:.66rem;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;border:1px solid var(--border);color:var(--muted);text-transform:uppercase;margin-bottom:3px}
+  .where{font-family:var(--font-mono);font-size:.66rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;padding:2px 8px;border-radius:6px;white-space:nowrap}
+  .w-con{background:var(--con-bg);color:var(--con)} .w-pol{background:var(--pol-bg);color:var(--pol)}
+  .w-drv{background:var(--drv-bg);color:var(--drv)} .w-ins{background:var(--ins-bg);color:var(--ins)}
+  code{font-family:var(--font-mono);font-size:.85em;background:var(--code-bg);padding:1px 5px;border-radius:5px;border:1px solid var(--border)}
+  footer{margin-top:50px;padding-top:18px;border-top:1px solid var(--border);color:var(--faint);font-size:.8rem;font-family:var(--font-mono)}
+  a{color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">Configuration Catalogue</div>
+    <h1>DLP Settings Reference</h1>
+    <p class="lede">Every setting in the endpoint DLP product — read from the code (<strong>agent config, driver registry knobs, and the console-managed lists</strong>) so nothing is missed when the console UI is built. Each row shows what it does, its values, its default (<strong>bold</strong>), and where it lives today. The goal: every one of these becomes a control the admin operates <strong>from the console — no command line.</strong></p>
+  </header>
+
+  <div class="legend">
+    <div class="lg"><span class="sw" style="background:var(--con)"></span><div><div class="t">Console</div><div class="d">Managed centrally in the console today, synced to agents over mTLS.</div></div></div>
+    <div class="lg"><span class="sw" style="background:var(--pol)"></span><div><div class="t">Endpoint policy</div><div class="d">In each agent's <code>agent.toml</code> today — <b>should move to the console.</b></div></div></div>
+    <div class="lg"><span class="sw" style="background:var(--drv)"></span><div><div class="t">Driver knob</div><div class="d">Kernel registry value — the <b>agent should set it</b> from console policy.</div></div></div>
+    <div class="lg"><span class="sw" style="background:var(--ins)"></span><div><div class="t">Install / auto</div><div class="d">Set at install or handled automatically; not an operator toggle.</div></div></div>
+  </div>
+  <p class="note"><b>Reading the "Where" column:</b> anything marked <span class="where w-pol">Endpoint policy</span> or <span class="where w-drv">Driver knob</span> is configured per-machine today (the CLI/registry steps used during testing). The target design moves all of them behind <span class="where w-con">Console</span> controls that the agent applies to each endpoint automatically.</p>
+
+  <!-- 1. READ-DENY -->
+  <h2 class="sec"><span class="n">01</span> Read-deny — stop untrusted tools reading sensitive files</h2>
+  <p class="sec-sub">The headline capability: an untrusted process (RustDesk/AnyDesk/unknown uploader/malware) is denied the <em>read</em> of a sensitive file so the bytes never reach it.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">Read-deny mode<br><span class="vals">ExfilReadBlockEnabled</span></td><td class="desc">Master switch. <b>Off</b> = no read protection. <b>Monitor</b> = detect &amp; report "would-block" but allow (safe rollout). <b>Enforce</b> = deny for real.</td><td><span class="toggle">Choice</span><br><span class="vals"><b>off (0)</b> · monitor (2) · enforce (1)</span></td><td><span class="where w-drv">Driver knob</span></td></tr>
+      <tr><td class="set">exfil_read_block</td><td class="desc">Runs the background tracker that computes the untrusted-reader PID set and pushes it to the driver. Must be on for read-deny to do anything.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">exfil_posture</td><td class="desc">Which processes are "untrusted". <b>Blocklist</b> = only known remote-tools/VM/behaviour. <b>Allowlist</b> = everything <em>not</em> on the Trusted-applications list (recommended, scales to unknown tools).</td><td><span class="toggle">Choice</span><br><span class="vals"><b>blocklist</b> · allowlist</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">ExfilReadFailBlock</td><td class="desc">When content can't be verified (unreadable/no bundle) and the reader is untrusted: deny (fail-secure) or allow.</td><td><span class="toggle">Toggle</span><br><span class="vals">off · <b>on (1)</b></span></td><td><span class="where w-drv">Driver knob</span></td></tr>
+      <tr><td class="set">scan_fixed</td><td class="desc">Also watch the fixed drive (C:) — not just removable — under the watched folders below. Off = removable/USB only.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">watch_paths</td><td class="desc">Which folders on the fixed drive to protect, e.g. <code>\Users</code> (all user files), <code>\</code> (whole C:). Up to 16 prefixes. Empty = C: never watched.</td><td><span class="toggle">List</span><br><span class="vals"><b>[ ]</b> (empty)</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">scan_network</td><td class="desc">Also inspect network (SMB) share reads/writes.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">block_at</td><td class="desc">Sensitivity threshold: a file is "sensitive" when a protected document's containment reaches this fraction.</td><td><span class="toggle">Value</span><br><span class="vals"><b>0.30</b> (0–1)</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">coverage_block_at</td><td class="desc">Alternative threshold: block when this fraction of the file is protected material.</td><td><span class="toggle">Value</span><br><span class="vals"><b>0.60</b> (0–1)</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 2. TRUSTED APPS -->
+  <h2 class="sec"><span class="n">02</span> Trusted applications (the allowlist)</h2>
+  <p class="sec-sub">Under the allowlist posture, these are the apps <em>allowed</em> to read sensitive content — everything else is denied. Already fully managed in the console (Trusted applications page).</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">Rule: by publisher</td><td class="desc">Trust apps signed by a code-signing publisher, e.g. "Adobe Inc." Spoof-resistant.</td><td><span class="toggle">List entry</span></td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">Rule: by install path</td><td class="desc">Trust apps under a folder, e.g. <code>C:\Program Files\Adobe</code>. Drive-roots rejected (would trust everything).</td><td><span class="toggle">List entry</span></td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">Rule: by app name</td><td class="desc">Trust by executable name, e.g. <code>winword.exe</code>. Weakest — pair with app-control.</td><td><span class="toggle">List entry</span></td><td><span class="where w-con">Console</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 3. GLOBAL FAIL BEHAVIOUR -->
+  <h2 class="sec"><span class="n">03</span> Fail behaviour (what happens when we can't decide)</h2>
+  <p class="sec-sub">Fail-secure vs fail-open when the agent/bundle can't produce a verdict — the core "defence posture" of the whole product.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">FailMode</td><td class="desc">Driver-wide default when the agent is unreachable or times out: block (classified sites) or allow+audit (general use).</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>allow (0)</b> · block (1)</span></td><td><span class="where w-drv">Driver knob</span></td></tr>
+      <tr><td class="set">fail_block (kguard)</td><td class="desc">Agent-side equivalent: when no verified fingerprint bundle is cached, block or allow+audit.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 4. USB -->
+  <h2 class="sec"><span class="n">04</span> Removable media (USB) channel</h2>
+  <p class="sec-sub">Controls copying to USB sticks / phones, and trusted-destination encryption (files land as sealed <code>.dlpenc</code> envelopes).</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">usb.enabled</td><td class="desc">Master switch for the USB channel. Off = idle.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">default_action</td><td class="desc">What happens for a USB device no rule matches (fail-secure).</td><td><span class="toggle">Choice</span><br><span class="vals"><b>read_only</b> · allow_audited · block · encrypt</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">mtp_action</td><td class="desc">Phones/cameras (MTP/WPD) that expose files without a drive letter.</td><td><span class="toggle">Choice</span><br><span class="vals"><b>block</b> · read_only · …</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">tethering_action</td><td class="desc">USB-tethering network adapters (an unmonitored egress path).</td><td><span class="toggle">Choice</span><br><span class="vals"><b>block</b> · …</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">Device rules</td><td class="desc">Per-device policy matched by serial / VID+PID / bus-type / any. Action: allow_audited, read_only, block, or <b>encrypt</b> (seal to <code>.dlpenc</code>). First match wins.</td><td><span class="toggle">List</span></td><td><span class="where w-con">Console</span> <span class="where w-pol">policy</span></td></tr>
+      <tr><td class="set">encrypt: mode</td><td class="desc">On an encrypt device: seal every file (<code>encrypt_all</code>) or only sensitive ones.</td><td><span class="toggle">Choice</span><br><span class="vals"><b>encrypt_sensitive</b> · encrypt_all</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">encrypt: on_block_band</td><td class="desc">What a whitelisted encrypt device does with the most-sensitive files: still block, or seal them out armoured.</td><td><span class="toggle">Choice</span><br><span class="vals"><b>block</b> · seal</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">max_file_bytes</td><td class="desc">Files larger than this are skipped (noted, not scanned).</td><td><span class="toggle">Value</span><br><span class="vals"><b>100 MB</b></span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">poll_interval_secs / settle_ms / settle_timeout_secs</td><td class="desc">Timing: how often to poll volumes, and how long to wait for a file to stop growing before scanning.</td><td><span class="toggle">Value</span><br><span class="vals"><b>2s / 1500ms / 30s</b></span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 5. NETWORK -->
+  <h2 class="sec"><span class="n">05</span> Network egress channel</h2>
+  <p class="sec-sub">Controls where processes may connect — the backstop that stops a tool sending data out even if it could read it.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">netfilter.mode</td><td class="desc"><b>Monitor</b> = log only. <b>Allowlist</b> = default-deny (only approved destinations). <b>Blocklist</b> = deny listed destinations.</td><td><span class="toggle">Choice</span><br><span class="vals"><b>monitor</b> · allowlist · blocklist</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">Egress rules</td><td class="desc">Permit/block by app, CIDR, port. First match wins. In allowlist mode MUST permit the server + DNS or the agent cuts itself off.</td><td><span class="toggle">List</span></td><td><span class="where w-con">Console</span> <span class="where w-pol">policy</span></td></tr>
+      <tr><td class="set">remote_tool_action</td><td class="desc">What to do with detected remote-access tools (AnyDesk/TeamViewer/VNC). Off by default — this is opt-in hygiene, separate from data-exfil blocking.</td><td><span class="toggle">Choice</span><br><span class="vals"><b>detect</b> · block_network · kill</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">persist</td><td class="desc">Keep network filters across reboot vs a dynamic session that cleans up on exit.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 6. CLIPBOARD -->
+  <h2 class="sec"><span class="n">06</span> Clipboard channel</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">clipboard.enabled</td><td class="desc">Master switch for clipboard monitoring.</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">default_action</td><td class="desc">For a clipboard payload nothing flags: audit it or block (clear the clipboard).</td><td><span class="toggle">Choice</span><br><span class="vals"><b>allow_audited</b> · block</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">block_images</td><td class="desc">Block image copies wholesale (can't be inspected without OCR).</td><td><span class="toggle">Toggle</span><br><span class="vals"><b>false</b> · true</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">max_bytes / block_at / coverage_block_at / fail_block</td><td class="desc">Size skip cap and the same sensitivity/fail thresholds as read-deny.</td><td><span class="toggle">Value</span><br><span class="vals"><b>8 MB / 0.30 / 0.60 / false</b></span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 7. WEB UPLOAD -->
+  <h2 class="sec"><span class="n">07</span> Web upload (browser channel)</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">Trusted origins</td><td class="desc">Web destinations whose uploads are sealed (encrypted) instead of blocked — e.g. an internal mail app. Each names a seal mode + key.</td><td><span class="toggle">List</span><br><span class="vals"><b>[ ]</b> (empty)</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 8. ENCRYPTION -->
+  <h2 class="sec"><span class="n">08</span> Encryption (encrypt-on-write)</h2>
+  <p class="sec-sub">Keys and thresholds for sealing files that leave via a trusted destination. Keys themselves are org-held and synced from the server.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">default_key_id</td><td class="desc">Which encryption key sealed files use when a rule names none (per-classification, e.g. <code>class-internal/v1</code>).</td><td><span class="toggle">Value</span><br><span class="vals"><b>class-internal/v1</b></span></td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">encrypt_at</td><td class="desc">Lower sensitivity edge at which a file starts being sealed on encrypt destinations.</td><td><span class="toggle">Value</span><br><span class="vals"><b>0.05</b> (0–1)</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">removable_write_block_at</td><td class="desc">Tighter containment ceiling for <em>blocking</em> a sensitive file copied to a non-whitelisted USB stick.</td><td><span class="toggle">Value</span><br><span class="vals"><b>0.15</b> (0–1)</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">Encryption keys</td><td class="desc">The actual org-held key material — created/rotated centrally, synced to endpoints over mTLS. Never on the endpoint in plaintext.</td><td><span class="toggle">Managed</span></td><td><span class="where w-con">Console</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 9. NOTIFICATIONS -->
+  <h2 class="sec"><span class="n">09</span> Endpoint notification (the "Blocked by DLP" toast)</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">notify.enabled</td><td class="desc">Show the user a native toast on every block. Off = silent (block + log only).</td><td><span class="toggle">Toggle</span><br><span class="vals">off · <b>on</b></span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">notify.mode</td><td class="desc">How much the toast reveals. <b>Standard</b> = file + channel + ref. <b>Minimal</b> = generic. <b>Covert</b> = no toast (counter-insider).</td><td><span class="toggle">Choice</span><br><span class="vals"><b>standard</b> · minimal · covert</span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">org_name</td><td class="desc">Organisation name shown in the toast title.</td><td><span class="toggle">Value</span><br><span class="vals"><b>"Data Loss Prevention"</b></span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+      <tr><td class="set">dedup_secs / max_per_minute</td><td class="desc">Anti-spam: suppress repeats of the same block within N seconds; hard cap per minute.</td><td><span class="toggle">Value</span><br><span class="vals"><b>5s / 20</b></span></td><td><span class="where w-pol">Endpoint policy</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 10. PROTECTED DOCS -->
+  <h2 class="sec"><span class="n">10</span> Protected documents &amp; trusted destinations (console lists)</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">Protected documents</td><td class="desc">The classified files whose content is fingerprinted — the definition of "sensitive". Synced to endpoints as a signed bundle.</td><td><span class="toggle">Managed</span></td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">Trusted USB devices</td><td class="desc">Approved removable devices and their disposition (read-only / encrypt / …). Synced to endpoints.</td><td><span class="toggle">List</span></td><td><span class="where w-con">Console</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 11. CONNECTION -->
+  <h2 class="sec"><span class="n">11</span> Connection &amp; identity (set at install)</h2>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Setting</th><th>What it does</th><th>Values (default)</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">server_url</td><td class="desc">The management server's mTLS address the agent connects to.</td><td><span class="toggle">Value</span></td><td><span class="where w-ins">Install / auto</span></td></tr>
+      <tr><td class="set">ca_cert_path</td><td class="desc">The CA certificate the agent pins to verify the server — can't be pointed at a fake console.</td><td><span class="toggle">Value</span></td><td><span class="where w-ins">Install / auto</span></td></tr>
+      <tr><td class="set">enrollment_token</td><td class="desc">One-time token to enrol the endpoint (created in the console). Ignored once the agent has its certificate.</td><td><span class="toggle">Value</span></td><td><span class="where w-con">Console</span> <span class="where w-ins">install</span></td></tr>
+      <tr><td class="set">state_dir</td><td class="desc">Where the agent keeps its sealed identity and cached policy.</td><td><span class="toggle">Value</span></td><td><span class="where w-ins">Install / auto</span></td></tr>
+      <tr><td class="set">checkin_interval_seconds</td><td class="desc">How often the agent checks in (the server's response takes precedence).</td><td><span class="toggle">Value</span><br><span class="vals"><b>300</b></span></td><td><span class="where w-ins">Install / auto</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 12. RBAC -->
+  <h2 class="sec"><span class="n">12</span> Access control (who may change what)</h2>
+  <p class="sec-sub">Four separated roles govern the console itself. Every setting above should be writable only by the right role, and every change audited.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Role</th><th>May do</th><th>Notably cannot</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">policy_author</td><td class="desc">Read/write policy — the allowlist, read-deny settings, channel policy.</td><td class="vals">read evidence</td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">incident_reviewer</td><td class="desc">Read incidents, read/export evidence (every access audited).</td><td class="vals">change policy</td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">auditor</td><td class="desc">Read the audit log, incident metadata, licence state.</td><td class="vals">change anything</td><td><span class="where w-con">Console</span></td></tr>
+      <tr><td class="set">sysadmin</td><td class="desc">Manage users/roles, system config, licence import.</td><td class="vals"><b>read evidence</b></td><td><span class="where w-con">Console</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- 13. LIFECYCLE -->
+  <h2 class="sec"><span class="n">13</span> Agent lifecycle (automatic — not operator settings)</h2>
+  <p class="sec-sub">These are handled by the installer and the running service — the operator never runs them. Listed so they're accounted for.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Action</th><th>What it does</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td class="set">enroll</td><td class="desc">Exchange the enrollment token for a client certificate (one time, at install).</td><td><span class="where w-ins">Install / auto</span></td></tr>
+      <tr><td class="set">index-update</td><td class="desc">Fetch the protected-document fingerprint bundle. Runs automatically at check-in.</td><td><span class="where w-ins">Install / auto</span></td></tr>
+      <tr><td class="set">install-service / run-endpoint</td><td class="desc">Register + run the agent as the LocalSystem service (so it can see SYSTEM processes and set the driver).</td><td><span class="where w-ins">Install / auto</span></td></tr>
+      <tr><td class="set">attach driver to C: / set registry knobs</td><td class="desc">Currently done by hand with <code>fltmc</code> / <code>reg add</code> during testing — <b>the agent will do this in code</b> from console policy. This is the core of the "no command line" work.</td><td><span class="where w-drv">Driver knob</span> → <span class="where w-con">Console</span></td></tr>
+    </tbody>
+  </table></div>
+
+  <footer>DLP settings reference · read from agent config.rs + driver registry + console-managed lists · defaults in bold</footer>
+</div>
