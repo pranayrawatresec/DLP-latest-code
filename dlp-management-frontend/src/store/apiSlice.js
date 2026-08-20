@@ -19,7 +19,7 @@ const baseQuery = async (args, apiCtx, extra) => {
 export const apiSlice = createApi({
   reducerPath: 'api',
   baseQuery,
-  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy'],
+  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy', 'Group'],
   endpoints: (b) => ({
     // Enrollment tokens
     getEnrollmentTokens: b.query({
@@ -191,6 +191,54 @@ export const apiSlice = createApi({
       query: (body) => ({ url: '/read-deny-policy', method: 'PUT', body }),
       invalidatesTags: ['ReadDenyPolicy'],
     }),
+
+    // Endpoint groups — per-machine/per-group policy targeting. The Default group
+    // holds every unassigned machine and uses the global read-deny policy.
+    getGroups: b.query({
+      query: () => '/groups',
+      transformResponse: (res) => res?.groups || [],
+      providesTags: ['Group'],
+    }),
+    createGroup: b.mutation({
+      query: (body) => ({ url: '/groups', method: 'POST', body }),
+      invalidatesTags: ['Group'],
+    }),
+    updateGroup: b.mutation({
+      query: ({ id, ...body }) => ({ url: `/groups/${id}`, method: 'PUT', body }),
+      invalidatesTags: ['Group'],
+    }),
+    deleteGroup: b.mutation({
+      query: (id) => ({ url: `/groups/${id}`, method: 'DELETE' }),
+      invalidatesTags: ['Group', 'Agent'],
+    }),
+
+    // Per-group read-deny policy (Default group edits the global row). Envelope:
+    // { policy, group, inheritsDefault, hasOverride }.
+    getGroupReadDenyPolicy: b.query({
+      query: (groupId) => `/read-deny-policy/group/${groupId}`,
+      providesTags: (result, error, groupId) => [{ type: 'ReadDenyPolicy', id: `group-${groupId}` }],
+    }),
+    updateGroupReadDenyPolicy: b.mutation({
+      query: ({ groupId, ...body }) => ({ url: `/read-deny-policy/group/${groupId}`, method: 'PUT', body }),
+      invalidatesTags: (result, error, { groupId }) => [
+        { type: 'ReadDenyPolicy', id: `group-${groupId}` },
+        'ReadDenyPolicy',
+        'Group',
+      ],
+    }),
+    resetGroupReadDenyPolicy: b.mutation({
+      query: (groupId) => ({ url: `/read-deny-policy/group/${groupId}`, method: 'DELETE' }),
+      invalidatesTags: (result, error, groupId) => [
+        { type: 'ReadDenyPolicy', id: `group-${groupId}` },
+        'Group',
+      ],
+    }),
+
+    // Assign an endpoint to a group (fleet management; agents.manage).
+    assignAgentGroup: b.mutation({
+      query: ({ id, groupId }) => ({ url: `/agents/${id}/group`, method: 'PUT', body: { groupId } }),
+      invalidatesTags: ['Agent', 'Group'],
+    }),
   }),
 })
 
@@ -226,4 +274,12 @@ export const {
   useDeleteTrustedReaderMutation,
   useGetReadDenyPolicyQuery,
   useUpdateReadDenyPolicyMutation,
+  useGetGroupsQuery,
+  useCreateGroupMutation,
+  useUpdateGroupMutation,
+  useDeleteGroupMutation,
+  useGetGroupReadDenyPolicyQuery,
+  useUpdateGroupReadDenyPolicyMutation,
+  useResetGroupReadDenyPolicyMutation,
+  useAssignAgentGroupMutation,
 } = apiSlice

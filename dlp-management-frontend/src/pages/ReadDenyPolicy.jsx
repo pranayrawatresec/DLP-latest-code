@@ -1,8 +1,14 @@
 import { useState, useEffect } from 'react'
 import { useSelector } from 'react-redux'
-import { useGetReadDenyPolicyQuery, useUpdateReadDenyPolicyMutation } from '../store/apiSlice'
+import { useSearchParams } from 'react-router-dom'
+import {
+  useGetGroupsQuery,
+  useGetGroupReadDenyPolicyQuery,
+  useUpdateGroupReadDenyPolicyMutation,
+  useResetGroupReadDenyPolicyMutation,
+} from '../store/apiSlice'
 import { selectHasPermission } from '../store/authSlice'
-import { PageHeader, Card, Button, Spinner, InlineAlert, Badge } from '../components/ui/kit'
+import { PageHeader, Card, Button, Spinner, InlineAlert, Badge, Select } from '../components/ui/kit'
 
 // --- option metadata --------------------------------------------------------
 
@@ -120,13 +126,38 @@ function Section({ title, desc, children }) {
 
 export default function ReadDenyPolicy() {
   const canWrite = useSelector(selectHasPermission('read_deny_policy:write'))
-  const { data: policy, isLoading, isError } = useGetReadDenyPolicyQuery()
-  const [save, { isLoading: saving }] = useUpdateReadDenyPolicyMutation()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // Per-group targeting: the page edits ONE group's policy at a time. Default to
+  // the Default group (whose policy is the global one) unless ?group=N selects
+  // another. Every group is edited through the group-aware endpoints; for the
+  // Default group the server maps to the global row, so behaviour is unchanged.
+  const { data: groups = [] } = useGetGroupsQuery()
+  const defaultGroup = groups.find((g) => g.isDefault)
+  const groupParam = searchParams.get('group')
+  const selectedGroupId =
+    groupParam && /^\d+$/.test(groupParam)
+      ? Number(groupParam)
+      : defaultGroup
+        ? defaultGroup.id
+        : null
+
+  const { data: envelope, isLoading, isError } = useGetGroupReadDenyPolicyQuery(selectedGroupId, {
+    skip: !selectedGroupId,
+  })
+  const policy = envelope?.policy
+  const group = envelope?.group
+  const inheritsDefault = envelope?.inheritsDefault
+  const hasOverride = envelope?.hasOverride
+
+  const [save, { isLoading: saving }] = useUpdateGroupReadDenyPolicyMutation()
+  const [resetOverride, { isLoading: resetting }] = useResetGroupReadDenyPolicyMutation()
 
   const [form, setForm] = useState(null)
   const [newPath, setNewPath] = useState('')
   const [msg, setMsg] = useState(null) // { kind:'ok'|'err', text }
 
+  // Reload the form whenever the resolved policy changes (incl. switching groups).
   useEffect(() => {
     if (policy)
       setForm({
@@ -134,7 +165,12 @@ export default function ReadDenyPolicy() {
         watchPaths: [...(policy.watchPaths || [])],
         readersAuthority: policy.readersAuthority || 'merge',
       })
-  }, [policy])
+  }, [policy, selectedGroupId])
+
+  const selectGroup = (id) => {
+    setMsg(null)
+    setSearchParams(defaultGroup && id === defaultGroup.id ? {} : { group: String(id) })
+  }
 
   if (isLoading || !form) {
     return (
@@ -168,10 +204,13 @@ export default function ReadDenyPolicy() {
   }
   const removePath = (p) => set({ watchPaths: form.watchPaths.filter((x) => x !== p) })
 
+  const isDefaultGroup = group?.isDefault
+
   async function onSave() {
     setMsg(null)
     try {
       await save({
+        groupId: selectedGroupId,
         mode: form.mode,
         posture: form.posture,
         scanFixed: form.scanFixed,
@@ -185,12 +224,64 @@ export default function ReadDenyPolicy() {
     }
   }
 
+  async function onReset() {
+    setMsg(null)
+    try {
+      await resetOverride(selectedGroupId).unwrap()
+      setMsg({ kind: 'ok', text: 'Custom policy removed — this group now inherits the Default.' })
+    } catch (e) {
+      setMsg({ kind: 'err', text: e?.data?.error || 'Could not reset the policy.' })
+    }
+  }
+
   return (
     <>
       <PageHeader
         title="Read-deny policy"
         description="Controls whether endpoints deny untrusted programs the read of sensitive files, and where. Agents apply this to the kernel driver automatically — no command line."
       />
+
+      {/* Group targeting: choose which group's policy to edit. Default = the global
+          policy every unassigned machine gets. */}
+      <Card className="mb-4">
+        <div className="flex flex-wrap items-center gap-3 px-6 py-4">
+          <label className="text-sm font-medium text-gray-900" htmlFor="rdp-group">
+            Group
+          </label>
+          <Select
+            id="rdp-group"
+            value={selectedGroupId || ''}
+            onChange={(e) => selectGroup(Number(e.target.value))}
+            className="w-56"
+          >
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.isDefault ? `${g.name} (all endpoints)` : g.name}
+              </option>
+            ))}
+          </Select>
+          {isDefaultGroup ? (
+            <Badge tone="blue">Global policy — applies to every unassigned machine</Badge>
+          ) : hasOverride ? (
+            <Badge tone="indigo">Custom policy for this group</Badge>
+          ) : (
+            <Badge tone="gray">Inherits the Default policy</Badge>
+          )}
+          {canWrite && !isDefaultGroup && hasOverride && (
+            <Button variant="dangerGhost" size="sm" onClick={onReset} disabled={resetting} className="ml-auto">
+              {resetting ? 'Resetting…' : 'Reset to Default'}
+            </Button>
+          )}
+        </div>
+        {!isDefaultGroup && inheritsDefault && (
+          <div className="px-6 pb-4 -mt-1">
+            <InlineAlert tone="blue">
+              This group currently inherits the Default policy. Editing and saving below creates a
+              custom policy for <b>{group?.name}</b> — other groups are unaffected.
+            </InlineAlert>
+          </div>
+        )}
+      </Card>
 
       <Card>
         <div className="px-6">

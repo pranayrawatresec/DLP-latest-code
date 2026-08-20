@@ -11,6 +11,7 @@ import ProtectedDocuments from './pages/ProtectedDocuments'
 import TrustedDestinations from './pages/TrustedDestinations'
 import TrustedReaders from './pages/TrustedReaders'
 import ReadDenyPolicy from './pages/ReadDenyPolicy'
+import Groups from './pages/Groups'
 import AppLayout from './components/layout/AppLayout'
 import ProtectedRoute from './components/ProtectedRoute'
 import RequirePermission from './components/RequirePermission'
@@ -59,6 +60,10 @@ function App() {
         <Route
           path="read-deny-policy"
           element={<RequirePermission permission="read_deny_policy:read"><ReadDenyPolicy /></RequirePermission>}
+        />
+        <Route
+          path="groups"
+          element={<RequirePermission permission="groups:read"><Groups /></RequirePermission>}
         />
         <Route
           path="sessions"
