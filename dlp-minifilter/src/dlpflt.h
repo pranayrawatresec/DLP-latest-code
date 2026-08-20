@@ -257,6 +257,15 @@ typedef struct _DLP_STREAM_CONTEXT {
      * re-scores the new content. Ensures a file cached CLEAN then overwritten with
      * sensitive content is re-classified, not served the stale verdict. */
     volatile LONG WriteEvicted;
+    /* Did the cached DENY come from a POSITIVE (sensitive-content) match, as opposed
+     * to a fail-safe deny (OOM / unreadable / up-call failure)? The OPEN-deny
+     * (DlpPostCreate -> FltCancelFileOpen) may cancel a create ONLY on a positive
+     * match (never on empty/new/unparseable files, #4 scoping), so it must know the
+     * positiveness of a verdict served from cache (step B) too -- otherwise every
+     * repeat open of an already-classified sensitive file slips past the open-deny
+     * (positive defaults FALSE) and re-opens the delegate-read window. Set alongside
+     * ExfilVerdict=_DENY; cleared to 0 when the verdict is evicted to _UNKNOWN. */
+    volatile LONG ExfilPositive;
     /* NOTE: repeat-deny audit dedup is NOT here — a stream context is shared across
      * every open of a file, so it cannot count distinct opens/processes. That lives
      * in the per-open DLP_HANDLE_CONTEXT (DenyReported) instead. */

@@ -754,6 +754,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;   /* contexts are NOT zeroed by FltMgr */
         ctx->WriteEvicted = 0;
+        ctx->ExfilPositive = 0;
 
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
@@ -810,6 +811,7 @@ DlpPreWrite(_Inout_ PFLT_CALLBACK_DATA Data,
             FILE_INTERNAL_INFORMATION intInfo;
             ULONGLONG fileId = 0;
             InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_UNKNOWN);
+            InterlockedExchange(&ctx->ExfilPositive, 0);  /* verdict gone -> no stale positive */
             RtlZeroMemory(&intInfo, sizeof(intInfo));
             if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
                     FltObjects->FileObject, &intInfo, sizeof(intInfo),
@@ -1719,6 +1721,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
         ctx->WriteEvicted = 0;
+        ctx->ExfilPositive = 0;
         status = FltSetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                      FLT_SET_CONTEXT_KEEP_IF_EXISTS,
                                      (PFLT_CONTEXT)ctx, NULL);
@@ -1739,9 +1742,17 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     cached = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
     if (cached == DLP_EXFIL_DENY || cached == DLP_EXFIL_ALLOW) {
         if (cached == DLP_EXFIL_DENY) {
-            /* Audit-only: leave *Positive FALSE so the OPEN-vs-READ deny behaviour
-             * is byte-for-byte what it was before (no new open cancellations). */
             DlpAuditSilentDeny(FltObjects, Pid);
+            /* Carry the cached DENY's positiveness so the OPEN-deny cancels EVERY
+             * untrusted open of a known-sensitive file, not only the first (which took
+             * the step-E path). Without this, once a file is classified its stream
+             * verdict serves later opens here with *Positive FALSE, and the open-deny
+             * (which fires only on a positive match, #4) silently stops cancelling --
+             * re-opening the delegate-read window this whole mechanism closes. A
+             * fail-safe DENY (ExfilPositive==0) still does NOT cancel opens. */
+            if (Positive != NULL) {
+                *Positive = (InterlockedCompareExchange(&ctx->ExfilPositive, 0, 0) != 0);
+            }
         }
         FltReleaseContext((PFLT_CONTEXT)ctx);
         return cached;
@@ -1792,6 +1803,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
          * either path to exactly one event per attempt.) */
         DlpAuditSilentDeny(FltObjects, Pid);
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
+        InterlockedExchange(&ctx->ExfilPositive, 1);  /* known-sensitive -> open-deny */
         FltReleaseFileNameInformation(nameInfo);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         if (Positive != NULL) {
@@ -1825,6 +1837,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
          * cross-open rings on a transient failure; only cache per-file (stream ctx). */
         if (gDlpData.ExfilReadFailBlock) {
             InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
+            InterlockedExchange(&ctx->ExfilPositive, 0);  /* fail-safe: reads denied, opens not cancelled */
             FltReleaseContext((PFLT_CONTEXT)ctx);
             return DLP_EXFIL_DENY;
         }
@@ -1880,6 +1893,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
             DlpAuditSilentDeny(FltObjects, Pid);
         }
         InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
+        InterlockedExchange(&ctx->ExfilPositive, positiveMatch ? 1 : 0);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         if (Positive != NULL) {
             *Positive = positiveMatch;
