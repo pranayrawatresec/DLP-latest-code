@@ -247,6 +247,39 @@ async function main() {
     return 'set semantics: duplicate rejected';
   });
 
+  await check('R07b', 'CASE-INSENSITIVE duplicate via API -> 409 (#15)', async () => {
+    // Endpoint matching ignores case, so winword.exe == WINWORD.EXE.
+    const base = `${TAG}_dedup.exe`;
+    const first = await api('/api/trusted-readers', {
+      cookie: authorCookie, method: 'POST', body: { matchType: 'name', value: base },
+    });
+    assert(first.status === 201, `first insert: expected 201, got ${first.status}`);
+    const variant = await api('/api/trusted-readers', {
+      cookie: authorCookie, method: 'POST', body: { matchType: 'name', value: base.toUpperCase() },
+    });
+    assert(variant.status === 409, `case-variant: expected 409, got ${variant.status}`);
+    return 'winword.exe then WINWORD.EXE rejected';
+  });
+
+  await check('R07c', 'DB functional unique index blocks a case-variant direct insert (#15)', async () => {
+    // Bypass the route entirely: prove migration 011's UNIQUE (match_type,
+    // lower(value)) is a hard DB invariant, not only an app-layer check.
+    const base = `${TAG}_dbci.exe`;
+    await pool.query(
+      `insert into trusted_readers (match_type, value, created_by) values ('name', $1, 'test')`,
+      [base]);
+    let code = null;
+    try {
+      await pool.query(
+        `insert into trusted_readers (match_type, value, created_by) values ('name', $1, 'test')`,
+        [base.toUpperCase()]);
+    } catch (e) {
+      code = e.code;
+    }
+    assert(code === '23505', `expected 23505 from the CI unique index, got ${code}`);
+    return 'DB rejects the case-variant (23505)';
+  });
+
   await check('R08', 'GET includes the new reader', async () => {
     const res = await api('/api/trusted-readers', { cookie: auditorCookie });
     const found = (await res.json()).readers.find((r) => r.id === readerId);
