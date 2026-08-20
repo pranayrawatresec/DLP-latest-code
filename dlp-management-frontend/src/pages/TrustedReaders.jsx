@@ -33,7 +33,7 @@ const TYPE_LABELS = {
 const TYPE_TONES = {
   publisher: 'green', // strongest identity
   path: 'blue',
-  name: 'gray', // weakest
+  name: 'amber', // weakest / spoofable — flagged so it stands out in the list
 }
 const TYPE_HINTS = {
   publisher:
@@ -139,6 +139,17 @@ function AddReaderModal({ groupId, groupLabel, onClose }) {
           className={matchType === 'name' || matchType === 'path' ? 'font-mono' : ''}
         />
       </Field>
+
+      {matchType === 'name' && (
+        <div className="mb-2">
+          <InlineAlert tone="amber">
+            <b>Name-only rules are easy to fake.</b> Any program with this exact file name is
+            trusted — malware renamed to <code className="font-mono">{value.trim() || 'winword.exe'}</code>{' '}
+            would be trusted too. Prefer a <b>Publisher</b> or <b>Install-path</b> rule, or only use a
+            name rule alongside app-control (WDAC/AppLocker) that pins what may run under that name.
+          </InlineAlert>
+        </div>
+      )}
 
       <Field label="Note (optional)" htmlFor="tr-note" hint="Why is this application trusted?">
         <Input
