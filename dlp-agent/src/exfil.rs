@@ -178,24 +178,53 @@ pub fn compute_exfil_pids(_self_pid: u32) -> Vec<u32> {
 use crate::trustedreaders::ReaderMatch;
 
 #[cfg(not(windows))]
-pub fn compute_untrusted_pids(_self_pid: u32, _rules: &[ReaderMatch]) -> Option<Vec<u32>> {
+pub fn compute_untrusted_pids(
+    _self_pid: u32,
+    _rules: &[ReaderMatch],
+    _central: bool,
+) -> Option<Vec<u32>> {
     Some(Vec::new())
 }
 
+/// `central` = the console list is AUTHORITATIVE (read-deny policy
+/// `readersAuthority = central`, #9). It changes only the EMPTY-list behaviour:
+///   * `central == false` (merge/legacy) — an empty list means "not configured",
+///     so push nothing (fail toward availability), as before.
+///   * `central == true` — an empty list is a deliberate "trust no application"
+///     declaration, so EVERY non-agent process is untrusted (fail-secure lockdown).
+/// A NON-empty list behaves identically either way.
 #[cfg(windows)]
-pub fn compute_untrusted_pids(self_pid: u32, rules: &[ReaderMatch]) -> Option<Vec<u32>> {
+pub fn compute_untrusted_pids(
+    self_pid: u32,
+    rules: &[ReaderMatch],
+    central: bool,
+) -> Option<Vec<u32>> {
     use std::collections::HashSet;
 
-    // Empty allowlist ⇒ fail toward AVAILABILITY, not lockout. An empty list
-    // almost always means "not configured / monitor mode"; pushing every PID
-    // would deny sensitive reads system-wide. Push nothing and log once so the
-    // operator knows the allowlist must be populated before it enforces.
+    // Empty list handling depends on WHY it is empty:
+    //   * merge/legacy (central == false): almost always "not configured / monitor
+    //     mode" — pushing every PID would deny sensitive reads system-wide, so push
+    //     nothing (fail toward AVAILABILITY) and warn to populate the list.
+    //   * central (central == true): an empty CENTRAL allowlist is an authoritative
+    //     "trust no application" — fall through so every non-agent process is
+    //     untrusted (fail-secure LOCKDOWN). The agent's own binary stays trusted
+    //     (own_exe below), so it never blocks itself.
     if rules.is_empty() {
-        tracing::warn!(
-            "read-deny allowlist posture with an EMPTY sanctioned-reader list — pushing no PIDs \
-             (populate the trusted-reader allowlist before it can enforce)"
-        );
-        return Some(Vec::new());
+        if central {
+            tracing::warn!(
+                "read-deny CENTRAL authority with an EMPTY sanctioned-reader list — every \
+                 non-agent process is treated as untrusted (fail-secure lockdown); add the apps \
+                 that must read sensitive files to the console allowlist to relax this"
+            );
+            // fall through: with no rule to sanction anything, the loop below marks
+            // every identifiable process untrusted.
+        } else {
+            tracing::warn!(
+                "read-deny allowlist posture with an EMPTY sanctioned-reader list — pushing no \
+                 PIDs (populate the trusted-reader allowlist before it can enforce)"
+            );
+            return Some(Vec::new());
+        }
     }
 
     // Enable SeDebugPrivilege once (best-effort): when the guard runs elevated /
@@ -1039,8 +1068,8 @@ mod tests {
             ReaderMatch::Publisher("Microsoft Corporation".into()),
             ReaderMatch::Path(format!(r"{sysroot}")),
         ];
-        let untrusted =
-            compute_untrusted_pids(std::process::id(), &rules).expect("enumeration succeeded");
+        let untrusted = compute_untrusted_pids(std::process::id(), &rules, false)
+            .expect("enumeration succeeded");
         eprintln!(
             "[probe] compute_untrusted_pids(Microsoft + {sysroot}) -> {} untrusted PID(s)",
             untrusted.len()
@@ -1049,5 +1078,28 @@ mod tests {
         assert!(!untrusted.contains(&std::process::id()));
         assert!(!untrusted.contains(&0));
         assert!(!untrusted.contains(&4));
+    }
+
+    // Empty-allowlist behaviour differs by authority (#9): merge => push nothing
+    // (availability); central => push everything non-agent (fail-secure lockdown).
+    #[test]
+    fn empty_allowlist_merge_pushes_nothing_central_locks_down() {
+        // MERGE + empty: unconfigured => enforce nothing.
+        let merge = compute_untrusted_pids(std::process::id(), &[], false)
+            .expect("enumeration succeeded");
+        assert!(merge.is_empty(), "merge + empty list must push NO pids");
+
+        // CENTRAL + empty: authoritative "trust nothing" => every non-agent process
+        // is untrusted. There are always other processes on the machine, so the set
+        // is non-empty — and never contains self / 0 / 4.
+        let central = compute_untrusted_pids(std::process::id(), &[], true)
+            .expect("enumeration succeeded");
+        assert!(
+            !central.is_empty(),
+            "central + empty list must lock down (push every non-agent pid)"
+        );
+        assert!(!central.contains(&std::process::id()));
+        assert!(!central.contains(&0));
+        assert!(!central.contains(&4));
     }
 }

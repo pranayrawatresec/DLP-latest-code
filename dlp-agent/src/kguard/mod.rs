@@ -654,7 +654,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
             ExfilPosture::Blocklist => Some(crate::exfil::compute_exfil_pids(self_pid)),
             ExfilPosture::Allowlist => {
                 let rules = crate::trustedreaders::resolve_matches(&snap.trusted_readers);
-                crate::exfil::compute_untrusted_pids(self_pid, &rules)
+                crate::exfil::compute_untrusted_pids(self_pid, &rules, snap.kguard.readers_central)
             }
         };
         let posture = match snap.kguard.exfil_posture {

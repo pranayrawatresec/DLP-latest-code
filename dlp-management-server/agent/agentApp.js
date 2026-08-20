@@ -388,6 +388,7 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
       scan_fixed: false,
       watch_paths: [],
       fail_block: false,
+      readers_authority: 'merge',
     };
     const policy = {
       mode: p.mode,
@@ -395,6 +396,9 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
       scanFixed: p.scan_fixed,
       watchPaths: p.watch_paths,
       failBlock: p.fail_block,
+      // 'central' => local [[trusted_readers]] are ignored on the endpoint (#9);
+      // 'merge' (default) => union with local, as before.
+      readersAuthority: p.readers_authority || 'merge',
     };
 
     await audit('agent-policy', 'agent.policy_delivered', agent.id, {

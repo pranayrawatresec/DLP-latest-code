@@ -321,6 +321,14 @@ pub struct KguardConfig {
     /// ([`Config::trusted_readers`]) as an untrusted reader. Only consulted when
     /// [`exfil_read_block`](Self::exfil_read_block) is on.
     pub exfil_posture: ExfilPosture,
+
+    /// Reader-allowlist authority (#9), pushed down from the console read-deny
+    /// policy at runtime — NOT a local config field. `true` = central-authoritative:
+    /// local `[[trusted_readers]]` are ignored and an EMPTY console allowlist means
+    /// fail-secure lockdown (every non-agent process untrusted). Set by
+    /// [`Config::with_read_deny_policy`]; `agent.toml` cannot set it.
+    #[serde(skip)]
+    pub readers_central: bool,
 }
 
 impl Default for KguardConfig {
@@ -337,6 +345,7 @@ impl Default for KguardConfig {
             watch_paths: Vec::new(),
             exfil_read_block: false,
             exfil_posture: ExfilPosture::Blocklist,
+            readers_central: false,
         }
     }
 }
@@ -709,12 +718,25 @@ impl Config {
         merged
     }
 
-    /// Produce an effective config whose sanctioned-reader allowlist is the
-    /// UNION of the local `[[trusted_readers]]` and the console-authored readers
-    /// synced over mTLS (read-deny allowlist posture). Union is correct: a reader
-    /// trusted either locally or centrally is trusted. Pure — a clone with the
-    /// synced rules appended; everything else is unchanged.
-    pub fn with_synced_readers(&self, readers: &[SyncedReader]) -> Config {
+    /// Produce an effective config whose sanctioned-reader allowlist is built from
+    /// the console-authored readers synced over mTLS (read-deny allowlist posture),
+    /// combined with the endpoint's local `[[trusted_readers]]` per the policy's
+    /// authority (#9):
+    ///
+    /// * `central == false` (`merge`, the default) — UNION of local + central: a
+    ///   reader trusted either locally or centrally is trusted. Today's behaviour.
+    /// * `central == true` — the console list is the WHOLE allowlist; local rules
+    ///   are dropped so HQ can revoke any endpoint-typed rule. The agent's own-exe /
+    ///   sibling-sealer trust lives in [`crate::exfil::compute_untrusted_pids`], NOT
+    ///   here, so central mode never makes the agent block itself.
+    ///
+    /// Pure — a clone with the reader list rebuilt; everything else is unchanged.
+    pub fn with_synced_readers(&self, readers: &[SyncedReader], central: bool) -> Config {
+        if central {
+            let mut merged = self.clone();
+            merged.trusted_readers = readers.iter().map(SyncedReader::to_rule).collect();
+            return merged;
+        }
         if readers.is_empty() {
             return self.clone();
         }
@@ -776,6 +798,53 @@ note = \"legacy rule\"
         assert_eq!(cfg.crypto.encrypt_at, 0.05);
         assert!(cfg.crypto.keyfile.is_none());
         assert!(cfg.webupload.trusted_origins.is_empty());
+    }
+
+    #[test]
+    fn synced_readers_merge_vs_central_authority() {
+        // A rule the endpoint typed into its LOCAL agent.toml.
+        let toml_str = format!(
+            "{BASE}
+[[trusted_readers]]
+path = \"C:\\\\Windows\"
+note = \"local OS trust\"
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.trusted_readers.len(), 1);
+
+        let synced = vec![SyncedReader {
+            match_type: "publisher".into(),
+            value: "Microsoft Corporation".into(),
+        }];
+
+        // MERGE (default / back-compat): union — the local rule survives alongside
+        // the console-authored one.
+        let merged = cfg.with_synced_readers(&synced, false);
+        assert_eq!(merged.trusted_readers.len(), 2);
+        assert!(merged
+            .trusted_readers
+            .iter()
+            .any(|r| r.path.as_deref() == Some("C:\\Windows")));
+
+        // CENTRAL (#9): the console list is the WHOLE allowlist — the local rule is
+        // dropped so HQ can revoke any endpoint-typed trust.
+        let central = cfg.with_synced_readers(&synced, true);
+        assert_eq!(central.trusted_readers.len(), 1);
+        assert!(central.trusted_readers.iter().all(|r| r.path.is_none()));
+        assert_eq!(
+            central.trusted_readers[0].publisher.as_deref(),
+            Some("Microsoft Corporation")
+        );
+
+        // CENTRAL with an EMPTY console list drops ALL local trust (a local rule can
+        // never sneak back in) — the strongest lockdown.
+        let empty_central = cfg.with_synced_readers(&[], true);
+        assert!(empty_central.trusted_readers.is_empty());
+
+        // MERGE with an empty console list is a no-op (keeps the local rule).
+        let empty_merge = cfg.with_synced_readers(&[], false);
+        assert_eq!(empty_merge.trusted_readers.len(), 1);
     }
 
     #[test]

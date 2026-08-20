@@ -18,6 +18,7 @@ router.use(requireAuth);
 
 const MODES = new Set(['off', 'monitor', 'enforce']);
 const POSTURES = new Set(['allowlist', 'blocklist']);
+const READER_AUTHORITIES = new Set(['central', 'merge']);
 
 function policyJson(row) {
   return {
@@ -26,6 +27,9 @@ function policyJson(row) {
     scanFixed: row.scan_fixed,
     watchPaths: row.watch_paths,
     failBlock: row.fail_block,
+    // Whether the console list is the WHOLE reader allowlist ('central') or is
+    // unioned with each endpoint's local rules ('merge', default). #9.
+    readersAuthority: row.readers_authority,
     updatedBy: row.updated_by,
     updatedAt: row.updated_at,
   };
@@ -58,6 +62,17 @@ function validatePolicy(body) {
   if (typeof body.scanFixed !== 'boolean') return { ok: false, error: 'scanFixed must be true or false' };
   if (typeof body.failBlock !== 'boolean') return { ok: false, error: 'failBlock must be true or false' };
 
+  // Reader-allowlist authority (#9). Optional for back-compat: an older client
+  // that omits it keeps the default 'merge' (today's union behaviour) — it can
+  // never silently flip a site to 'central'.
+  let readersAuthority = 'merge';
+  if (body.readersAuthority !== undefined) {
+    readersAuthority = typeof body.readersAuthority === 'string' ? body.readersAuthority.trim() : '';
+    if (!READER_AUTHORITIES.has(readersAuthority)) {
+      return { ok: false, error: 'readersAuthority must be central|merge' };
+    }
+  }
+
   const wp = body.watchPaths;
   if (!Array.isArray(wp) || wp.length > 16) {
     return { ok: false, error: 'watchPaths must be an array of at most 16 folder prefixes' };
@@ -80,7 +95,15 @@ function validatePolicy(body) {
       error: 'pick at least one folder to watch (e.g. \\Users), or turn off fixed-drive scanning',
     };
   }
-  return { ok: true, mode, posture, scanFixed: body.scanFixed, watchPaths, failBlock: body.failBlock };
+  return {
+    ok: true,
+    mode,
+    posture,
+    scanFixed: body.scanFixed,
+    watchPaths,
+    failBlock: body.failBlock,
+    readersAuthority,
+  };
 }
 
 // GET /api/read-deny-policy — the current policy.
@@ -106,10 +129,18 @@ router.put('/', requirePermission('read_deny_policy:write'), async (req, res, ne
     const { rows } = await client.query(
       `update read_deny_policy
           set mode=$1, posture=$2, scan_fixed=$3, watch_paths=$4, fail_block=$5,
-              updated_by=$6, updated_at=now()
+              readers_authority=$6, updated_by=$7, updated_at=now()
         where id = 1
       returning *`,
-      [v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, req.user.email]
+      [
+        v.mode,
+        v.posture,
+        v.scanFixed,
+        JSON.stringify(v.watchPaths),
+        v.failBlock,
+        v.readersAuthority,
+        req.user.email,
+      ]
     );
     await writeChainEntry(client, req.user.email, 'read_deny_policy.update', 'read-deny', {
       mode: v.mode,
@@ -117,6 +148,7 @@ router.put('/', requirePermission('read_deny_policy:write'), async (req, res, ne
       scanFixed: v.scanFixed,
       watchPaths: v.watchPaths,
       failBlock: v.failBlock,
+      readersAuthority: v.readersAuthority,
     });
     await client.query('commit');
     res.json({ policy: policyJson(rows[0]) });

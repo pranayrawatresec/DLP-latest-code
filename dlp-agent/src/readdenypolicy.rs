@@ -28,6 +28,12 @@ pub struct ReadDenyPolicy {
     pub watch_paths: Vec<String>,
     #[serde(default, rename = "failBlock")]
     pub fail_block: bool,
+    /// `central` | `merge`. `merge` (default) unions the console list with the
+    /// endpoint's local `[[trusted_readers]]` (today's behaviour); `central` makes
+    /// the console list the WHOLE allowlist so HQ can revoke a locally-typed rule
+    /// (#9). An old/partial server response defaults to the back-compat `merge`.
+    #[serde(default = "default_authority", rename = "readersAuthority")]
+    pub readers_authority: String,
 }
 
 fn default_mode() -> String {
@@ -35,6 +41,9 @@ fn default_mode() -> String {
 }
 fn default_posture() -> String {
     "blocklist".into()
+}
+fn default_authority() -> String {
+    "merge".into()
 }
 
 impl Default for ReadDenyPolicy {
@@ -45,6 +54,7 @@ impl Default for ReadDenyPolicy {
             scan_fixed: false,
             watch_paths: Vec::new(),
             fail_block: false,
+            readers_authority: "merge".into(),
         }
     }
 }
@@ -69,6 +79,12 @@ impl ReadDenyPolicy {
             ExfilPosture::Blocklist
         }
     }
+    /// True when the console list is authoritative — local `[[trusted_readers]]`
+    /// must be ignored so the central policy can revoke any endpoint-typed rule
+    /// (#9). Defaults to false (`merge`), preserving today's union behaviour.
+    pub fn readers_central(&self) -> bool {
+        self.readers_authority == "central"
+    }
 }
 
 impl Config {
@@ -83,6 +99,11 @@ impl Config {
         merged.kguard.scan_fixed = p.scan_fixed;
         merged.kguard.watch_paths = p.watch_paths.clone();
         merged.kguard.fail_block = p.fail_block;
+        // Carry the reader-allowlist authority to the exfil pusher so an EMPTY
+        // console list under central authority fails secure (lockdown) instead of
+        // being read as "unconfigured" (#9). Must be set alongside the readers merge
+        // in `with_synced_readers(_, p.readers_central())`.
+        merged.kguard.readers_central = p.readers_central();
         merged
     }
 }
@@ -219,5 +240,39 @@ pub fn attach_fixed_volume(volume: &str) {
             // ERROR_FLT_INSTANCE_NAME_COLLISION (already attached) is expected/fine.
             tracing::info!(volume, error = %e, "filter attach to volume (already-attached is OK)");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readers_authority_defaults_to_merge_when_absent() {
+        // An old/partial server response (no readersAuthority) must default to the
+        // back-compat 'merge' — never silently flip an endpoint to 'central'.
+        let p: ReadDenyPolicy =
+            serde_json::from_str(r#"{"mode":"enforce","posture":"allowlist"}"#).unwrap();
+        assert_eq!(p.readers_authority, "merge");
+        assert!(!p.readers_central());
+    }
+
+    #[test]
+    fn readers_central_only_for_central() {
+        let central: ReadDenyPolicy =
+            serde_json::from_str(r#"{"readersAuthority":"central"}"#).unwrap();
+        assert!(central.readers_central());
+
+        let merge: ReadDenyPolicy =
+            serde_json::from_str(r#"{"readersAuthority":"merge"}"#).unwrap();
+        assert!(!merge.readers_central());
+
+        // An unrecognised value fails safe to NOT central (keeps local trust).
+        let weird: ReadDenyPolicy =
+            serde_json::from_str(r#"{"readersAuthority":"bogus"}"#).unwrap();
+        assert!(!weird.readers_central());
+
+        // The Default is merge.
+        assert!(!ReadDenyPolicy::default().readers_central());
     }
 }

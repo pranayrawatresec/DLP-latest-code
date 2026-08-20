@@ -586,7 +586,9 @@ fn cmd_usb_guard(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
     // Read-deny allowlist posture: also pull the sanctioned-reader allowlist so
     // the exfil pusher classifies against the console-authored list.
     let readers = checkin::sync_trusted_readers(cfg, storage);
-    let effective = cfg.with_synced_destinations(&synced).with_synced_readers(&readers);
+    // Standalone usb-guard (operator debugging tool) has no read-deny policy fetch,
+    // so it keeps the back-compat MERGE (local + central) — unchanged behaviour.
+    let effective = cfg.with_synced_destinations(&synced).with_synced_readers(&readers, false);
     let cfg = &effective;
 
     let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
@@ -786,7 +788,7 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
     let policy = checkin::sync_read_deny_policy(cfg, storage);
     let effective = cfg
         .with_synced_destinations(&synced)
-        .with_synced_readers(&readers)
+        .with_synced_readers(&readers, policy.readers_central())
         .with_read_deny_policy(&policy);
     let shared: Arc<RwLock<Config>> = Arc::new(RwLock::new(effective));
 
@@ -971,7 +973,7 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                 let policy = checkin::sync_read_deny_policy(&base_cfg, &storage);
                 let new_effective = base_cfg
                     .with_synced_destinations(&synced)
-                    .with_synced_readers(&readers)
+                    .with_synced_readers(&readers, policy.readers_central())
                     .with_read_deny_policy(&policy);
                 health.set_keyring_present(build_sealer_keyring(&base_cfg, &storage).is_some());
                 match shared.write() {

@@ -40,6 +40,19 @@ const WATCH_PRESETS = [
   { v: '\\', label: 'Whole C: drive (\\)' },
 ]
 
+const READER_AUTHORITIES = [
+  {
+    v: 'merge',
+    label: 'Merge',
+    hint: 'This list is combined with each endpoint’s local trusted-reader rules (default). Local rules can widen trust and cannot be revoked from here.',
+  },
+  {
+    v: 'central',
+    label: 'Central',
+    hint: 'This list is the ONLY trusted-reader allowlist. Rules typed into an endpoint’s local config are ignored, so you can revoke any trust from here. Recommended for locked-down sites.',
+  },
+]
+
 // --- small controls ---------------------------------------------------------
 
 function Segmented({ value, options, onChange, disabled }) {
@@ -115,7 +128,12 @@ export default function ReadDenyPolicy() {
   const [msg, setMsg] = useState(null) // { kind:'ok'|'err', text }
 
   useEffect(() => {
-    if (policy) setForm({ ...policy, watchPaths: [...(policy.watchPaths || [])] })
+    if (policy)
+      setForm({
+        ...policy,
+        watchPaths: [...(policy.watchPaths || [])],
+        readersAuthority: policy.readersAuthority || 'merge',
+      })
   }, [policy])
 
   if (isLoading || !form) {
@@ -133,7 +151,14 @@ export default function ReadDenyPolicy() {
     setForm((f) => ({ ...f, ...patch }))
     setMsg(null)
   }
-  const dirty = policy && JSON.stringify(form) !== JSON.stringify({ ...policy, watchPaths: policy.watchPaths || [] })
+  const dirty =
+    policy &&
+    JSON.stringify(form) !==
+      JSON.stringify({
+        ...policy,
+        watchPaths: policy.watchPaths || [],
+        readersAuthority: policy.readersAuthority || 'merge',
+      })
 
   const addPath = (raw) => {
     const p = (raw || '').trim()
@@ -152,6 +177,7 @@ export default function ReadDenyPolicy() {
         scanFixed: form.scanFixed,
         watchPaths: form.watchPaths,
         failBlock: form.failBlock,
+        readersAuthority: form.readersAuthority,
       }).unwrap()
       setMsg({ kind: 'ok', text: 'Policy saved — endpoints apply it at their next check-in.' })
     } catch (e) {
@@ -191,6 +217,31 @@ export default function ReadDenyPolicy() {
                   disabled={!canWrite}
                 />
                 <p className="mt-2 text-xs text-gray-500">{POSTURES.find((p) => p.v === form.posture)?.hint}</p>
+
+                {form.posture === 'allowlist' && (
+                  <div className="mt-4 pt-4 border-t border-gray-100">
+                    <div className="text-sm font-medium text-gray-900 mb-1">Trusted-applications authority</div>
+                    <p className="text-xs text-gray-500 mb-2 max-w-2xl">
+                      Whether the console Trusted applications list is combined with each endpoint’s local
+                      rules, or replaces them entirely so trust can be revoked centrally.
+                    </p>
+                    <Segmented
+                      value={form.readersAuthority}
+                      options={READER_AUTHORITIES}
+                      onChange={(v) => set({ readersAuthority: v })}
+                      disabled={!canWrite}
+                    />
+                    <p className="mt-2 text-xs text-gray-500">
+                      {READER_AUTHORITIES.find((a) => a.v === form.readersAuthority)?.hint}
+                    </p>
+                    {form.readersAuthority === 'central' && (
+                      <p className="mt-1 text-xs text-amber-700">
+                        In Central mode, make sure this list includes every application that must read
+                        sensitive files (e.g. Office, your PDF reader) — local exceptions no longer apply.
+                      </p>
+                    )}
+                  </div>
+                )}
               </Section>
 
               <Section

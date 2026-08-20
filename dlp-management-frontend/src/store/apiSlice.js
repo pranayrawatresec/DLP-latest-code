@@ -187,7 +187,7 @@ export const apiSlice = createApi({
       providesTags: ['ReadDenyPolicy'],
     }),
     updateReadDenyPolicy: b.mutation({
-      // body: { mode, posture, scanFixed, watchPaths, failBlock }
+      // body: { mode, posture, scanFixed, watchPaths, failBlock, readersAuthority }
       query: (body) => ({ url: '/read-deny-policy', method: 'PUT', body }),
       invalidatesTags: ['ReadDenyPolicy'],
     }),
