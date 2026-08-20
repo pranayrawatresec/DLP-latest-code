@@ -82,8 +82,16 @@ pub fn is_sanctioned(image_path: &str, publisher: Option<&str>, rules: &[ReaderM
 // Pure matching helpers.
 // ---------------------------------------------------------------------------
 
+// Case-insensitive equality with UNICODE case folding (not ASCII-only), so an
+// accented vendor name typed in a different case still matches — e.g. a signer
+// "CAFÉ CORP" and a rule "café corp". `to_lowercase()` is Unicode-aware (folds
+// É→é) and, for pure-ASCII input, is identical to the old ASCII fold — so existing
+// ASCII publisher/name rules behave exactly as before. This also aligns the agent
+// with the server, whose dedup uses Postgres `lower()` (Unicode-aware on UTF-8).
+// (Full case-folding — ß→ss, ligatures — would need a crate; to_lowercase covers
+// the accented-name case without adding a dependency.)
 fn eq_ci(a: &str, b: &str) -> bool {
-    a.trim().eq_ignore_ascii_case(b.trim())
+    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 /// Final path component of `image_path`, splitting on either separator. Empty
@@ -102,7 +110,9 @@ fn base_name(image_path: &str) -> &str {
 /// `…\App` never claims `…\Application`). Both sides are lowercased and have
 /// their separators normalized to `\` before comparison.
 fn path_has_prefix(image_path: &str, prefix: &str) -> bool {
-    let norm = |s: &str| s.trim().replace('/', "\\").to_ascii_lowercase();
+    // Unicode-aware lowercasing (matches eq_ci) so an accented folder name in an
+    // install-path rule folds correctly; identical to the ASCII fold for ASCII paths.
+    let norm = |s: &str| s.trim().replace('/', "\\").to_lowercase();
     let path = norm(image_path);
     let mut pfx = norm(prefix);
     if pfx.is_empty() {
@@ -282,6 +292,28 @@ mod tests {
         // Unsigned / unverifiable => never sanctioned by publisher.
         assert!(!r.matches(r"C:\x\word.exe", None));
         assert!(!r.matches(r"C:\x\word.exe", Some("Evil Publisher")));
+    }
+
+    #[test]
+    fn publisher_matches_accented_name_with_unicode_case_folding() {
+        // A signer whose ACCENTED letter differs in case must still match — ASCII-
+        // only folding (the old behaviour) would miss it.
+        let r = ReaderMatch::Publisher("café corp".into());
+        assert!(r.matches(r"C:\x\app.exe", Some("CAFÉ CORP")));
+        assert!(r.matches(r"C:\x\app.exe", Some("Café Corp")));
+
+        let s = ReaderMatch::Publisher("Société Générale".into());
+        assert!(s.matches(r"C:\x\app.exe", Some("société générale")));
+        // Case-folding, NOT accent-stripping: an accent-free signer is a genuinely
+        // different name and must NOT match (avoids false-positive trust).
+        assert!(!s.matches(r"C:\x\app.exe", Some("societe generale")));
+    }
+
+    #[test]
+    fn path_prefix_folds_accented_folder_names() {
+        let pfx = r"C:\Café\App";
+        assert!(path_has_prefix(r"C:\CAFÉ\APP\bin\x.exe", pfx)); // accented case-insensitive
+        assert!(!path_has_prefix(r"C:\Cafe\App\x.exe", pfx)); // accent-free is different
     }
 
     #[test]
