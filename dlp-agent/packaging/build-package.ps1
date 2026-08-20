@@ -1,4 +1,4 @@
-# Assembles the agent "install package" — the payload a real MSI would carry.
+# Assembles the agent "install package" -- the payload a real MSI would carry.
 # Output: packaging/out/  { dlp-agent.exe, ca-cert.pem, agent.toml (template) }
 #
 # In production this is what the WiX/MSI build produces per customer (their CA
@@ -28,7 +28,25 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 Copy-Item $exe     (Join-Path $out 'dlp-agent.exe') -Force
 Copy-Item $serverCa (Join-Path $out 'ca-cert.pem')  -Force
 
-# agent.toml template — install.ps1 fills TOKEN and SERVER at "install" time.
+# Driver payload for the production endpoint installer (install-endpoint.ps1):
+# the signed minifilter + its INF (+ catalog if present). Optional -- the dev
+# simulation install.ps1 ignores these; a driverless package just skips the
+# kernel step. The .sys is the SEPARATELY-SIGNED release build, not from git.
+$mfRoot = Join-Path $repoRoot 'dlp-minifilter'
+$drvSys = Join-Path $mfRoot 'build\out\dlpflt.sys'
+$drvInf = Join-Path $mfRoot 'dlpflt.inf'
+$drvCat = Join-Path $mfRoot 'build\out\dlpflt.cat'
+if ((Test-Path $drvSys) -and (Test-Path $drvInf)) {
+    Copy-Item $drvSys (Join-Path $out 'dlpflt.sys') -Force
+    Copy-Item $drvInf (Join-Path $out 'dlpflt.inf') -Force
+    if (Test-Path $drvCat) { Copy-Item $drvCat (Join-Path $out 'dlpflt.cat') -Force }
+    Write-Host "Included signed driver payload (dlpflt.sys/.inf)." -ForegroundColor Green
+} else {
+    Write-Host "Driver payload not found under dlp-minifilter\build\out -- package will be agent-only." -ForegroundColor Yellow
+    Write-Host "  Build + sign it first: dlp-minifilter\build\build-driver.bat then tools\sign-driver.ps1" -ForegroundColor Yellow
+}
+
+# agent.toml template -- install.ps1 fills TOKEN and SERVER at "install" time.
 @'
 # Written by the installer on the target PC.
 server_url = "__SERVER__"
