@@ -136,8 +136,9 @@ router.post('/', requirePermission('trusted_readers:write'), async (req, res, ne
     await client.query('select pg_advisory_xact_lock($1)', [AUDIT_CHAIN_LOCK]);
 
     // Case-insensitive dedup: endpoint matching ignores case, so "winword.exe"
-    // and "WINWORD.EXE" are the same rule. Reject up front; the exact UNIQUE
-    // index remains a backstop.
+    // and "WINWORD.EXE" are the same rule. Reject up front with a clean 409; the
+    // DB's functional UNIQUE index (match_type, lower(value)) — migration 011 — is
+    // the hard backstop and surfaces as a 23505 handled below.
     const dup = await client.query(
       `select 1 from trusted_readers where match_type = $1 and lower(value) = lower($2) limit 1`,
       [v.matchType, v.value]

@@ -282,9 +282,9 @@
 
   <article class="finding high">
     <div class="f-head"><span class="f-id">15</span><h3 class="f-title">Duplicate-rule prevention ignores capitalisation</h3><span class="chip chip-high">Important</span><span class="chip chip-fixed">✓ Fixed</span></div>
-    <div class="f-meta"><span class="tag">Server</span><span class="loc">008_trusted_readers.sql:26</span></div>
+    <div class="f-meta"><span class="tag">Server</span><span class="loc">trustedReaders.js (case-insensitive dedup) · migration 011 (CI unique index)</span></div>
     <p class="f-plain"><span class="k">In plain terms —</span> The "no duplicates" guard on the list is case-sensitive, but Windows matching ignores case. So <code>winword.exe</code> and <code>WINWORD.EXE</code> are stored as two separate rules that mean the identical thing — the list fills with confusing near-duplicates and the duplicate-blocker doesn't actually work.</p>
-    <p class="f-fix"><span class="fixk">Fix</span><span>Normalise (lower-case, trim trailing slash) before saving and enforce uniqueness on the normalised value.</span></p>
+    <p class="f-fix"><span class="fixk">Fix</span><span>The route normalises (unify separators, trim trailing slash) and rejects case-insensitive duplicates before insert (<code>lower(value) = lower(...)</code> under the audit chain lock → clean 409). Hardened at the DB too: migration 011 adds a functional <b>UNIQUE index on <code>(match_type, lower(value))</code></b>, so <code>winword.exe</code>/<code>WINWORD.EXE</code> can never coexist even if the app path is bypassed — DB-verified (a direct case-variant insert is rejected with 23505).</span></p>
   </article>
 
   <!-- ============ CONSOLE COVERAGE ============ -->
