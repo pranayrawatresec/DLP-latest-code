@@ -356,8 +356,16 @@ app.get('/agent/trusted-readers', async (req, res, next) => {
     const agent = await requireKnownAgent(req, res, 'agent-readers');
     if (!agent) return;
 
+    // Per-group scoping: deliver GLOBAL readers (group_id NULL) + the agent's own
+    // group's readers. An agent with no explicit group (group_id NULL) is in the
+    // Default group, so its effective group resolves to the Default group's id —
+    // keeping the NULL-means-Default convention consistent with policy delivery.
     const { rows } = await pool.query(
-      `select match_type, value from trusted_readers order by created_at desc, id desc`
+      `select match_type, value from trusted_readers
+        where group_id is null
+           or group_id = coalesce($1, (select id from groups where is_default limit 1))
+        order by created_at desc, id desc`,
+      [agent.group_id ?? null]
     );
     const readers = rows.map((row) => ({ matchType: row.match_type, value: row.value }));
 
@@ -365,6 +373,7 @@ app.get('/agent/trusted-readers', async (req, res, next) => {
     // how large it was is worth the trail (values are metadata, never secrets).
     await audit('agent-readers', 'agent.readers_delivered', agent.id, {
       readerCount: readers.length,
+      groupId: agent.group_id ?? null,
     });
 
     return res.status(200).json({ readers });

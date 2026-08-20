@@ -164,7 +164,11 @@ export const apiSlice = createApi({
     // may read sensitive content locally). Every other process is treated as an
     // untrusted reader and denied the read of sensitive files on endpoints.
     getTrustedReaders: b.query({
-      query: () => '/trusted-readers',
+      // groupId: undefined => all; 'global' => global readers; <n> => that group's.
+      query: (groupId) => ({
+        url: '/trusted-readers',
+        params: groupId !== undefined && groupId !== null && groupId !== '' ? { groupId } : {},
+      }),
       transformResponse: (res) => res?.readers || [],
       providesTags: ['TrustedReader'],
     }),

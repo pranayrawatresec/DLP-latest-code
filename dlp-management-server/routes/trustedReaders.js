@@ -102,18 +102,37 @@ function readerJson(row) {
     matchType: row.match_type,
     value: row.value,
     note: row.note,
+    // group_id NULL = global (applies to every group); a set id = only that group.
+    groupId: row.group_id ?? null,
+    groupName: row.group_name ?? null,
     createdBy: row.created_by,
     createdAt: row.created_at,
   };
 }
 
-// GET /api/trusted-readers - the allowlist, newest first.
+// GET /api/trusted-readers - the allowlist, newest first. Optional ?groupId filter:
+//   absent   => ALL readers (overview, each carrying its group);
+//   'global' => only global (group_id NULL) readers;
+//   <n>      => only that group's readers.
 router.get('/', requirePermission('trusted_readers:read'), async (req, res, next) => {
   try {
+    const scope = req.query.groupId;
+    let where = '';
+    const params = [];
+    if (scope === 'global') {
+      where = 'where tr.group_id is null';
+    } else if (scope !== undefined && /^\d+$/.test(scope)) {
+      where = 'where tr.group_id = $1';
+      params.push(Number(scope));
+    }
     const { rows } = await pool.query(
-      `select id, match_type, value, note, created_by, created_at
-         from trusted_readers
-        order by created_at desc, id desc`
+      `select tr.id, tr.match_type, tr.value, tr.note, tr.group_id, tr.created_by, tr.created_at,
+              g.name as group_name
+         from trusted_readers tr
+         left join groups g on g.id = tr.group_id
+         ${where}
+        order by tr.created_at desc, tr.id desc`,
+      params
     );
     res.json({ readers: rows.map(readerJson) });
   } catch (err) {
@@ -129,19 +148,40 @@ router.post('/', requirePermission('trusted_readers:write'), async (req, res, ne
   if (!v.ok) return res.status(400).json({ error: v.error });
   const note = typeof body.note === 'string' ? body.note.slice(0, 1000) : null;
 
+  // groupId: absent/null/'' => global (NULL). Otherwise a positive integer group
+  // (validated to exist below). Global rules apply to every group; a scoped rule
+  // applies only to that group.
+  let groupId = null;
+  if (body.groupId !== undefined && body.groupId !== null && body.groupId !== '') {
+    groupId = Number(body.groupId);
+    if (!Number.isInteger(groupId) || groupId <= 0) {
+      return res.status(400).json({ error: 'groupId must be a positive integer or null (global)' });
+    }
+  }
+
   const client = await pool.connect();
   try {
     await client.query('begin');
     // One transaction holding the chain lock: dedup + insert + audit are atomic.
     await client.query('select pg_advisory_xact_lock($1)', [AUDIT_CHAIN_LOCK]);
 
-    // Case-insensitive dedup: endpoint matching ignores case, so "winword.exe"
-    // and "WINWORD.EXE" are the same rule. Reject up front with a clean 409; the
-    // DB's functional UNIQUE index (match_type, lower(value)) — migration 011 — is
-    // the hard backstop and surfaces as a 23505 handled below.
+    if (groupId !== null) {
+      const g = await client.query('select 1 from groups where id = $1', [groupId]);
+      if (g.rows.length === 0) {
+        await client.query('rollback');
+        return res.status(400).json({ error: 'unknown group' });
+      }
+    }
+
+    // Case-insensitive dedup, SCOPED to the same group bucket (global rows bucket
+    // together via coalesce(group_id,0)), so "winword.exe" and "WINWORD.EXE" collide
+    // within a scope but a global + a per-group copy may coexist. The DB's functional
+    // UNIQUE index (migration 013) is the hard backstop (23505 below).
     const dup = await client.query(
-      `select 1 from trusted_readers where match_type = $1 and lower(value) = lower($2) limit 1`,
-      [v.matchType, v.value]
+      `select 1 from trusted_readers
+        where coalesce(group_id,0) = coalesce($1,0) and match_type = $2 and lower(value) = lower($3)
+        limit 1`,
+      [groupId, v.matchType, v.value]
     );
     if (dup.rows.length) {
       await client.query('rollback');
@@ -151,10 +191,10 @@ router.post('/', requirePermission('trusted_readers:write'), async (req, res, ne
     let rows;
     try {
       ({ rows } = await client.query(
-        `insert into trusted_readers (match_type, value, note, created_by)
-         values ($1, $2, $3, $4)
-         returning id, match_type, value, note, created_by, created_at`,
-        [v.matchType, v.value, note, req.user.email]
+        `insert into trusted_readers (match_type, value, note, group_id, created_by)
+         values ($1, $2, $3, $4, $5)
+         returning id, match_type, value, note, group_id, created_by, created_at`,
+        [v.matchType, v.value, note, groupId, req.user.email]
       ));
     } catch (err) {
       if (err && err.code === '23505') {
@@ -168,6 +208,7 @@ router.post('/', requirePermission('trusted_readers:write'), async (req, res, ne
     await writeChainEntry(client, req.user.email, 'trusted_reader.create', String(reader.id), {
       matchType: reader.matchType,
       value: reader.value,
+      groupId,
     });
     await client.query('commit');
     res.status(201).json({ reader });

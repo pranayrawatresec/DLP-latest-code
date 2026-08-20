@@ -141,6 +141,7 @@ async function enrollAgent(hostname) {
 }
 
 async function cleanup(emails) {
+  await pool.query(`delete from trusted_readers where value like $1 or note like $1`, [`${TAG}%`]);
   await pool.query(`delete from groups where name like $1`, [`${TAG}%`]);
   await pool.query(`delete from agents where hostname like $1`, [`${TAG}%`]);
   await pool.query(`delete from enrollment_tokens where created_by = $1`, [TAG]);
@@ -278,6 +279,28 @@ async function main() {
       `unassigned agent LEAKED the group policy: ${JSON.stringify(u.body.policy)}`);
     return 'per-group delivery correct; unassigned isolated from the group override';
   });
+
+  await check('G09b', 'per-group readers: global reaches all, group-scoped only its group', async () => {
+    const globalName = `${TAG}_glob.exe`
+    const g = await api('/api/trusted-readers', {
+      cookie: authorCookie, method: 'POST', body: { matchType: 'name', value: globalName },
+    })
+    assert(g.status === 201, `global reader create: ${g.status}`)
+    const pilotName = `${TAG}_pilotonly.exe`
+    const p = await api('/api/trusted-readers', {
+      cookie: authorCookie, method: 'POST', body: { matchType: 'name', value: pilotName, groupId: pilotId },
+    })
+    assert(p.status === 201, `pilot reader create: ${p.status}`)
+
+    const av = (await request({ pathname: '/agent/trusted-readers', method: 'GET', ...assigned.tls })).body.readers.map((r) => r.value)
+    const uv = (await request({ pathname: '/agent/trusted-readers', method: 'GET', ...unassigned.tls })).body.readers.map((r) => r.value)
+
+    assert(av.includes(globalName), 'assigned agent missing the GLOBAL reader')
+    assert(uv.includes(globalName), 'unassigned agent missing the GLOBAL reader')
+    assert(av.includes(pilotName), 'assigned agent missing its group-scoped reader')
+    assert(!uv.includes(pilotName), 'unassigned agent LEAKED the pilot-only reader')
+    return 'global delivered to both; group reader only to the assigned agent'
+  })
 
   await check('G10', 'reset override -> group inherits Default; assigned agent follows', async () => {
     const del = await api(`/api/read-deny-policy/group/${pilotId}`, { cookie: authorCookie, method: 'DELETE' });

@@ -4,6 +4,7 @@ import {
   useGetTrustedReadersQuery,
   useCreateTrustedReaderMutation,
   useDeleteTrustedReaderMutation,
+  useGetGroupsQuery,
 } from '../store/apiSlice'
 import { selectHasPermission } from '../store/authSlice'
 import {
@@ -54,7 +55,7 @@ function typeBadge(t) {
 
 // --- add-application modal --------------------------------------------------
 
-function AddReaderModal({ onClose }) {
+function AddReaderModal({ groupId, groupLabel, onClose }) {
   const [createReader, { isLoading: saving }] = useCreateTrustedReaderMutation()
 
   const [matchType, setMatchType] = useState('publisher')
@@ -71,6 +72,7 @@ function AddReaderModal({ onClose }) {
         matchType,
         value: value.trim(),
         note: note.trim() || undefined,
+        groupId: groupId ?? null,
       }).unwrap()
       onClose()
     } catch (e) {
@@ -116,6 +118,10 @@ function AddReaderModal({ onClose }) {
         </div>
       )}
 
+      <div className="mb-4 text-xs text-gray-500">
+        Adding to <span className="font-medium text-gray-700">{groupLabel}</span>
+      </div>
+
       <Field label="Identify the application by">
         <div className="inline-flex gap-1 rounded-lg bg-gray-100 p-1">
           {typeBtn('publisher', 'Publisher')}
@@ -150,12 +156,21 @@ function AddReaderModal({ onClose }) {
 
 export default function TrustedReaders() {
   const canWrite = useSelector(selectHasPermission('trusted_readers:write'))
-  const { data: readers = [], isLoading, isError } = useGetTrustedReadersQuery()
+  // Scope: 'global' (applies to every group) or a group id (only that group).
+  const [scope, setScope] = useState('global')
+  const { data: groups = [] } = useGetGroupsQuery()
+  const { data: readers = [], isLoading, isError } = useGetTrustedReadersQuery(scope)
   const [deleteReader, { isLoading: deleting }] = useDeleteTrustedReaderMutation()
 
   const [showAdd, setShowAdd] = useState(false)
   const [removing, setRemoving] = useState(null)
   const [deleteErr, setDeleteErr] = useState('')
+
+  const scopeGroupId = scope === 'global' ? null : Number(scope)
+  const scopeLabel =
+    scope === 'global'
+      ? 'Global — every group'
+      : groups.find((g) => g.id === scopeGroupId)?.name || 'this group'
 
   async function confirmDelete() {
     setDeleteErr('')
@@ -180,6 +195,33 @@ export default function TrustedReaders() {
           )
         }
       />
+
+      {/* Scope: global applications (trusted everywhere) vs a specific group. */}
+      <Card className="mb-4">
+        <div className="flex flex-wrap items-center gap-3 px-6 py-4">
+          <label className="text-sm font-medium text-gray-900" htmlFor="tr-scope">
+            Applies to
+          </label>
+          <Select
+            id="tr-scope"
+            value={scope}
+            onChange={(e) => setScope(e.target.value)}
+            className="w-56"
+          >
+            <option value="global">Global — every group</option>
+            {groups.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.isDefault ? `${g.name} group only` : `${g.name} only`}
+              </option>
+            ))}
+          </Select>
+          <span className="text-xs text-gray-500">
+            {scope === 'global'
+              ? 'These apps are trusted on every endpoint.'
+              : 'Only endpoints in this group also trust these apps (in addition to the global list).'}
+          </span>
+        </div>
+      </Card>
 
       <Card>
         {isLoading ? (
@@ -255,7 +297,13 @@ export default function TrustedReaders() {
         )}
       </Card>
 
-      {showAdd && <AddReaderModal onClose={() => setShowAdd(false)} />}
+      {showAdd && (
+        <AddReaderModal
+          groupId={scopeGroupId}
+          groupLabel={scopeLabel}
+          onClose={() => setShowAdd(false)}
+        />
+      )}
 
       {removing && (
         <Modal
