@@ -221,6 +221,17 @@ async function main() {
     return 'unique name enforced';
   });
 
+  await check('G05b', 'DB rejects over-length group name (length check lives in DB)', async () => {
+    let code = null;
+    try {
+      await pool.query(`insert into groups (name, created_by) values ($1, 'test')`, [`${TAG}_${'z'.repeat(70)}`]);
+    } catch (e) {
+      code = e.code;
+    }
+    assert(code === '23514', `over-length name: expected 23514, got ${code}`);
+    return 'DB rejects over-length group name (23514)';
+  });
+
   await check('G06', 'new group lists with 0 machines and no override', async () => {
     const res = await api('/api/groups', { cookie: authorCookie });
     const g = (await res.json()).groups.find((x) => x.id === pilotId);

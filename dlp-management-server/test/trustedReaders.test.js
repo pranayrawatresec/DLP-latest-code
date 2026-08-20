@@ -280,6 +280,31 @@ async function main() {
     return 'DB rejects the case-variant (23505)';
   });
 
+  await check('R07d', 'DB rejects over-length value + note (length checks live in DB)', async () => {
+    // Bypass the route: prove migration 014's CHECK constraints bound the columns
+    // regardless of the write path (defense-in-depth).
+    let vcode = null;
+    try {
+      await pool.query(
+        `insert into trusted_readers (match_type, value, created_by) values ('name', $1, 'test')`,
+        ['a'.repeat(600)]);
+    } catch (e) {
+      vcode = e.code;
+    }
+    assert(vcode === '23514', `over-length value: expected 23514, got ${vcode}`);
+
+    let ncode = null;
+    try {
+      await pool.query(
+        `insert into trusted_readers (match_type, value, note, created_by) values ('name', $1, $2, 'test')`,
+        [`${TAG}_lnote.exe`, 'x'.repeat(1100)]);
+    } catch (e) {
+      ncode = e.code;
+    }
+    assert(ncode === '23514', `over-length note: expected 23514, got ${ncode}`);
+    return 'DB rejects over-length value and note (23514)';
+  });
+
   await check('R08', 'GET includes the new reader', async () => {
     const res = await api('/api/trusted-readers', { cookie: auditorCookie });
     const found = (await res.json()).readers.find((r) => r.id === readerId);
