@@ -28,6 +28,7 @@ const { audit } = require('../lib/audit');
 const { signCertificateRequest, loadCaCertificatePem, canonicalSerial } = require('../lib/ca');
 const { redeemToken } = require('../lib/enrollmentTokens');
 const { latestBundle, latestBundleVersion, INDEX_DIR } = require('../lib/indexBundle');
+const { effectivePolicyForGroup } = require('../lib/groupPolicy');
 
 const CHECKIN_INTERVAL_SECONDS = Number(process.env.CHECKIN_INTERVAL_SECONDS || 300);
 
@@ -217,9 +218,10 @@ app.post('/agent/checkin', async (req, res, next) => {
 async function requireKnownAgent(req, res, actor) {
   const peer = req.socket.getPeerCertificate();
   const serial = canonicalSerial(peer.serialNumber || '');
-  const { rows } = await pool.query('select id, status from agents where cert_serial = $1', [
-    serial,
-  ]);
+  const { rows } = await pool.query(
+    'select id, status, group_id from agents where cert_serial = $1',
+    [serial]
+  );
   const agent = rows[0];
   if (!agent) {
     await audit(actor, 'agent.refused_unknown', serial);
@@ -381,15 +383,10 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
     const agent = await requireKnownAgent(req, res, 'agent-policy');
     if (!agent) return;
 
-    const { rows } = await pool.query('select * from read_deny_policy where id = 1');
-    const p = rows[0] || {
-      mode: 'off',
-      posture: 'blocklist',
-      scan_fixed: false,
-      watch_paths: [],
-      fail_block: false,
-      readers_authority: 'merge',
-    };
+    // Per-group targeting: resolve the effective policy for this agent's group
+    // (group_id NULL => Default). A group with no override inherits the Default
+    // (read_deny_policy id=1) — so unassigned agents get exactly today's policy.
+    const p = await effectivePolicyForGroup(agent.group_id);
     const policy = {
       mode: p.mode,
       posture: p.posture,
@@ -405,6 +402,7 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
       mode: policy.mode,
       posture: policy.posture,
       scanFixed: policy.scanFixed,
+      groupId: agent.group_id ?? null,
     });
 
     return res.status(200).json({ policy });

@@ -20,6 +20,7 @@
     "test:bundle": "node test/bundle.test.js",
     "test:encryption": "node test/encryption.test.js",
     "test:readers": "node test/trustedReaders.test.js",
+    "test:groups": "node test/groups.test.js",
     "e2e:detection": "node scripts/detection-e2e.js"
   },
   "dependencies": {

@@ -16,6 +16,7 @@ var incidentsRouter = require('./routes/incidents');
 var encryptionRouter = require('./routes/encryption');
 var trustedReadersRouter = require('./routes/trustedReaders');
 var readDenyPolicyRouter = require('./routes/readDenyPolicy');
+var groupsRouter = require('./routes/groups');
 var { attachUser } = require('./middleware/auth');
 
 var app = express();
@@ -40,6 +41,7 @@ app.use('/api/users', usersRouter);
 app.use('/api/sessions', sessionsRouter);
 app.use('/api/enrollment-tokens', enrollmentTokensRouter);
 app.use('/api/agents', agentsRouter);
+app.use('/api/groups', groupsRouter);
 app.use('/api/audit', auditRouter);
 app.use('/api/protected', protectedRouter);
 app.use('/api/incidents', incidentsRouter);

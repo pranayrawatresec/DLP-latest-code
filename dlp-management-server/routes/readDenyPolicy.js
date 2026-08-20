@@ -164,4 +164,137 @@ router.put('/', requirePermission('read_deny_policy:write'), async (req, res, ne
   }
 });
 
+// --- Per-group policy (per-machine/per-group targeting) ---------------------
+// The Default group's policy IS the global read_deny_policy (id=1): editing the
+// Default group here writes id=1, exactly like PUT /. A non-default group keeps its
+// own OVERRIDE in group_read_deny_policy; with none it INHERITS the Default.
+
+function parseGroupId(raw) {
+  return /^\d+$/.test(raw) ? Number(raw) : NaN;
+}
+
+// GET /api/read-deny-policy/group/:groupId — the group's effective policy, plus
+// whether it is the group's own override or inherited from Default.
+router.get('/group/:groupId', requirePermission('read_deny_policy:read'), async (req, res, next) => {
+  const groupId = parseGroupId(req.params.groupId);
+  if (!Number.isInteger(groupId) || groupId <= 0) return res.status(404).json({ error: 'group not found' });
+  try {
+    const g = await pool.query('select id, name, is_default from groups where id = $1', [groupId]);
+    if (g.rows.length === 0) return res.status(404).json({ error: 'group not found' });
+    const group = { id: g.rows[0].id, name: g.rows[0].name, isDefault: g.rows[0].is_default };
+
+    if (group.isDefault) {
+      const { rows } = await pool.query('select * from read_deny_policy where id = 1');
+      return res.json({ policy: policyJson(rows[0]), group, inheritsDefault: false, hasOverride: true });
+    }
+    const o = await pool.query('select * from group_read_deny_policy where group_id = $1', [groupId]);
+    if (o.rows.length) {
+      return res.json({ policy: policyJson(o.rows[0]), group, inheritsDefault: false, hasOverride: true });
+    }
+    // No override => show the inherited Default policy (read-only until customised).
+    const d = await pool.query('select * from read_deny_policy where id = 1');
+    return res.json({ policy: policyJson(d.rows[0]), group, inheritsDefault: true, hasOverride: false });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/read-deny-policy/group/:groupId — set the group's policy. Default group
+// writes the global id=1; a non-default group upserts its own override.
+router.put('/group/:groupId', requirePermission('read_deny_policy:write'), async (req, res, next) => {
+  const groupId = parseGroupId(req.params.groupId);
+  if (!Number.isInteger(groupId) || groupId <= 0) return res.status(404).json({ error: 'group not found' });
+  const v = validatePolicy(req.body || {});
+  if (!v.ok) return res.status(400).json({ error: v.error });
+
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query('select pg_advisory_xact_lock($1)', [AUDIT_CHAIN_LOCK]);
+    const g = await client.query('select id, is_default from groups where id = $1', [groupId]);
+    if (g.rows.length === 0) {
+      await client.query('rollback');
+      return res.status(404).json({ error: 'group not found' });
+    }
+    let rows;
+    if (g.rows[0].is_default) {
+      ({ rows } = await client.query(
+        `update read_deny_policy
+            set mode=$1, posture=$2, scan_fixed=$3, watch_paths=$4, fail_block=$5,
+                readers_authority=$6, updated_by=$7, updated_at=now()
+          where id = 1
+        returning *`,
+        [v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, v.readersAuthority, req.user.email]
+      ));
+      await writeChainEntry(client, req.user.email, 'read_deny_policy.update', 'read-deny', {
+        group: 'default',
+        mode: v.mode, posture: v.posture, scanFixed: v.scanFixed,
+        watchPaths: v.watchPaths, failBlock: v.failBlock, readersAuthority: v.readersAuthority,
+      });
+    } else {
+      ({ rows } = await client.query(
+        `insert into group_read_deny_policy
+           (group_id, mode, posture, scan_fixed, watch_paths, fail_block, readers_authority, updated_by, updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8, now())
+         on conflict (group_id) do update set
+           mode=excluded.mode, posture=excluded.posture, scan_fixed=excluded.scan_fixed,
+           watch_paths=excluded.watch_paths, fail_block=excluded.fail_block,
+           readers_authority=excluded.readers_authority, updated_by=excluded.updated_by,
+           updated_at=now()
+         returning *`,
+        [groupId, v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, v.readersAuthority, req.user.email]
+      ));
+      await writeChainEntry(client, req.user.email, 'read_deny_policy.group_update', String(groupId), {
+        mode: v.mode, posture: v.posture, scanFixed: v.scanFixed,
+        watchPaths: v.watchPaths, failBlock: v.failBlock, readersAuthority: v.readersAuthority,
+      });
+    }
+    await client.query('commit');
+    res.json({ policy: policyJson(rows[0]) });
+  } catch (err) {
+    try {
+      await client.query('rollback');
+    } catch (_) {
+      /* already unwound */
+    }
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/read-deny-policy/group/:groupId — drop a group's override so it
+// INHERITS the Default again. The Default group has no override to drop.
+router.delete('/group/:groupId', requirePermission('read_deny_policy:write'), async (req, res, next) => {
+  const groupId = parseGroupId(req.params.groupId);
+  if (!Number.isInteger(groupId) || groupId <= 0) return res.status(404).json({ error: 'group not found' });
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    await client.query('select pg_advisory_xact_lock($1)', [AUDIT_CHAIN_LOCK]);
+    const g = await client.query('select is_default from groups where id = $1', [groupId]);
+    if (g.rows.length === 0) {
+      await client.query('rollback');
+      return res.status(404).json({ error: 'group not found' });
+    }
+    if (g.rows[0].is_default) {
+      await client.query('rollback');
+      return res.status(400).json({ error: 'the Default group has no override to reset' });
+    }
+    await client.query('delete from group_read_deny_policy where group_id = $1', [groupId]);
+    await writeChainEntry(client, req.user.email, 'read_deny_policy.group_reset', String(groupId), {});
+    await client.query('commit');
+    res.status(204).end();
+  } catch (err) {
+    try {
+      await client.query('rollback');
+    } catch (_) {
+      /* already unwound */
+    }
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
