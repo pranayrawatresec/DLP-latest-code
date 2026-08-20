@@ -894,13 +894,24 @@ where
     // port). This is a heap allocation, NEVER the stack — 4 MiB would overflow a
     // thread stack. Backed by a `Vec<u64>` so the start is 8-aligned, which the
     // 8-byte-aligned `FILTER_MESSAGE_HEADER`/`DlpScanRequest` require. Allocated
-    // once and reused across iterations (we only read `content_length` bytes, so
-    // stale tail bytes are never observed).
+    // once and reused across iterations. We trust the driver's `content_length`
+    // (it is our own signed kernel component) but do NOT let a hypothetical driver
+    // bug leak a PREVIOUS message's bytes: before each receive we zero the content
+    // region up to the high-water mark of content ever placed, so if a message ever
+    // reported more content than it actually delivered, the unfilled tail reads as
+    // zeros — never another file's stale bytes (defense-in-depth; audit item
+    // "reported content size trusted blindly"). Bytes above the high-water mark are
+    // still the Vec's pristine zeros, so this is fully correct at bounded cost.
     let header_size = size_of::<FILTER_MESSAGE_HEADER>();
     let req_size = size_of::<DlpScanRequest>();
     let total_size = header_size + req_size + DLP_MAX_CONTENT;
     let mut backing: Vec<u64> = vec![0u64; total_size.div_ceil(8)];
     let buf_ptr = backing.as_mut_ptr() as *mut u8;
+    let content_start = header_size + req_size;
+    // High-water mark: the most content bytes any prior message placed in the
+    // buffer. Only this prefix can hold stale data; everything past it is untouched
+    // (zero). Zeroing just [0, content_hw) before each receive is enough.
+    let mut content_hw: usize = 0;
 
     // Read-deny mode (once, like the driver reads its knob at load). In MONITOR the
     // driver classifies + reports but ALLOWS, so a read incident is a WOULD-block,
@@ -922,6 +933,14 @@ where
                 tracing::info!("kguard stop signalled — ending message loop");
                 return Ok(());
             }
+        }
+
+        // Clear any content a PRIOR message left in the buffer before receiving the
+        // next one, so an under-delivered message can never expose stale bytes (see
+        // the buffer comment above). SAFETY: [content_start, content_start+content_hw)
+        // is within the `total_size`-byte allocation (content_hw <= DLP_MAX_CONTENT).
+        if content_hw > 0 {
+            unsafe { std::ptr::write_bytes(buf_ptr.add(content_start), 0, content_hw) };
         }
 
         let recv = unsafe {
@@ -975,8 +994,10 @@ where
             // bounded to the 4 MiB cap. SAFETY: content occupies
             // [header_size + req_size, +content_len) inside the allocation.
             let content_len = (req.content_length as usize).min(DLP_MAX_CONTENT);
+            // Advance the high-water mark so the next receive clears this region.
+            content_hw = content_hw.max(content_len);
             let content: &[u8] = unsafe {
-                std::slice::from_raw_parts(buf_ptr.add(header_size + req_size), content_len)
+                std::slice::from_raw_parts(buf_ptr.add(content_start), content_len)
             };
             let truncated = req.truncated != 0;
             // Score the in-memory content (NO file re-open), or fall back to the
