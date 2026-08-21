@@ -1,0 +1,24 @@
+-- 016_admin_users_pw_hash.sql — restore the admin_users.pw_hash column the auth
+-- and bootstrap code require but the current 001_init.sql never creates.
+--
+-- WHY: bootstrap-admin.js, routes/auth.js and routes/users.js all read/write
+-- admin_users.pw_hash (the bcrypt password hash), but 001_init.sql (as it now
+-- stands) defines admin_users WITHOUT it. A FRESH `npm run migrate` therefore
+-- produces an admin_users with no pw_hash, and the very first standup step,
+-- `npm run bootstrap-admin`, dies with:
+--     column "pw_hash" of relation "admin_users" does not exist
+-- which blocks the entire deployment — no first sysadmin means no console login
+-- and nothing can be configured. (Existing dev DBs only work because they were
+-- built from an older 001 that included the column; 001 was later edited and the
+-- column orphaned, with no follow-up migration to add it back.)
+--
+-- FIX SHAPE: additive + idempotent. `IF NOT EXISTS` makes this a no-op on any DB
+-- that already has the column (dev DBs from the older 001), so it is safe to run
+-- everywhere. admin_users is guaranteed empty before the first bootstrap (every
+-- insert path supplies pw_hash, so a row without it cannot exist), so adding the
+-- column NOT NULL succeeds with no default. We do NOT edit the already-applied
+-- 001 — migrations are append-only and 001 will not re-run on existing DBs.
+--
+-- Applied inside a transaction by db/migrate.js — no BEGIN/COMMIT here.
+
+ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS pw_hash text NOT NULL;
