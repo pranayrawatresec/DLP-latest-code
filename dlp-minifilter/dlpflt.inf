@@ -13,7 +13,7 @@
 [Version]
 Signature   = "$Windows NT$"
 Class       = "ContentScreener"
-ClassGuid   = {3e3f0674-c83c-4d4b-8515-54043dcb26a3}
+ClassGuid   = {3e3f0674-c83c-4558-bb26-9820e1eba5c5}
 Provider    = %ProviderName%
 DriverVer = 08/25/2026,1.0.0.0
 CatalogFile = dlpflt.cat

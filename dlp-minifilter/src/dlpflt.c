@@ -1016,37 +1016,41 @@ DlpInspectStream(_Inout_ PFLT_CALLBACK_DATA Data,
     (VOID)DlpReadStreamContent(FltObjects->Instance, FltObjects->FileObject,
                                &content, &contentBytes, &truncated);
 
-    /* Item 10: known-bad content-hash fast path. When we shipped content, hash
-     * the EXACT bytes and consult the bounded, epoch-stamped known-bad table.
-     *   * hit  -> block in-kernel with NO up-call (a repeat copy of content the
-     *            agent already blocked is stopped without waking user-mode);
-     *   * miss -> the normal up-call, and a GENUINE agent BLOCK reply (status
-     *            success, not a fail-secure default) seeds the table so the next
-     *            copy takes the fast path.
-     * The raw-content SHA is unrelated to the service's fingerprint math -- it
-     * only fingerprints the shipped bytes for exact-repeat suppression. */
-    if (contentBytes > 0 && content != NULL) {
-        UCHAR sha[DLP_SHA256_LEN];
-
-        DlpComputeSha256((const UCHAR *)content, contentBytes, sha);
-
-        if (DlpBadHashLookup(sha)) {
-            block = TRUE;   /* known-bad, current epoch -> block, no up-call */
-        } else {
-            NTSTATUS verdictStatus =
-                DlpQueryVerdict(&nameInfo->Name, fileId, pid,
-                                content, contentBytes, truncated,
-                                DLP_REASON_WRITE, &block);
-            if (NT_SUCCESS(verdictStatus) && block) {
-                DlpBadHashInsert(sha);   /* seed the fast path */
-            }
+    /* Destination-aware write decision (bulletproof design, Phase 1).
+     *
+     * The block-vs-SEAL choice for a removable/network (exfil) destination depends
+     * on WHICH device is being written to -- a whitelisted "encrypt" stick seals the
+     * file to a .dlpenc envelope; any other device blocks it -- a fact the raw
+     * content hash does NOT capture. So the write decision must ALWAYS come from the
+     * destination-aware guard and must NEVER be short-circuited by the content-hash
+     * ring. (Deciding a write from the content ring is exactly the bug that made a
+     * file blocked once keep being quarantined after its destination was later
+     * whitelisted -- silently discarding it instead of sealing it, with no up-call,
+     * no seal, no incident.)
+     *
+     * The known-bad ring is still SEEDED on a genuine block, because it accelerates
+     * the READ-deny path (DlpPreRead), whose decision IS content-only and
+     * destination-independent -- but it is never CONSULTED to decide a write.
+     *
+     * Fail-secure invariant: if the guard cannot return a genuine verdict (down,
+     * timeout, or no connected client), a write to an exfil destination is BLOCKED
+     * unconditionally -- NOT governed by FailMode. Sensitive data must never leave
+     * on doubt; trust for a removable write is only ever an explicit guard verdict. */
+    {
+        NTSTATUS verdictStatus =
+            DlpQueryVerdict(&nameInfo->Name, fileId, pid,
+                            content, contentBytes, truncated,
+                            DLP_REASON_WRITE, &block);
+        /* ONLY an exact STATUS_SUCCESS is a genuine verdict. STATUS_TIMEOUT and
+         * other IPC failures are NT_SUCCESS-*severity* but mean "no verdict" -- so
+         * NT_SUCCESS() would wrongly accept them. Match the read-deny discipline. */
+        if (verdictStatus != STATUS_SUCCESS) {
+            block = TRUE;   /* no genuine verdict (incl. timeout) -> fail-secure block */
+        } else if (block && contentBytes > 0 && content != NULL) {
+            UCHAR sha[DLP_SHA256_LEN];
+            DlpComputeSha256((const UCHAR *)content, contentBytes, sha);
+            DlpBadHashInsert(sha);   /* seed the READ-deny fast path only */
         }
-    } else {
-        /* Empty file or a failed read: path-only query. On any failure
-         * DlpQueryVerdict sets `block` from FailMode. */
-        (VOID)DlpQueryVerdict(&nameInfo->Name, fileId, pid,
-                              content, contentBytes, truncated,
-                              DLP_REASON_WRITE, &block);
     }
 
     if (content != NULL) {
