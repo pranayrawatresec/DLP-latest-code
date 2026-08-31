@@ -34,6 +34,11 @@ pub struct ReadDenyPolicy {
     /// (#9). An old/partial server response defaults to the back-compat `merge`.
     #[serde(default = "default_authority", rename = "readersAuthority")]
     pub readers_authority: String,
+    /// Deny ALL sensitive reads by any process running in an RDP (WTS remote)
+    /// session — strict / token model, overriding the app allowlist. Off by
+    /// default; an old/partial server response (field absent) is `false`.
+    #[serde(default, rename = "denyRemoteSessions")]
+    pub deny_remote_sessions: bool,
 }
 
 fn default_mode() -> String {
@@ -55,6 +60,7 @@ impl Default for ReadDenyPolicy {
             watch_paths: Vec::new(),
             fail_block: false,
             readers_authority: "merge".into(),
+            deny_remote_sessions: false,
         }
     }
 }
@@ -104,6 +110,10 @@ impl Config {
         // being read as "unconfigured" (#9). Must be set alongside the readers merge
         // in `with_synced_readers(_, p.readers_central())`.
         merged.kguard.readers_central = p.readers_central();
+        // RDP session-aware read-deny: when on, the exfil pusher unions every
+        // process in an RDP session into the untrusted set (strict / token model),
+        // so their sensitive reads are denied and any copy-out fails at the source.
+        merged.kguard.deny_remote_sessions = p.deny_remote_sessions;
         merged
     }
 }
@@ -274,5 +284,22 @@ mod tests {
 
         // The Default is merge.
         assert!(!ReadDenyPolicy::default().readers_central());
+    }
+
+    #[test]
+    fn deny_remote_sessions_defaults_off_and_parses() {
+        // Absent (old server) → off, so the feature can never silently turn on.
+        let absent: ReadDenyPolicy =
+            serde_json::from_str(r#"{"mode":"enforce","posture":"allowlist"}"#).unwrap();
+        assert!(!absent.deny_remote_sessions);
+        assert!(!ReadDenyPolicy::default().deny_remote_sessions);
+
+        // Explicit true/false parse from the camelCase wire field.
+        let on: ReadDenyPolicy =
+            serde_json::from_str(r#"{"denyRemoteSessions":true}"#).unwrap();
+        assert!(on.deny_remote_sessions);
+        let off: ReadDenyPolicy =
+            serde_json::from_str(r#"{"denyRemoteSessions":false}"#).unwrap();
+        assert!(!off.deny_remote_sessions);
     }
 }

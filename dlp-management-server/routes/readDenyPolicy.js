@@ -30,6 +30,9 @@ function policyJson(row) {
     // Whether the console list is the WHOLE reader allowlist ('central') or is
     // unioned with each endpoint's local rules ('merge', default). #9.
     readersAuthority: row.readers_authority,
+    // Deny ALL sensitive reads by any process in an RDP (WTS remote) session
+    // (strict / token model) — off by default. See migration 017.
+    denyRemoteSessions: row.deny_remote_sessions ?? false,
     updatedBy: row.updated_by,
     updatedAt: row.updated_at,
   };
@@ -73,6 +76,17 @@ function validatePolicy(body) {
     }
   }
 
+  // Deny sensitive access in remote (RDP) sessions (#RDP). Optional for
+  // back-compat: an older client that omits it keeps the default (off). Only an
+  // explicit `true` turns it on — it can never silently flip on.
+  let denyRemoteSessions = false;
+  if (body.denyRemoteSessions !== undefined) {
+    if (typeof body.denyRemoteSessions !== 'boolean') {
+      return { ok: false, error: 'denyRemoteSessions must be true or false' };
+    }
+    denyRemoteSessions = body.denyRemoteSessions;
+  }
+
   const wp = body.watchPaths;
   if (!Array.isArray(wp) || wp.length > 16) {
     return { ok: false, error: 'watchPaths must be an array of at most 16 folder prefixes' };
@@ -103,6 +117,7 @@ function validatePolicy(body) {
     watchPaths,
     failBlock: body.failBlock,
     readersAuthority,
+    denyRemoteSessions,
   };
 }
 
@@ -129,7 +144,7 @@ router.put('/', requirePermission('read_deny_policy:write'), async (req, res, ne
     const { rows } = await client.query(
       `update read_deny_policy
           set mode=$1, posture=$2, scan_fixed=$3, watch_paths=$4, fail_block=$5,
-              readers_authority=$6, updated_by=$7, updated_at=now()
+              readers_authority=$6, deny_remote_sessions=$7, updated_by=$8, updated_at=now()
         where id = 1
       returning *`,
       [
@@ -139,6 +154,7 @@ router.put('/', requirePermission('read_deny_policy:write'), async (req, res, ne
         JSON.stringify(v.watchPaths),
         v.failBlock,
         v.readersAuthority,
+        v.denyRemoteSessions,
         req.user.email,
       ]
     );
@@ -149,6 +165,7 @@ router.put('/', requirePermission('read_deny_policy:write'), async (req, res, ne
       watchPaths: v.watchPaths,
       failBlock: v.failBlock,
       readersAuthority: v.readersAuthority,
+      denyRemoteSessions: v.denyRemoteSessions,
     });
     await client.query('commit');
     res.json({ policy: policyJson(rows[0]) });
@@ -221,32 +238,35 @@ router.put('/group/:groupId', requirePermission('read_deny_policy:write'), async
       ({ rows } = await client.query(
         `update read_deny_policy
             set mode=$1, posture=$2, scan_fixed=$3, watch_paths=$4, fail_block=$5,
-                readers_authority=$6, updated_by=$7, updated_at=now()
+                readers_authority=$6, deny_remote_sessions=$7, updated_by=$8, updated_at=now()
           where id = 1
         returning *`,
-        [v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, v.readersAuthority, req.user.email]
+        [v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, v.readersAuthority, v.denyRemoteSessions, req.user.email]
       ));
       await writeChainEntry(client, req.user.email, 'read_deny_policy.update', 'read-deny', {
         group: 'default',
         mode: v.mode, posture: v.posture, scanFixed: v.scanFixed,
         watchPaths: v.watchPaths, failBlock: v.failBlock, readersAuthority: v.readersAuthority,
+        denyRemoteSessions: v.denyRemoteSessions,
       });
     } else {
       ({ rows } = await client.query(
         `insert into group_read_deny_policy
-           (group_id, mode, posture, scan_fixed, watch_paths, fail_block, readers_authority, updated_by, updated_at)
-         values ($1,$2,$3,$4,$5,$6,$7,$8, now())
+           (group_id, mode, posture, scan_fixed, watch_paths, fail_block, readers_authority, deny_remote_sessions, updated_by, updated_at)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
          on conflict (group_id) do update set
            mode=excluded.mode, posture=excluded.posture, scan_fixed=excluded.scan_fixed,
            watch_paths=excluded.watch_paths, fail_block=excluded.fail_block,
-           readers_authority=excluded.readers_authority, updated_by=excluded.updated_by,
+           readers_authority=excluded.readers_authority,
+           deny_remote_sessions=excluded.deny_remote_sessions, updated_by=excluded.updated_by,
            updated_at=now()
          returning *`,
-        [groupId, v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, v.readersAuthority, req.user.email]
+        [groupId, v.mode, v.posture, v.scanFixed, JSON.stringify(v.watchPaths), v.failBlock, v.readersAuthority, v.denyRemoteSessions, req.user.email]
       ));
       await writeChainEntry(client, req.user.email, 'read_deny_policy.group_update', String(groupId), {
         mode: v.mode, posture: v.posture, scanFixed: v.scanFixed,
         watchPaths: v.watchPaths, failBlock: v.failBlock, readersAuthority: v.readersAuthority,
+        denyRemoteSessions: v.denyRemoteSessions,
       });
     }
     await client.query('commit');

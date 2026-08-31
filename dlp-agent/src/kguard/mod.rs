@@ -665,7 +665,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
         // failed). The push is a FULL REPLACE, so pushing now would drop the
         // driver's protection to whatever partial/empty set we have. Skip the push
         // and retain the driver's previous set — fail secure, never fail open.
-        let pids = match pids {
+        let mut pids = match pids {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -681,6 +681,23 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
                 continue;
             }
         };
+
+        // RDP session-aware read-deny (strict / token model). When the console
+        // read-deny policy sets `denyRemoteSessions`, union EVERY process in an RDP
+        // (WTS remote) session into the untrusted set — so even an otherwise-trusted
+        // app cannot read a sensitive file over RDP, and any copy-out (redirected
+        // drive, clipboard) fails at the source read. Classic RDP only; AnyDesk/
+        // RustDesk are on the console session and stay covered by the allowlist.
+        let mut remote_pids = 0usize;
+        if snap.kguard.deny_remote_sessions {
+            let existing: std::collections::HashSet<u32> = pids.iter().copied().collect();
+            for pid in crate::exfil::remote_session_pids() {
+                if pid != 0 && pid != 4 && pid != self_pid && !existing.contains(&pid) {
+                    pids.push(pid);
+                    remote_pids += 1;
+                }
+            }
+        }
         let msg = crate::exfil::DlpExfilUpdate::new(&pids);
         let rc = unsafe {
             FilterSendMessage(
@@ -696,7 +713,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
             tracing::warn!(error = %e, "exfil-set push failed (port closing?) — ending pusher");
             break;
         }
-        tracing::info!(count = pids.len(), posture, "pushed untrusted-reader PID set to driver");
+        tracing::info!(count = pids.len(), posture, remote_session_pids = remote_pids, "pushed untrusted-reader PID set to driver");
         tracing::debug!(posture, pids = ?pids, "untrusted-reader PID set (full list)");
         // ~2s cadence, checking stop every 100ms so shutdown is prompt.
         for _ in 0..20 {

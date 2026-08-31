@@ -351,6 +351,93 @@ pub fn compute_untrusted_pids(
     Some(set.into_iter().collect())
 }
 
+/// PIDs of every process running in a **remote (RDP) session** (WTS client
+/// protocol = RDP). The exfil pusher unions these into the untrusted-reader set
+/// when the console read-deny policy has `denyRemoteSessions` on, so EVERY process
+/// in an RDP session (even an otherwise-trusted app) is denied the read of a
+/// sensitive file — the strict / token model, mirroring how an EV signing token
+/// refuses to be used over RDP (session isolation).
+///
+/// Classic RDP ONLY: AnyDesk/RustDesk/TeamViewer hijack the physical **console**
+/// session (protocol = console, not RDP), so WTS reports them as local and they are
+/// NOT flagged here — they stay covered by the process allowlist. Best-effort: any
+/// WTS failure returns whatever was found (never panics, never blocks the pusher).
+#[cfg(not(windows))]
+pub fn remote_session_pids() -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub fn remote_session_pids() -> Vec<u32> {
+    use std::collections::HashSet;
+    use windows::core::PWSTR;
+    use windows::Win32::System::RemoteDesktop::{
+        WTSClientProtocolType, WTSEnumerateProcessesW, WTSEnumerateSessionsW, WTSFreeMemory,
+        WTSQuerySessionInformationW, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTS_SESSION_INFOW,
+    };
+    // WTS_PROTOCOL_TYPE: 0 = console, 1 = ICA (Citrix), 2 = RDP.
+    const WTS_PROTOCOL_TYPE_RDP: u16 = 2;
+
+    let mut rdp_sessions: HashSet<u32> = HashSet::new();
+    let mut pids: Vec<u32> = Vec::new();
+
+    unsafe {
+        // 1) Find the sessions whose CLIENT PROTOCOL is RDP.
+        let mut sess: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+        let mut sess_count: u32 = 0;
+        if WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sess, &mut sess_count).is_ok()
+            && !sess.is_null()
+        {
+            let list = std::slice::from_raw_parts(sess, sess_count as usize);
+            for s in list {
+                let mut buf: PWSTR = PWSTR::null();
+                let mut bytes: u32 = 0;
+                let ok = WTSQuerySessionInformationW(
+                    WTS_CURRENT_SERVER_HANDLE,
+                    s.SessionId,
+                    WTSClientProtocolType,
+                    &mut buf,
+                    &mut bytes,
+                )
+                .is_ok();
+                if ok && !buf.is_null() && bytes >= 2 {
+                    // The buffer holds a USHORT protocol code, not a string.
+                    let proto = *(buf.0 as *const u16);
+                    if proto == WTS_PROTOCOL_TYPE_RDP {
+                        rdp_sessions.insert(s.SessionId);
+                    }
+                }
+                if !buf.is_null() {
+                    WTSFreeMemory(buf.0 as *mut core::ffi::c_void);
+                }
+            }
+            WTSFreeMemory(sess as *mut core::ffi::c_void);
+        }
+
+        // Fast path: no RDP session on the box -> nothing to flag.
+        if rdp_sessions.is_empty() {
+            return pids;
+        }
+
+        // 2) Collect every process whose session is one of those RDP sessions.
+        let mut procs: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
+        let mut proc_count: u32 = 0;
+        if WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut procs, &mut proc_count)
+            .is_ok()
+            && !procs.is_null()
+        {
+            let list = std::slice::from_raw_parts(procs, proc_count as usize);
+            for p in list {
+                if rdp_sessions.contains(&p.SessionId) {
+                    pids.push(p.ProcessId);
+                }
+            }
+            WTSFreeMemory(procs as *mut core::ffi::c_void);
+        }
+    }
+    pids
+}
+
 /// Enable SeDebugPrivilege on the current process token (best-effort). Lets an
 /// elevated / SYSTEM guard `OpenProcess` SYSTEM- and higher-integrity processes
 /// for image identification; a no-op (silently) when the token doesn't hold the

@@ -16,6 +16,7 @@ const POLICY_FALLBACK = {
   watch_paths: [],
   fail_block: false,
   readers_authority: 'merge',
+  deny_remote_sessions: false,
 };
 
 // Effective policy for `groupId` (null => Default). `db` may be a pool or a client
@@ -28,7 +29,8 @@ async function effectivePolicyForGroup(groupId, db = pool) {
             COALESCE(o.scan_fixed, r.scan_fixed)               AS scan_fixed,
             COALESCE(o.watch_paths, r.watch_paths)             AS watch_paths,
             COALESCE(o.fail_block, r.fail_block)               AS fail_block,
-            COALESCE(o.readers_authority, r.readers_authority) AS readers_authority
+            COALESCE(o.readers_authority, r.readers_authority) AS readers_authority,
+            COALESCE(o.deny_remote_sessions, r.deny_remote_sessions) AS deny_remote_sessions
        FROM read_deny_policy r
        LEFT JOIN group_read_deny_policy o ON o.group_id = $1
       WHERE r.id = 1`,
@@ -46,6 +48,7 @@ function policyJson(row) {
     watchPaths: row.watch_paths,
     failBlock: row.fail_block,
     readersAuthority: row.readers_authority || 'merge',
+    denyRemoteSessions: row.deny_remote_sessions ?? false,
   };
 }
 

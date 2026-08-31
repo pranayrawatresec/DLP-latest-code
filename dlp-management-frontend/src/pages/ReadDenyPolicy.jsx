@@ -164,6 +164,7 @@ export default function ReadDenyPolicy() {
         ...policy,
         watchPaths: [...(policy.watchPaths || [])],
         readersAuthority: policy.readersAuthority || 'merge',
+        denyRemoteSessions: policy.denyRemoteSessions ?? false,
       })
   }, [policy, selectedGroupId])
 
@@ -194,6 +195,7 @@ export default function ReadDenyPolicy() {
         ...policy,
         watchPaths: policy.watchPaths || [],
         readersAuthority: policy.readersAuthority || 'merge',
+        denyRemoteSessions: policy.denyRemoteSessions ?? false,
       })
 
   const addPath = (raw) => {
@@ -217,6 +219,7 @@ export default function ReadDenyPolicy() {
         watchPaths: form.watchPaths,
         failBlock: form.failBlock,
         readersAuthority: form.readersAuthority,
+        denyRemoteSessions: form.denyRemoteSessions,
       }).unwrap()
       setMsg({ kind: 'ok', text: 'Policy saved — endpoints apply it at their next check-in.' })
     } catch (e) {
@@ -413,6 +416,19 @@ export default function ReadDenyPolicy() {
                   disabled={!canWrite}
                   label="Fail secure — block unverifiable reads by untrusted programs"
                   hint="Off = allow and audit (general use). On = block (classified sites)."
+                />
+              </Section>
+
+              <Section
+                title="Remote sessions (RDP)"
+                desc="An RDP user isn't physically at the machine — the same reason a code-signing token refuses to work over RDP. Turn this on to keep sensitive data out of remote sessions."
+              >
+                <Toggle
+                  checked={form.denyRemoteSessions}
+                  onChange={(v) => set({ denyRemoteSessions: v })}
+                  disabled={!canWrite}
+                  label="Deny all sensitive reads from an RDP session"
+                  hint="On = every program in an RDP session (even trusted apps) is blocked from reading sensitive files, so copies to a redirected drive or the clipboard fail at the source. Classic RDP only — AnyDesk/RustDesk hijack the console session and are covered by the trusted-applications list."
                 />
               </Section>
             </>
