@@ -405,6 +405,9 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
       // 'central' => local [[trusted_readers]] are ignored on the endpoint (#9);
       // 'merge' (default) => union with local, as before.
       readersAuthority: p.readers_authority || 'merge',
+      // Deny ALL sensitive reads by any process in an RDP (WTS remote) session
+      // (strict / token model). Off by default; see migration 017.
+      denyRemoteSessions: p.deny_remote_sessions ?? false,
     };
 
     await audit('agent-policy', 'agent.policy_delivered', agent.id, {
