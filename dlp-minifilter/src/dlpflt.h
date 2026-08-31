@@ -170,6 +170,23 @@ typedef struct _DLP_EXFIL_UPDATE {
     ULONG Pids[DLP_EXFIL_MSG_MAX];        /* the exfil-channel PIDs              */
 } DLP_EXFIL_UPDATE, *PDLP_EXFIL_UPDATE;
 
+/* Remote-session (RDP) read-deny. The agent pushes the set of REMOTE (RDP) session
+ * IDs rather than the PIDs inside them. A session is remote for its whole lifetime,
+ * so a brand-new process in an already-flagged RDP session is denied IMMEDIATELY --
+ * this closes the launch-to-flag race the per-PID push leaves open (a fast reader
+ * like a browser's PDF renderer reads before the ~2 s PID push can flag its PID).
+ * First ULONG is DLP_SESSION_VERSION; MUST NOT collide with DLP_CONFIG_VERSION (1),
+ * DLP_EXFIL_VERSION, or DLP_DRAIN_VERSION. ("DlpS" bytes). */
+#define DLP_SESSION_VERSION  0x53706C44u   /* 'D''l''p''S' */
+#define DLP_MAX_SESSIONS     64
+
+/* User -> kernel: the current set of remote (RDP) session IDs. */
+typedef struct _DLP_SESSION_UPDATE {
+    ULONG Version;                        /* = DLP_SESSION_VERSION               */
+    ULONG Count;                          /* valid entries (<= DLP_MAX_SESSIONS) */
+    ULONG Sessions[DLP_MAX_SESSIONS];     /* remote (RDP) session IDs            */
+} DLP_SESSION_UPDATE, *PDLP_SESSION_UPDATE;
+
 /* Read-deny AUDIT drain. The guard sends a request whose first ULONG is
  * DLP_DRAIN_VERSION; the driver replies (output buffer) with buffered cache-hit
  * deny events. Distinct from DLP_CONFIG_VERSION (1) and DLP_EXFIL_VERSION. */
@@ -451,6 +468,13 @@ typedef struct _DLP_FLT_DATA {
     DLP_EXFIL_ENTRY Exfil[DLP_EXFIL_MAX];
     volatile LONG   ExfilEpoch;             /* bumped on each full-replace push       */
     volatile LONG   ExfilCount;             /* live entries (diagnostics)             */
+
+    /* Remote-session (RDP) read-deny set (agent-pushed, DLP_SESSION_UPDATE). A read
+     * whose requestor lives in one of these sessions is gated exactly like an exfil
+     * PID. SessionCount==0 (no RDP flagged) short-circuits the per-read check. */
+    KSPIN_LOCK      SessionLock;
+    ULONG           RemoteSessions[DLP_MAX_SESSIONS];
+    volatile LONG   RemoteSessionCount;     /* valid entries [0..DLP_MAX_SESSIONS]    */
 } DLP_FLT_DATA, *PDLP_FLT_DATA;
 
 extern DLP_FLT_DATA gDlpData;
@@ -536,6 +560,13 @@ VOID     DlpDenyReport(_In_ ULONG Pid, _In_ ULONGLONG FileId, _In_ ULONG Reason)
 BOOLEAN  DlpExfilLookup(_In_ ULONG Pid);
 VOID     DlpExfilReplace(_In_reads_(Count) const ULONG *Pids, _In_ ULONG Count);
 VOID     DlpExfilRemove(_In_ ULONG Pid);
+
+/* Remote-session (RDP) read-deny. DlpSessionReplace full-replaces the flagged
+ * session-ID set (DLP_SESSION_UPDATE). DlpSessionIsRemote returns TRUE when the
+ * I/O requestor's session is flagged -- cheap: FltGetRequestorProcess (no lookup) +
+ * a field read, short-circuited when no sessions are flagged. */
+VOID     DlpSessionReplace(_In_reads_(Count) const ULONG *Sessions, _In_ ULONG Count);
+BOOLEAN  DlpSessionIsRemote(_In_ PFLT_CALLBACK_DATA Data);
 
 /* Process-create/-exit notify: drop an exited PID from the exfil set (closes
  * the PID-reuse window between agent pushes). Registered with

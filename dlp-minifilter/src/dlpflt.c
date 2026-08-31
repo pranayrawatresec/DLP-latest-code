@@ -28,6 +28,10 @@ a bug = BSOD). Runtime correctness is the operator's manual test (SPEC section 8
 #include "dlpflt.h"
 #include <ntddstor.h>   /* IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_* for bus type */
 
+/* Exported by ntoskrnl but not surfaced by the km headers for this SDK/NTDDI combo;
+ * used by DlpSessionIsRemote for session-aware (RDP) read-deny. */
+NTKERNELAPI ULONG PsGetProcessSessionId(_In_ PEPROCESS Process);
+
 /* ------------------------------------------------------------------------- *
  *  Global state                                                             *
  * ------------------------------------------------------------------------- */
@@ -281,6 +285,10 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     RtlZeroMemory(gDlpData.Exfil, sizeof(gDlpData.Exfil));
     gDlpData.ExfilEpoch = 1;                                /* 0 reserved       */
     gDlpData.ExfilCount = 0;
+    /* Remote-session (RDP) read-deny set. Empty until the agent pushes sessions. */
+    KeInitializeSpinLock(&gDlpData.SessionLock);
+    RtlZeroMemory(gDlpData.RemoteSessions, sizeof(gDlpData.RemoteSessions));
+    gDlpData.RemoteSessionCount = 0;
     KeInitializeSpinLock(&gDlpData.DenyRingLock);          /* read-deny audit ring */
     gDlpData.DenyRingCount = 0;
     gDlpData.DenyRingDropped = 0;
@@ -715,7 +723,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         BOOLEAN positive = FALSE;
         /* The classify runs in BOTH monitor and enforce (its up-call is what raises
          * the would-block / block incident); only ENFORCE cancels the open. */
-        if (DlpExfilLookup(exfilPid) &&
+        if ((DlpExfilLookup(exfilPid) || DlpSessionIsRemote(Data)) &&
             DlpExfilClassifyAndCache(FltObjects, Data, exfilPid, &positive) == DLP_EXFIL_DENY &&
             positive &&
             gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
@@ -1602,6 +1610,65 @@ DlpExfilRemove(_In_ ULONG Pid)
     KeReleaseSpinLock(&gDlpData.ExfilLock, oldIrql);
 }
 
+/* Full-replace the flagged remote (RDP) session-ID set (DLP_SESSION_UPDATE). */
+VOID
+DlpSessionReplace(_In_reads_(Count) const ULONG *Sessions, _In_ ULONG Count)
+{
+    KIRQL oldIrql;
+    ULONG i;
+    ULONG n = Count;
+
+    if (n > DLP_MAX_SESSIONS) {
+        n = DLP_MAX_SESSIONS;              /* bounded; excess dropped (agent caps too) */
+    }
+
+    KeAcquireSpinLock(&gDlpData.SessionLock, &oldIrql);
+    for (i = 0; i < DLP_MAX_SESSIONS; i++) {
+        gDlpData.RemoteSessions[i] = (i < n && Sessions != NULL) ? Sessions[i] : 0;
+    }
+    gDlpData.RemoteSessionCount = (LONG)n;
+    KeReleaseSpinLock(&gDlpData.SessionLock, oldIrql);
+}
+
+/* TRUE when the I/O requestor lives in a flagged remote (RDP) session. Cheap:
+ * short-circuits when nothing is flagged; FltGetRequestorProcess returns the
+ * initiating EPROCESS with no added reference (a field read, not a PsLookup). */
+BOOLEAN
+DlpSessionIsRemote(_In_ PFLT_CALLBACK_DATA Data)
+{
+    KIRQL oldIrql;
+    BOOLEAN found = FALSE;
+    PEPROCESS proc;
+    ULONG sid;
+    LONG count, i;
+
+    if (InterlockedCompareExchange(&gDlpData.RemoteSessionCount, 0, 0) == 0) {
+        return FALSE;                      /* no RDP session flagged -> zero cost */
+    }
+    proc = FltGetRequestorProcess(Data);
+    if (proc == NULL) {
+        return FALSE;                      /* thread-less / system I/O */
+    }
+    sid = PsGetProcessSessionId(proc);
+    if (sid == 0) {
+        return FALSE;                      /* session 0 = services, never remote */
+    }
+
+    KeAcquireSpinLock(&gDlpData.SessionLock, &oldIrql);
+    count = gDlpData.RemoteSessionCount;
+    if (count > DLP_MAX_SESSIONS) {
+        count = DLP_MAX_SESSIONS;
+    }
+    for (i = 0; i < count; i++) {
+        if (gDlpData.RemoteSessions[i] == sid) {
+            found = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&gDlpData.SessionLock, oldIrql);
+    return found;
+}
+
 
 /* ========================================================================= *
  *  Read-deny -- DlpPreRead (IRP_MJ_READ pre-op, read-deny-LLD §4)            *
@@ -1928,10 +1995,12 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
     if (DlpShouldSkip(Data, FltObjects)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
-    /* 3. Only exfil-channel PIDs are subject to read-deny -- the common case
-     *    (ordinary app) exits here after ONE spinlocked scan. */
+    /* 3. Only exfil-channel PIDs -- or a requestor in a flagged REMOTE (RDP)
+     *    session -- are subject to read-deny. The common case (ordinary app on the
+     *    console) exits here after ONE spinlocked scan; the session check is
+     *    short-circuited when no RDP session is flagged. */
     pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-    if (!DlpExfilLookup(pid)) {
+    if (!DlpExfilLookup(pid) && !DlpSessionIsRemote(Data)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* 4. Zero-length read: nothing to gate. */
@@ -1998,9 +2067,10 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
     if (DlpShouldSkip(Data, FltObjects)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
-    /* 6. Only exfil-channel PIDs. */
+    /* 6. Only exfil-channel PIDs -- or a requestor in a flagged REMOTE (RDP)
+     *    session (mapped-read half of the same gate). */
     pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-    if (!DlpExfilLookup(pid)) {
+    if (!DlpExfilLookup(pid) && !DlpSessionIsRemote(Data)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 

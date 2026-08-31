@@ -645,11 +645,39 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
     };
 
     let self_pid = std::process::id();
+    // Runtime scan-scope re-apply. The resync/apply path only writes the driver's
+    // registry knobs; `send_config` (the live DLP_CONFIG message) otherwise runs
+    // ONLY at guard startup — so a console watch/scope change would not reach the
+    // running driver until the guard restarted or the box rebooted. Track the last
+    // scope we pushed and re-send DLP_CONFIG on THIS connection (the driver accepts
+    // config on any handle) whenever it changes, so a live re-sync applies within one
+    // ~2s cycle. `None` forces one send on the first cycle (idempotent with startup).
+    let mut last_scope: Option<(bool, Vec<String>)> = None;
     while !stop.load(Ordering::Relaxed) {
         // Re-snapshot each cycle so a live re-sync picks up posture / allowlist
         // changes. `blocklist` (default) is the UNCHANGED signature/behaviour set;
         // `allowlist` pushes every process NOT on the sanctioned-reader allowlist.
         let snap = snapshot_config(shared_cfg);
+
+        // Runtime scan-scope re-apply (see note above the loop). Re-send DLP_CONFIG
+        // to the driver whenever the watch-set or scan_fixed flag changes, so a live
+        // console policy change takes effect without an agent restart / reboot.
+        let scope = (snap.kguard.scan_fixed, snap.kguard.watch_paths.clone());
+        if last_scope.as_ref() != Some(&scope) {
+            send_config(port, &snap.kguard);
+            // A fixed-volume attach must follow the watch-set (InstanceSetup gates on
+            // ScanFixed=1/WatchCount>0). Idempotent — "already attached" is success.
+            if snap.kguard.scan_fixed {
+                crate::readdenypolicy::attach_fixed_volume("C:");
+            }
+            tracing::info!(
+                scan_fixed = scope.0,
+                watch_count = scope.1.len(),
+                "re-applied read-deny scan scope to driver (runtime policy change)"
+            );
+            last_scope = Some(scope);
+        }
+
         let pids = match snap.kguard.exfil_posture {
             ExfilPosture::Blocklist => Some(crate::exfil::compute_exfil_pids(self_pid)),
             ExfilPosture::Allowlist => {
@@ -665,7 +693,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
         // failed). The push is a FULL REPLACE, so pushing now would drop the
         // driver's protection to whatever partial/empty set we have. Skip the push
         // and retain the driver's previous set — fail secure, never fail open.
-        let mut pids = match pids {
+        let pids = match pids {
             Some(p) => p,
             None => {
                 tracing::warn!(
@@ -682,22 +710,7 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
             }
         };
 
-        // RDP session-aware read-deny (strict / token model). When the console
-        // read-deny policy sets `denyRemoteSessions`, union EVERY process in an RDP
-        // (WTS remote) session into the untrusted set — so even an otherwise-trusted
-        // app cannot read a sensitive file over RDP, and any copy-out (redirected
-        // drive, clipboard) fails at the source read. Classic RDP only; AnyDesk/
-        // RustDesk are on the console session and stay covered by the allowlist.
-        let mut remote_pids = 0usize;
-        if snap.kguard.deny_remote_sessions {
-            let existing: std::collections::HashSet<u32> = pids.iter().copied().collect();
-            for pid in crate::exfil::remote_session_pids() {
-                if pid != 0 && pid != 4 && pid != self_pid && !existing.contains(&pid) {
-                    pids.push(pid);
-                    remote_pids += 1;
-                }
-            }
-        }
+        // Base read-deny: push the exfil-channel PID set (untrusted readers).
         let msg = crate::exfil::DlpExfilUpdate::new(&pids);
         let rc = unsafe {
             FilterSendMessage(
@@ -713,8 +726,36 @@ fn exfil_push_loop(stop: &std::sync::atomic::AtomicBool, shared_cfg: &Arc<RwLock
             tracing::warn!(error = %e, "exfil-set push failed (port closing?) — ending pusher");
             break;
         }
-        tracing::info!(count = pids.len(), posture, remote_session_pids = remote_pids, "pushed untrusted-reader PID set to driver");
-        tracing::debug!(posture, pids = ?pids, "untrusted-reader PID set (full list)");
+
+        // RDP session-aware read-deny (strict / token model). Push the set of REMOTE
+        // (RDP) session IDs — NOT the PIDs inside them — so a brand-new process in an
+        // already-flagged RDP session is denied IMMEDIATELY (a session is remote for
+        // its whole life), closing the launch-to-flag race a per-PID push leaves open
+        // (a fast reader like a browser's PDF renderer reads before a PID push lands).
+        // Empty set when the policy is off, so toggling it clears the driver. Classic
+        // RDP only; AnyDesk/RustDesk sit on the console session and stay covered by the
+        // allowlist. A failure here never ends the pusher (the PID channel is primary).
+        let sessions: Vec<u32> = if snap.kguard.deny_remote_sessions {
+            crate::exfil::remote_session_ids()
+        } else {
+            Vec::new()
+        };
+        let smsg = crate::exfil::DlpSessionUpdate::new(&sessions);
+        if let Err(e) = unsafe {
+            FilterSendMessage(
+                port,
+                &smsg as *const crate::exfil::DlpSessionUpdate as *const core::ffi::c_void,
+                core::mem::size_of::<crate::exfil::DlpSessionUpdate>() as u32,
+                None,
+                0,
+                &mut 0u32,
+            )
+        } {
+            tracing::warn!(error = %e, "remote-session push failed — RDP read-deny may lag this cycle");
+        }
+
+        tracing::info!(count = pids.len(), posture, remote_sessions = sessions.len(), "pushed untrusted-reader PID set to driver");
+        tracing::debug!(posture, pids = ?pids, sessions = ?sessions, "untrusted-reader PID set (full list)");
         // ~2s cadence, checking stop every 100ms so shutdown is prompt.
         for _ in 0..20 {
             if stop.load(Ordering::Relaxed) {

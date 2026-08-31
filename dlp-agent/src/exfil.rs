@@ -45,6 +45,37 @@ impl DlpExfilUpdate {
 // Size-lock: the kernel struct is 8 + 1024*4 = 4104 bytes.
 const _: () = assert!(core::mem::size_of::<DlpExfilUpdate>() == 8 + DLP_EXFIL_MSG_MAX * 4);
 
+// ---- Remote-session (RDP) read-deny push -----------------------------------
+pub const DLP_SESSION_VERSION: u32 = 0x5370_6C44; // 'D''l''p''S' — MUST match dlpflt.h
+pub const DLP_SESSION_MAX: usize = 64;
+
+/// Wire mirror of the kernel `DLP_SESSION_UPDATE` (`#[repr(C)]`, size-locked).
+/// Full-replace: `count` remote (RDP) session IDs in `sessions`.
+#[repr(C)]
+pub struct DlpSessionUpdate {
+    pub version: u32,
+    pub count: u32,
+    pub sessions: [u32; DLP_SESSION_MAX],
+}
+
+impl DlpSessionUpdate {
+    /// Build a full-replace message from a session-ID set (truncated to the cap).
+    pub fn new(sessions: &[u32]) -> Self {
+        let mut m = DlpSessionUpdate {
+            version: DLP_SESSION_VERSION,
+            count: 0,
+            sessions: [0u32; DLP_SESSION_MAX],
+        };
+        let n = sessions.len().min(DLP_SESSION_MAX);
+        m.sessions[..n].copy_from_slice(&sessions[..n]);
+        m.count = n as u32;
+        m
+    }
+}
+
+// Size-lock: the kernel struct is 8 + 64*4 = 264 bytes.
+const _: () = assert!(core::mem::size_of::<DlpSessionUpdate>() == 8 + DLP_SESSION_MAX * 4);
+
 // ---- Read-deny AUDIT drain (cache-hit deny notifications) ------------------
 pub const DLP_DRAIN_VERSION: u32 = 0x796E_6544; // 'D''e''n''y' — MUST match dlpflt.h
 pub const DLP_DENYRING_MAX: usize = 256;
@@ -351,38 +382,38 @@ pub fn compute_untrusted_pids(
     Some(set.into_iter().collect())
 }
 
-/// PIDs of every process running in a **remote (RDP) session** (WTS client
-/// protocol = RDP). The exfil pusher unions these into the untrusted-reader set
-/// when the console read-deny policy has `denyRemoteSessions` on, so EVERY process
-/// in an RDP session (even an otherwise-trusted app) is denied the read of a
-/// sensitive file — the strict / token model, mirroring how an EV signing token
+/// The SESSION IDs of every **remote (RDP) session**. The pusher ships these to the
+/// driver (DLP_SESSION_UPDATE) when the console read-deny policy has `denyRemoteSessions`
+/// on, so EVERY process in an RDP session (even an otherwise-trusted app) is denied the
+/// read of a sensitive file — the strict / token model, mirroring how an EV signing token
 /// refuses to be used over RDP (session isolation).
 ///
-/// Classic RDP ONLY: AnyDesk/RustDesk/TeamViewer hijack the physical **console**
-/// session (protocol = console, not RDP), so WTS reports them as local and they are
-/// NOT flagged here — they stay covered by the process allowlist. Best-effort: any
-/// WTS failure returns whatever was found (never panics, never blocks the pusher).
+/// Classic RDP ONLY: AnyDesk/RustDesk/TeamViewer hijack the physical **console** session
+/// (protocol = console, not RDP), so WTS reports them as local and they are NOT flagged
+/// here — they stay covered by the process allowlist. Best-effort: any WTS failure returns
+/// whatever was found (never panics, never blocks the pusher).
 #[cfg(not(windows))]
-pub fn remote_session_pids() -> Vec<u32> {
+pub fn remote_session_ids() -> Vec<u32> {
     Vec::new()
 }
 
+/// The SESSION IDs of every **remote (RDP) session** (WTS client protocol = RDP).
+/// The driver flags reads whose requestor lives in one of these sessions — pushing
+/// session IDs (stable for the session's whole life) rather than the PIDs inside them
+/// closes the launch-to-flag race a per-PID push leaves open (a fast reader like a
+/// browser's PDF renderer reads before the ~2 s PID push can flag it).
 #[cfg(windows)]
-pub fn remote_session_pids() -> Vec<u32> {
-    use std::collections::HashSet;
+pub fn remote_session_ids() -> Vec<u32> {
     use windows::core::PWSTR;
     use windows::Win32::System::RemoteDesktop::{
-        WTSClientProtocolType, WTSEnumerateProcessesW, WTSEnumerateSessionsW, WTSFreeMemory,
-        WTSQuerySessionInformationW, WTS_CURRENT_SERVER_HANDLE, WTS_PROCESS_INFOW, WTS_SESSION_INFOW,
+        WTSClientProtocolType, WTSEnumerateSessionsW, WTSFreeMemory, WTSQuerySessionInformationW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW,
     };
     // WTS_PROTOCOL_TYPE: 0 = console, 1 = ICA (Citrix), 2 = RDP.
     const WTS_PROTOCOL_TYPE_RDP: u16 = 2;
 
-    let mut rdp_sessions: HashSet<u32> = HashSet::new();
-    let mut pids: Vec<u32> = Vec::new();
-
+    let mut ids: Vec<u32> = Vec::new();
     unsafe {
-        // 1) Find the sessions whose CLIENT PROTOCOL is RDP.
         let mut sess: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
         let mut sess_count: u32 = 0;
         if WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sess, &mut sess_count).is_ok()
@@ -403,8 +434,9 @@ pub fn remote_session_pids() -> Vec<u32> {
                 if ok && !buf.is_null() && bytes >= 2 {
                     // The buffer holds a USHORT protocol code, not a string.
                     let proto = *(buf.0 as *const u16);
-                    if proto == WTS_PROTOCOL_TYPE_RDP {
-                        rdp_sessions.insert(s.SessionId);
+                    // Session 0 is services (never a client session) — never flag it.
+                    if proto == WTS_PROTOCOL_TYPE_RDP && s.SessionId != 0 {
+                        ids.push(s.SessionId);
                     }
                 }
                 if !buf.is_null() {
@@ -413,29 +445,8 @@ pub fn remote_session_pids() -> Vec<u32> {
             }
             WTSFreeMemory(sess as *mut core::ffi::c_void);
         }
-
-        // Fast path: no RDP session on the box -> nothing to flag.
-        if rdp_sessions.is_empty() {
-            return pids;
-        }
-
-        // 2) Collect every process whose session is one of those RDP sessions.
-        let mut procs: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
-        let mut proc_count: u32 = 0;
-        if WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut procs, &mut proc_count)
-            .is_ok()
-            && !procs.is_null()
-        {
-            let list = std::slice::from_raw_parts(procs, proc_count as usize);
-            for p in list {
-                if rdp_sessions.contains(&p.SessionId) {
-                    pids.push(p.ProcessId);
-                }
-            }
-            WTSFreeMemory(procs as *mut core::ffi::c_void);
-        }
     }
-    pids
+    ids
 }
 
 /// Enable SeDebugPrivilege on the current process token (best-effort). Lets an

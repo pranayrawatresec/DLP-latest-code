@@ -337,6 +337,40 @@ DlpPortMessage(_In_opt_ PVOID PortCookie,
         return STATUS_SUCCESS;
     }
 
+    /* ---- DLP_SESSION_UPDATE (remote/RDP session read-deny full-replace) ---- */
+    if (version == DLP_SESSION_VERSION) {
+        ULONG count = 0;
+        ULONG *kbuf;
+
+        if (InputBufferLength < sizeof(DLP_SESSION_UPDATE)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        /* Copy the session-ID array into a kernel buffer under SEH before taking
+         * the spinlock (DlpSessionReplace must not touch user memory). Bounded. */
+#pragma warning(suppress: 4996)
+        kbuf = (ULONG *)ExAllocatePoolWithTag(NonPagedPoolNx,
+                                              DLP_MAX_SESSIONS * sizeof(ULONG),
+                                              DLP_EXFIL_TAG);
+        if (kbuf == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        __try {
+            PDLP_SESSION_UPDATE in = (PDLP_SESSION_UPDATE)InputBuffer;
+            ProbeForRead(InputBuffer, sizeof(DLP_SESSION_UPDATE), __alignof(ULONG));
+            count = in->Count;
+            if (count > DLP_MAX_SESSIONS) {
+                count = DLP_MAX_SESSIONS;
+            }
+            RtlCopyMemory(kbuf, in->Sessions, count * sizeof(ULONG));
+        } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
+            ExFreePoolWithTag(kbuf, DLP_EXFIL_TAG);
+            return STATUS_INVALID_USER_BUFFER;
+        }
+        DlpSessionReplace(kbuf, count);
+        ExFreePoolWithTag(kbuf, DLP_EXFIL_TAG);
+        return STATUS_SUCCESS;
+    }
+
     /* ---- DLP_CONFIG (scan scope) ------------------------------------------- */
     if (version != DLP_CONFIG_VERSION || InputBufferLength < sizeof(DLP_CONFIG)) {
         return STATUS_INVALID_PARAMETER;
@@ -486,6 +520,16 @@ DlpConfigPathIsWatched(_In_ PCUNICODE_STRING Path)
         USHORT wlen = gDlpData.Config.WatchLen[i];
         if (wlen == 0 || wlen > DLP_WATCH_PATH_CHARS) {
             continue;
+        }
+        /* A watch of just "\" is the volume root: it means "the whole fixed drive".
+         * DlpUnicodeContainsCI's right-boundary rule can NEVER match a bare "\" --
+         * every "\" in a real path is followed by a name component, not a separator
+         * or end -- so without this a whole-drive watch silently leaves the entire
+         * volume UNwatched and disables read-deny. Treat it as match-everything so
+         * the most intuitive admin setting ("protect all of C:") is honoured. */
+        if (wlen == 1 && gDlpData.Config.Watch[i][0] == L'\\') {
+            matched = TRUE;
+            break;
         }
         if (DlpUnicodeContainsCI(Path, gDlpData.Config.Watch[i], wlen)) {
             matched = TRUE;
