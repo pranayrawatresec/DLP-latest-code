@@ -361,13 +361,16 @@ app.get('/agent/trusted-readers', async (req, res, next) => {
     // Default group, so its effective group resolves to the Default group's id —
     // keeping the NULL-means-Default convention consistent with policy delivery.
     const { rows } = await pool.query(
-      `select match_type, value from trusted_readers
+      `select kind, match_type, value from trusted_readers
         where group_id is null
            or group_id = coalesce($1, (select id from groups where is_default limit 1))
         order by created_at desc, id desc`,
       [agent.group_id ?? null]
     );
-    const readers = rows.map((row) => ({ matchType: row.match_type, value: row.value }));
+    // Deliver kind so the agent can apply deny-overrides. Older agents ignore the
+    // extra field (default 'allow'); a missing kind on an older server likewise
+    // defaults to 'allow' agent-side — back-compatible in both directions.
+    const readers = rows.map((row) => ({ kind: row.kind || 'allow', matchType: row.match_type, value: row.value }));
 
     // One audit row per delivery — the allowlist is policy; who received it and
     // how large it was is worth the trail (values are metadata, never secrets).

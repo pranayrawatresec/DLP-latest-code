@@ -28,6 +28,20 @@
 
 use serde::Deserialize;
 
+/// Whether a reader rule GRANTS trust (`Allow`) or is a deny-OVERRIDE (`Deny`).
+/// A deny rule blocks a process from reading sensitive content EVEN IF an allow
+/// rule (e.g. a publisher) would otherwise trust it — deny wins. This is how an
+/// admin keeps a broad publisher trusted (Office, Explorer) yet carves out its
+/// exfil channels (Teams, OneDrive) by name/path. Defaults to `Allow` so an
+/// omitted/unknown value (older config, older server) preserves prior behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReaderKind {
+    #[default]
+    Allow,
+    Deny,
+}
+
 /// A normalized sanctioned-reader matcher. Produced from a local
 /// [`TrustedReaderRule`] or a synced [`SyncedReader`]; consumed by the exfil
 /// classifier. Case-insensitive throughout.
@@ -149,7 +163,7 @@ fn path_has_prefix(image_path: &str, prefix: &str) -> bool {
 /// A rule with no matcher is dropped (never a catch-all — an empty allowlist in
 /// the allowlist posture would make EVERY process untrusted, so a malformed
 /// rule must not silently become one).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TrustedReaderRule {
     /// Authenticode signer subject CN (e.g. `"Microsoft Corporation"`).
     #[serde(default)]
@@ -163,6 +177,10 @@ pub struct TrustedReaderRule {
     /// Free-form operator note (why this app is trusted).
     #[serde(default)]
     pub note: Option<String>,
+    /// Allow (default) or deny-override. A local `[[trusted_readers]]` entry may
+    /// set `kind = "deny"` to block an app the same way the console does.
+    #[serde(default)]
+    pub kind: ReaderKind,
 }
 
 impl TrustedReaderRule {
@@ -192,6 +210,24 @@ pub fn resolve_matches(rules: &[TrustedReaderRule]) -> Vec<ReaderMatch> {
     rules.iter().filter_map(TrustedReaderRule::to_match).collect()
 }
 
+/// The effective matchers partitioned by disposition: `(allow, deny)`. A process
+/// is TRUSTED iff it matches an `allow` matcher AND matches NO `deny` matcher.
+/// The classifier ([`crate::exfil`]) uses this so a deny-override wins over any
+/// allow (e.g. block Teams by name while `Microsoft Corporation` stays trusted).
+pub fn resolve_split(rules: &[TrustedReaderRule]) -> (Vec<ReaderMatch>, Vec<ReaderMatch>) {
+    let mut allow = Vec::new();
+    let mut deny = Vec::new();
+    for rule in rules {
+        if let Some(m) = rule.to_match() {
+            match rule.kind {
+                ReaderKind::Allow => allow.push(m),
+                ReaderKind::Deny => deny.push(m),
+            }
+        }
+    }
+    (allow, deny)
+}
+
 // ---------------------------------------------------------------------------
 // Server-sync wire shape (GET /agent/trusted-readers) + persistence. Mirrors
 // trustsync.rs's destination flow: metadata only, fail-soft to last-persisted.
@@ -205,18 +241,32 @@ pub struct SyncedReader {
     #[serde(rename = "matchType")]
     pub match_type: String,
     pub value: String,
+    /// "allow" (default) or "deny". Older servers omit it → defaults to Allow, so
+    /// delivery is back-compatible in both directions.
+    #[serde(default, skip_serializing_if = "is_allow")]
+    pub kind: ReaderKind,
+}
+
+/// Serde helper: don't serialize the common `Allow` kind, keeping the persisted
+/// `trusted-readers.json` compact and byte-identical to pre-deny files for allow
+/// rules (round-trips cleanly with older/newer readers).
+fn is_allow(k: &ReaderKind) -> bool {
+    matches!(k, ReaderKind::Allow)
 }
 
 impl SyncedReader {
-    /// Convert to a local-shaped rule so the merged list is one type.
+    /// Convert to a local-shaped rule so the merged list is one type, carrying the
+    /// allow/deny kind through unchanged.
     pub fn to_rule(&self) -> TrustedReaderRule {
         let val = Some(self.value.clone());
-        match self.match_type.as_str() {
-            "publisher" => TrustedReaderRule { publisher: val, path: None, name: None, note: None },
-            "path" => TrustedReaderRule { publisher: None, path: val, name: None, note: None },
-            "name" => TrustedReaderRule { publisher: None, path: None, name: val, note: None },
-            _ => TrustedReaderRule { publisher: None, path: None, name: None, note: None },
-        }
+        let mut rule = match self.match_type.as_str() {
+            "publisher" => TrustedReaderRule { publisher: val, ..Default::default() },
+            "path" => TrustedReaderRule { path: val, ..Default::default() },
+            "name" => TrustedReaderRule { name: val, ..Default::default() },
+            _ => TrustedReaderRule::default(),
+        };
+        rule.kind = self.kind;
+        rule
     }
 }
 
@@ -362,29 +412,52 @@ mod tests {
             publisher: Some("Microsoft Corporation".into()),
             path: Some(r"C:\Windows".into()),
             name: Some("x.exe".into()),
-            note: None,
+            ..Default::default()
         };
         assert_eq!(r.to_match(), Some(ReaderMatch::Publisher("Microsoft Corporation".into())));
 
         let only_path = TrustedReaderRule {
             publisher: Some("   ".into()), // blank ⇒ skipped
             path: Some(r"C:\Windows".into()),
-            name: None,
-            note: None,
+            ..Default::default()
         };
         assert_eq!(only_path.to_match(), Some(ReaderMatch::Path(r"C:\Windows".into())));
 
-        let empty = TrustedReaderRule { publisher: None, path: None, name: Some("  ".into()), note: None };
+        let empty = TrustedReaderRule { name: Some("  ".into()), ..Default::default() };
         assert_eq!(empty.to_match(), None, "a rule with no non-empty matcher is dropped");
     }
 
     #[test]
     fn resolve_drops_matcherless_rules() {
         let rules = vec![
-            TrustedReaderRule { publisher: None, path: None, name: None, note: Some("junk".into()) },
-            TrustedReaderRule { publisher: None, path: Some(r"C:\Windows".into()), name: None, note: None },
+            TrustedReaderRule { note: Some("junk".into()), ..Default::default() },
+            TrustedReaderRule { path: Some(r"C:\Windows".into()), ..Default::default() },
         ];
         assert_eq!(resolve_matches(&rules), vec![ReaderMatch::Path(r"C:\Windows".into())]);
+    }
+
+    #[test]
+    fn resolve_split_partitions_allow_and_deny_and_deny_overrides() {
+        // A broad publisher allow + a name deny carve-out (the Teams/OneDrive case).
+        let rules = vec![
+            TrustedReaderRule { publisher: Some("Microsoft Corporation".into()), ..Default::default() },
+            TrustedReaderRule { name: Some("ms-teams.exe".into()), kind: ReaderKind::Deny, ..Default::default() },
+        ];
+        let (allow, deny) = resolve_split(&rules);
+        assert_eq!(allow, vec![ReaderMatch::Publisher("Microsoft Corporation".into())]);
+        assert_eq!(deny, vec![ReaderMatch::Name("ms-teams.exe".into())]);
+
+        // Teams: matches the allow (publisher) AND the deny (name) → deny wins.
+        let teams = r"C:\Program Files\WindowsApps\MSTeams\ms-teams.exe";
+        let allowed = is_sanctioned(teams, Some("Microsoft Corporation"), &allow);
+        let denied = is_sanctioned(teams, Some("Microsoft Corporation"), &deny);
+        assert!(allowed && denied, "Teams matches both lists");
+        assert!(allowed && !denied == false, "effective trust must be false (deny wins)");
+
+        // Word: matches allow, not deny → stays trusted.
+        let word = r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE";
+        assert!(is_sanctioned(word, Some("Microsoft Corporation"), &allow));
+        assert!(!is_sanctioned(word, Some("Microsoft Corporation"), &deny));
     }
 
     // --- synced wire conversion + persistence round-trip -------------------
@@ -397,22 +470,35 @@ mod tests {
             ("name", ReaderMatch::Name("winword.exe".into())),
         ];
         for (mt, expected) in cases {
-            let sr = SyncedReader { match_type: mt.into(), value: match &expected {
+            let sr = SyncedReader { match_type: mt.into(), kind: ReaderKind::Allow, value: match &expected {
                 ReaderMatch::Publisher(v) | ReaderMatch::Path(v) | ReaderMatch::Name(v) => v.clone(),
             }};
             assert_eq!(sr.to_rule().to_match(), Some(expected));
         }
         // Unknown match type ⇒ no matcher (dropped).
-        let unknown = SyncedReader { match_type: "sha256".into(), value: "abc".into() };
+        let unknown = SyncedReader { match_type: "sha256".into(), value: "abc".into(), kind: ReaderKind::Allow };
         assert_eq!(unknown.to_rule().to_match(), None);
+    }
+
+    #[test]
+    fn synced_reader_carries_deny_kind_and_defaults_to_allow() {
+        // Explicit deny flows through to the rule.
+        let d = SyncedReader { match_type: "name".into(), value: "ms-teams.exe".into(), kind: ReaderKind::Deny };
+        assert_eq!(d.to_rule().kind, ReaderKind::Deny);
+        // A wire object with NO kind field (older server) deserializes as Allow.
+        let sr: SyncedReader = serde_json::from_str(r#"{"matchType":"name","value":"x.exe"}"#).unwrap();
+        assert_eq!(sr.kind, ReaderKind::Allow);
+        // An explicit "deny" on the wire deserializes correctly.
+        let sd: SyncedReader = serde_json::from_str(r#"{"matchType":"name","value":"x.exe","kind":"deny"}"#).unwrap();
+        assert_eq!(sd.kind, ReaderKind::Deny);
     }
 
     #[test]
     fn readers_persist_round_trips() {
         let readers = vec![
-            SyncedReader { match_type: "publisher".into(), value: "Microsoft Corporation".into() },
-            SyncedReader { match_type: "path".into(), value: r"C:\Program Files\Adobe".into() },
-            SyncedReader { match_type: "name".into(), value: "backup.exe".into() },
+            SyncedReader { match_type: "publisher".into(), value: "Microsoft Corporation".into(), kind: ReaderKind::Allow },
+            SyncedReader { match_type: "path".into(), value: r"C:\Program Files\Adobe".into(), kind: ReaderKind::Allow },
+            SyncedReader { match_type: "name".into(), value: "backup.exe".into(), kind: ReaderKind::Deny },
         ];
         let bytes = serialize_readers(&readers);
         let text = String::from_utf8(bytes.clone()).unwrap();

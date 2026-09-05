@@ -25,6 +25,10 @@ const router = express.Router();
 router.use(requireAuth);
 
 const MATCH_TYPES = new Set(['publisher', 'path', 'name']);
+// A rule is either an 'allow' (trusted reader) or a 'deny' override (blocked even
+// if an allow rule — e.g. a publisher — would otherwise trust it). Deny wins on
+// the endpoint. 'allow' is the default so an omitted kind is back-compatible.
+const KINDS = new Set(['allow', 'deny']);
 const INT4_MAX = 2147483647;
 
 // Unify separators to backslash and strip trailing separators.
@@ -99,6 +103,7 @@ function validateReader(body) {
 function readerJson(row) {
   return {
     id: row.id,
+    kind: row.kind || 'allow',
     matchType: row.match_type,
     value: row.value,
     note: row.note,
@@ -126,7 +131,7 @@ router.get('/', requirePermission('trusted_readers:read'), async (req, res, next
       params.push(Number(scope));
     }
     const { rows } = await pool.query(
-      `select tr.id, tr.match_type, tr.value, tr.note, tr.group_id, tr.created_by, tr.created_at,
+      `select tr.id, tr.kind, tr.match_type, tr.value, tr.note, tr.group_id, tr.created_by, tr.created_at,
               g.name as group_name
          from trusted_readers tr
          left join groups g on g.id = tr.group_id
@@ -147,6 +152,13 @@ router.post('/', requirePermission('trusted_readers:write'), async (req, res, ne
   const v = validateReader(body);
   if (!v.ok) return res.status(400).json({ error: v.error });
   const note = typeof body.note === 'string' ? body.note.slice(0, 1000) : null;
+
+  // kind: 'allow' (default) or 'deny' (override). An omitted kind stays 'allow'
+  // so existing callers are unaffected.
+  const kind = body.kind === undefined || body.kind === null || body.kind === '' ? 'allow' : String(body.kind).trim();
+  if (!KINDS.has(kind)) {
+    return res.status(400).json({ error: "kind must be 'allow' or 'deny'" });
+  }
 
   // groupId: absent/null/'' => global (NULL). Otherwise a positive integer group
   // (validated to exist below). Global rules apply to every group; a scoped rule
@@ -177,35 +189,41 @@ router.post('/', requirePermission('trusted_readers:write'), async (req, res, ne
     // together via coalesce(group_id,0)), so "winword.exe" and "WINWORD.EXE" collide
     // within a scope but a global + a per-group copy may coexist. The DB's functional
     // UNIQUE index (migration 013) is the hard backstop (23505 below).
+    // Dedup is scoped to (group bucket, kind, match_type, lower(value)) — matching
+    // the DB's functional unique index (migration 018). The same matcher may thus
+    // exist once as an allow and once as a deny (deny wins on the endpoint).
     const dup = await client.query(
       `select 1 from trusted_readers
-        where coalesce(group_id,0) = coalesce($1,0) and match_type = $2 and lower(value) = lower($3)
+        where coalesce(group_id,0) = coalesce($1,0) and kind = $2 and match_type = $3 and lower(value) = lower($4)
         limit 1`,
-      [groupId, v.matchType, v.value]
+      [groupId, kind, v.matchType, v.value]
     );
     if (dup.rows.length) {
       await client.query('rollback');
-      return res.status(409).json({ error: 'that reader is already on the allowlist' });
+      return res.status(409).json({ error: `that ${kind === 'deny' ? 'blocked application' : 'reader'} is already on the list` });
     }
 
     let rows;
     try {
       ({ rows } = await client.query(
-        `insert into trusted_readers (match_type, value, note, group_id, created_by)
-         values ($1, $2, $3, $4, $5)
-         returning id, match_type, value, note, group_id, created_by, created_at`,
-        [v.matchType, v.value, note, groupId, req.user.email]
+        `insert into trusted_readers (kind, match_type, value, note, group_id, created_by)
+         values ($1, $2, $3, $4, $5, $6)
+         returning id, kind, match_type, value, note, group_id, created_by, created_at`,
+        [kind, v.matchType, v.value, note, groupId, req.user.email]
       ));
     } catch (err) {
       if (err && err.code === '23505') {
         await client.query('rollback');
-        return res.status(409).json({ error: 'that reader is already on the allowlist' });
+        return res.status(409).json({ error: `that ${kind === 'deny' ? 'blocked application' : 'reader'} is already on the list` });
       }
       throw err;
     }
 
     const reader = readerJson(rows[0]);
-    await writeChainEntry(client, req.user.email, 'trusted_reader.create', String(reader.id), {
+    // Distinct audit actions for allow vs deny so the trail reads clearly.
+    const action = kind === 'deny' ? 'trusted_reader.deny.create' : 'trusted_reader.create';
+    await writeChainEntry(client, req.user.email, action, String(reader.id), {
+      kind,
       matchType: reader.matchType,
       value: reader.value,
       groupId,
@@ -242,14 +260,17 @@ router.delete('/:id', requirePermission('trusted_readers:write'), async (req, re
     await client.query('select pg_advisory_xact_lock($1)', [AUDIT_CHAIN_LOCK]);
     const { rows } = await client.query(
       `delete from trusted_readers where id = $1
-       returning id, match_type, value`,
+       returning id, kind, match_type, value`,
       [id]
     );
     if (rows.length === 0) {
       await client.query('rollback');
       return res.status(404).json({ error: 'reader not found' });
     }
-    await writeChainEntry(client, req.user.email, 'trusted_reader.delete', String(rows[0].id), {
+    const delKind = rows[0].kind || 'allow';
+    const delAction = delKind === 'deny' ? 'trusted_reader.deny.delete' : 'trusted_reader.delete';
+    await writeChainEntry(client, req.user.email, delAction, String(rows[0].id), {
+      kind: delKind,
       matchType: rows[0].match_type,
       value: rows[0].value,
     });

@@ -825,6 +825,7 @@ note = \"local OS trust\"
         let synced = vec![SyncedReader {
             match_type: "publisher".into(),
             value: "Microsoft Corporation".into(),
+            kind: crate::trustedreaders::ReaderKind::Allow,
         }];
 
         // MERGE (default / back-compat): union — the local rule survives alongside

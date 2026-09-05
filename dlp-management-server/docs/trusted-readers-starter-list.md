@@ -87,3 +87,48 @@ Use the **CN=** value (`Adobe Inc.`) as the `publisher` rule value.
 5. **The agent is self-trusted in the kernel** (its own I/O is skipped), so it
    does not strictly need an allowlist entry; the seeded path rule only covers
    auxiliary tooling shipped alongside it.
+
+## Blocked applications (deny-override)
+
+Publisher trust is coarse: trusting `Microsoft Corporation` (for Office, Explorer,
+Defender) also trusts every other app that vendor signs — including the built-in
+**exfiltration channels**: Teams, OneDrive, Edge, Outlook. A file a trusted app is
+allowed to read can be taken off the box by that same app (a Teams chat, a OneDrive
+sync, a browser upload). The **Blocked applications** list (console → Trusted
+applications → *Blocked applications*, `kind = deny`) carves those apps out of a
+broad publisher trust:
+
+> Effective trust on the endpoint = **matches an allow rule AND matches NO deny
+> rule.** A deny rule wins over any allow — so `Microsoft Corporation` stays
+> trusted for Office while `ms-teams.exe` is blocked.
+
+We deliberately **seed no deny rules** (an opinionated block could break a site
+that legitimately shares via Teams internally). Enable the ones a site wants from
+this list. **Prefer `name`** for a block — it catches the app across per-user
+(`%LOCALAPPDATA%`), machine-wide (`C:\Program Files`), and Store/MSIX
+(`C:\Program Files\WindowsApps`) installs, and a name rule's usual weakness
+(spoofing) barely matters for a *deny*.
+
+| App (why it's an exfil channel) | matchType | value |
+|---|---|---|
+| Microsoft Teams (new / MSIX) | name | `ms-teams.exe` |
+| Microsoft Teams (classic) | name | `Teams.exe` |
+| OneDrive (auto-sync to cloud) | name | `OneDrive.exe` |
+| Microsoft Edge (web upload) | name | `msedge.exe` |
+| Google Chrome (web upload) | name | `chrome.exe` |
+| Slack | name | `slack.exe` |
+| Dropbox | name | `Dropbox.exe` |
+| Google Drive | name | `GoogleDriveFS.exe` |
+| Outlook (classic desktop) | name | `outlook.exe` |
+
+### The security limit — state it to the customer
+
+Deny-override closes the **default** leak: the exfil app installed and run normally
+can no longer read sensitive files. It **cannot** stop a determined insider who
+**copies or renames a publisher-trusted binary** to escape a name/path deny while
+still matching the publisher allow — that residual hole is inherent to publisher
+trust. Fully closing it needs **application control (WDAC/AppLocker)** pinning what
+may run, or not trusting the publisher at all (drop the publisher allow and list
+only the specific signed apps a site needs). Blocking `OneDrive.exe` is the
+highest-value single entry: it auto-syncs to the cloud with no user action, making
+it a silent, continuous channel.

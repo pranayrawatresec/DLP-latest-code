@@ -211,28 +211,37 @@ use crate::trustedreaders::ReaderMatch;
 #[cfg(not(windows))]
 pub fn compute_untrusted_pids(
     _self_pid: u32,
-    _rules: &[ReaderMatch],
+    _allow: &[ReaderMatch],
+    _deny: &[ReaderMatch],
     _central: bool,
 ) -> Option<Vec<u32>> {
     Some(Vec::new())
 }
 
+/// Compute the untrusted-reader PID set from the split allow/deny matcher lists.
+/// Effective trust: a process is TRUSTED iff it matches an `allow` matcher AND
+/// matches NO `deny` matcher — so a deny-override wins over any allow (e.g. block
+/// Teams by name while `Microsoft Corporation` stays trusted for Office).
+///
 /// `central` = the console list is AUTHORITATIVE (read-deny policy
-/// `readersAuthority = central`, #9). It changes only the EMPTY-list behaviour:
-///   * `central == false` (merge/legacy) — an empty list means "not configured",
-///     so push nothing (fail toward availability), as before.
-///   * `central == true` — an empty list is a deliberate "trust no application"
-///     declaration, so EVERY non-agent process is untrusted (fail-secure lockdown).
-/// A NON-empty list behaves identically either way.
+/// `readersAuthority = central`, #9). It changes only the EMPTY-ALLOW behaviour:
+///   * `central == false` (merge/legacy) — an empty allow list means "not
+///     configured", so push nothing (fail toward availability), as before.
+///   * `central == true` — an empty allow list is a deliberate "trust no
+///     application" declaration, so EVERY non-agent process is untrusted
+///     (fail-secure lockdown). A NON-empty allow list behaves identically either
+///     way. Deny rules are always applied on top.
 #[cfg(windows)]
 pub fn compute_untrusted_pids(
     self_pid: u32,
-    rules: &[ReaderMatch],
+    allow: &[ReaderMatch],
+    deny: &[ReaderMatch],
     central: bool,
 ) -> Option<Vec<u32>> {
     use std::collections::HashSet;
 
-    // Empty list handling depends on WHY it is empty:
+    // Empty-ALLOW handling depends on WHY it is empty (deny rules don't change it —
+    // an empty allow means nothing is trusted regardless of deny):
     //   * merge/legacy (central == false): almost always "not configured / monitor
     //     mode" — pushing every PID would deny sensitive reads system-wide, so push
     //     nothing (fail toward AVAILABILITY) and warn to populate the list.
@@ -240,7 +249,7 @@ pub fn compute_untrusted_pids(
     //     "trust no application" — fall through so every non-agent process is
     //     untrusted (fail-secure LOCKDOWN). The agent's own binary stays trusted
     //     (own_exe below), so it never blocks itself.
-    if rules.is_empty() {
+    if allow.is_empty() {
         if central {
             tracing::warn!(
                 "read-deny CENTRAL authority with an EMPTY sanctioned-reader list — every \
@@ -288,7 +297,8 @@ pub fn compute_untrusted_pids(
     let elevated = SEDEBUG_OK.load(Ordering::Relaxed);
 
     let skip = |pid: u32| pid == 0 || pid == 4 || pid == self_pid;
-    let has_publisher_rule = rules.iter().any(ReaderMatch::needs_publisher);
+    let has_pub_allow = allow.iter().any(ReaderMatch::needs_publisher);
+    let has_pub_deny = deny.iter().any(ReaderMatch::needs_publisher);
 
     // Auto-sanction the agent's OWN installed binary, independent of the admin
     // allowlist. Sibling agent processes (notably the usb-monitor sealer, which
@@ -335,27 +345,52 @@ pub fn compute_untrusted_pids(
             continue;
         }
 
-        // Cheap matchers first (path/name — no signature work).
-        let cheap_ok = rules
+        // Deny-override wins over any allow. Cheap deny matchers (path/name) first
+        // — no signature work — so a name deny like "ms-teams.exe" blocks the app
+        // immediately even though a publisher allow would otherwise trust it.
+        let cheap_denied = deny
             .iter()
             .filter(|r| !r.needs_publisher())
             .any(|r| r.matches(&image, None));
-        if cheap_ok {
+        if cheap_denied {
+            set.insert(pid);
             continue;
         }
 
-        // Only verify the Authenticode signer when a publisher rule might still
-        // sanction it — bounds signature verification to the processes the cheap
-        // rules didn't already clear (and it is cached per image path).
-        if has_publisher_rule {
-            let publisher = cached_publisher(&image);
-            let pub_ok = rules
+        // Cheap allow matchers (path/name).
+        let cheap_allowed = allow
+            .iter()
+            .filter(|r| !r.needs_publisher())
+            .any(|r| r.matches(&image, None));
+
+        // Resolve the Authenticode signer at most once, and only when it can still
+        // change the verdict: a publisher DENY could override even a cheap allow, or
+        // (when not cheap-allowed) a publisher ALLOW could trust it. Cached per image.
+        let need_signer = has_pub_deny || (!cheap_allowed && has_pub_allow);
+        let publisher = if need_signer { cached_publisher(&image) } else { None };
+
+        // Publisher deny-override.
+        if has_pub_deny
+            && deny
                 .iter()
                 .filter(|r| r.needs_publisher())
-                .any(|r| r.matches(&image, publisher.as_deref()));
-            if pub_ok {
-                continue;
-            }
+                .any(|r| r.matches(&image, publisher.as_deref()))
+        {
+            set.insert(pid);
+            continue;
+        }
+
+        // Trusted if allowed by a cheap rule or a publisher rule (and not denied above).
+        if cheap_allowed {
+            continue;
+        }
+        if has_pub_allow
+            && allow
+                .iter()
+                .filter(|r| r.needs_publisher())
+                .any(|r| r.matches(&image, publisher.as_deref()))
+        {
+            continue;
         }
 
         set.insert(pid);
@@ -1166,7 +1201,7 @@ mod tests {
             ReaderMatch::Publisher("Microsoft Corporation".into()),
             ReaderMatch::Path(format!(r"{sysroot}")),
         ];
-        let untrusted = compute_untrusted_pids(std::process::id(), &rules, false)
+        let untrusted = compute_untrusted_pids(std::process::id(), &rules, &[], false)
             .expect("enumeration succeeded");
         eprintln!(
             "[probe] compute_untrusted_pids(Microsoft + {sysroot}) -> {} untrusted PID(s)",
@@ -1183,14 +1218,14 @@ mod tests {
     #[test]
     fn empty_allowlist_merge_pushes_nothing_central_locks_down() {
         // MERGE + empty: unconfigured => enforce nothing.
-        let merge = compute_untrusted_pids(std::process::id(), &[], false)
+        let merge = compute_untrusted_pids(std::process::id(), &[], &[], false)
             .expect("enumeration succeeded");
         assert!(merge.is_empty(), "merge + empty list must push NO pids");
 
         // CENTRAL + empty: authoritative "trust nothing" => every non-agent process
         // is untrusted. There are always other processes on the machine, so the set
         // is non-empty — and never contains self / 0 / 4.
-        let central = compute_untrusted_pids(std::process::id(), &[], true)
+        let central = compute_untrusted_pids(std::process::id(), &[], &[], true)
             .expect("enumeration succeeded");
         assert!(
             !central.is_empty(),
