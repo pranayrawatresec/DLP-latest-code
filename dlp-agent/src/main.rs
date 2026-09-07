@@ -22,8 +22,8 @@ mod service;
 // modules at the crate root so the binary submodules keep addressing them as
 // `crate::config` / `crate::storage`.
 use dlp_agent::{
-    browser_host, clipboard, config, crypto, decrypt, detect, exfil, netfilter, notify,
-    readdenypolicy, storage, supervise, trustdest, trustedreaders, trustsync, usb,
+    browser_host, clipboard, clippolicy, config, crypto, decrypt, detect, exfil, netfilter, notify,
+    readdenypolicy, storage, supervise, trustdest, trustedreaders, trustsync, usb, usersession,
 };
 
 use anyhow::{Context, Result};
@@ -139,6 +139,7 @@ fn run() -> Result<()> {
         "usb-monitor" => cmd_usb_monitor(&cfg, &storage, &args)?,
         "usb-guard" => cmd_usb_guard(&cfg, &storage, &args)?,
         "clipboard-monitor" => cmd_clipboard_monitor(&cfg, &storage, &args)?,
+        "clipboard-agent" => cmd_clipboard_agent(&cfg, &storage)?,
         "net-monitor" => cmd_net_monitor(&cfg, &storage, &args)?,
         "browser-host" => cmd_browser_host(&cfg, &storage, &args)?,
         "decrypt" => cmd_decrypt(&cfg, &storage, &args)?,
@@ -786,6 +787,10 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
     // driver knobs + volume attach (no CLI), and override the local [kguard] fields
     // so the console is the single source of truth for read-deny.
     let policy = checkin::sync_read_deny_policy(cfg, storage);
+    // Clipboard policy: pull + cache so the per-session helper (spawned below) reads
+    // the current mode. The helper applies it; run_endpoint (Session 0) can't watch
+    // the user's clipboard itself.
+    let _ = checkin::sync_clipboard_policy(cfg, storage);
     let effective = cfg
         .with_synced_destinations(&synced)
         .with_synced_readers(&readers, policy.readers_central())
@@ -971,6 +976,9 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                 let synced = checkin::load_synced_destinations(&storage);
                 let readers = checkin::sync_trusted_readers(&base_cfg, &storage);
                 let policy = checkin::sync_read_deny_policy(&base_cfg, &storage);
+                // Refresh the clipboard policy cache so the session supervisor picks
+                // up console changes (off<->monitor<->enforce) and respawns the helper.
+                let _ = checkin::sync_clipboard_policy(&base_cfg, &storage);
                 let new_effective = base_cfg
                     .with_synced_destinations(&synced)
                     .with_synced_readers(&readers, policy.readers_central())
@@ -983,6 +991,78 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                 tracing::info!("resynced trusted config — guard + sealer will use it live");
             }
         }));
+    }
+
+    // (e) CLIPBOARD SESSION SUPERVISOR — the DLPAgent service runs in Session 0,
+    // which has its own clipboard, NOT the interactive user's. So spawn the
+    // clipboard helper INTO the user session (WTS + CreateProcessAsUserW) and keep
+    // it alive: relaunch on exit (logoff/crash), on session change, or when the
+    // policy changes (off<->monitor<->enforce, block_images, fail_block). The child
+    // reads the cached clipboard policy the check-in/resync workers keep fresh.
+    #[cfg(windows)]
+    {
+        let stop_w = stop.clone();
+        let state_dir = state_dir.clone();
+        handles.push(supervised_thread(
+            "clipboard-session",
+            stop.clone(),
+            Duration::from_secs(5),
+            move || {
+                let storage = Storage::new(state_dir.clone());
+                let mut child: Option<usersession::SessionChild> = None;
+                // (session, mode, block_images, fail_block) the live child was started with.
+                let mut applied: Option<(u32, clippolicy::ClipboardMode, bool, bool)> = None;
+                loop {
+                    if stop_w.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let policy = checkin::load_clipboard_policy(&storage);
+                    let session = usersession::active_console_session();
+
+                    // Reap a child that has exited (logoff / crash).
+                    if let Some(c) = &child {
+                        if !c.is_alive() {
+                            child = None;
+                            applied = None;
+                        }
+                    }
+
+                    if policy.is_off() || session.is_none() {
+                        // No interactive user, or protection off — ensure no child.
+                        if let Some(c) = child.take() {
+                            c.terminate();
+                            applied = None;
+                        }
+                    } else {
+                        let sess = session.unwrap();
+                        let want = (sess, policy.mode, policy.block_images, policy.fail_block);
+                        let stale = child.is_none()
+                            || applied != Some(want)
+                            || child.as_ref().map(|c| c.session) != Some(sess);
+                        if stale {
+                            if let Some(c) = child.take() {
+                                c.terminate();
+                            }
+                            match usersession::spawn_in_session(sess, &["clipboard-agent"]) {
+                                Ok(c) => {
+                                    tracing::info!(session = sess, mode = %policy.mode, "spawned clipboard helper in user session");
+                                    child = Some(c);
+                                    applied = Some(want);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, session = sess, "could not spawn clipboard helper (will retry)");
+                                    applied = None;
+                                }
+                            }
+                        }
+                    }
+                    sleep_interruptible(5, &stop_w);
+                }
+                if let Some(c) = child.take() {
+                    c.terminate();
+                }
+            },
+        ));
     }
 
     // Block until stop, then let the cooperative workers wind down.
@@ -1158,6 +1238,55 @@ fn cmd_clipboard_monitor(cfg: &Config, storage: &Storage, args: &[String]) -> Re
     };
 
     clipboard::run_monitor(cfg, storage, enforce, sink);
+    Ok(())
+}
+
+/// `clipboard-agent`: the per-session clipboard helper the DLPAgent service spawns
+/// into the interactive user session (Session 0 can't see the user's clipboard).
+/// It reads the console-managed clipboard policy from the local cache and applies
+/// it — `off` idles, `monitor` audits a sensitive copy, `enforce` clears the
+/// clipboard so the paste yields nothing. Incidents flow through the same mTLS +
+/// offline-queue path as the manual `clipboard-monitor`. The Session-0 supervisor
+/// restarts this child when the policy changes or the session changes.
+fn cmd_clipboard_agent(cfg: &Config, storage: &Storage) -> Result<()> {
+    // Console policy is the single source of truth; override the local [clipboard].
+    let policy = checkin::load_clipboard_policy(storage);
+    let mut eff = cfg.clone();
+    policy.apply_to_config(&mut eff);
+    let cfg = &eff;
+
+    if policy.is_off() {
+        tracing::info!("clipboard-agent: policy is off — idle (no monitoring)");
+        return Ok(());
+    }
+    tracing::info!(mode = %policy.mode, block_images = policy.block_images, "clipboard-agent: starting per-session monitor");
+
+    let queue = usb::queue::IncidentQueue::new(&cfg.state_dir);
+    if storage.has_identity() && !queue.is_empty() {
+        let flushed = queue.flush(|body| post_incident_body(cfg, storage, body).map(|_| ()));
+        if flushed > 0 {
+            tracing::info!(flushed, "flushed queued clipboard incidents");
+        }
+    }
+    let sink = |inc: UsbIncident| match incident_wire_body(cfg, &inc) {
+        Some(body) => {
+            if storage.has_identity() {
+                match post_incident_body(cfg, storage, &body) {
+                    Ok(id) => tracing::info!(incident_id = %id, kind = ?inc.kind, "clipboard incident reported"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "clipboard incident post failed — queuing locally");
+                        let _ = queue.enqueue(&body);
+                    }
+                }
+            } else {
+                let _ = queue.enqueue(&body);
+            }
+        }
+        None => tracing::info!(kind = ?inc.kind, "clipboard metadata incident (no verdict; not posted)"),
+    };
+
+    // enforce=true only in Enforce mode; Monitor classifies + audits but allows.
+    clipboard::run_monitor(cfg, storage, policy.enforce(), sink);
     Ok(())
 }
 

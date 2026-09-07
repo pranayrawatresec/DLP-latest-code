@@ -21,5 +21,7 @@ pub mod supervise;
 pub mod trustdest;
 pub mod trustedreaders;
 pub mod readdenypolicy;
+pub mod clippolicy;
+pub mod usersession;
 pub mod trustsync;
 pub mod usb;

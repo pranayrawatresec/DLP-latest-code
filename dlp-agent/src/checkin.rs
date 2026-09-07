@@ -2,6 +2,7 @@
 //! certificate, refreshes state, and (Phase 3) will receive the licensed
 //! entitlement token and signed policy bundle.
 use crate::readdenypolicy::{self, ReadDenyPolicy};
+use crate::clippolicy::ClipboardPolicy;
 use crate::trustedreaders::{self, SyncedReader};
 use crate::trustsync::{self, SyncedDestination, TrustedConfig};
 use crate::{client, config::Config, storage::Storage};
@@ -279,6 +280,64 @@ pub fn load_read_deny_policy(storage: &Storage) -> ReadDenyPolicy {
     match storage.load_read_deny_policy() {
         Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         None => ReadDenyPolicy::default(),
+    }
+}
+
+/// Pull the console-managed CLIPBOARD policy and persist it (metadata only) so the
+/// per-session helper keeps applying it if the server is briefly unreachable
+/// (fail-soft to the last-persisted policy — default off when never synced).
+pub fn sync_clipboard_policy(cfg: &Config, storage: &Storage) -> ClipboardPolicy {
+    match fetch_clipboard_policy(cfg, storage) {
+        Ok(policy) => {
+            if let Ok(json) = serde_json::to_vec(&policy) {
+                if let Err(e) = storage.store_clipboard_policy(&json) {
+                    tracing::warn!(error = %e, "could not persist clipboard policy");
+                }
+            }
+            tracing::info!(
+                mode = %policy.mode,
+                block_images = policy.block_images,
+                "synced clipboard policy from server"
+            );
+            policy
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "clipboard policy sync failed — using last-persisted policy (offline)"
+            );
+            load_clipboard_policy(storage)
+        }
+    }
+}
+
+fn fetch_clipboard_policy(cfg: &Config, storage: &Storage) -> Result<ClipboardPolicy> {
+    #[derive(Deserialize)]
+    struct PolicyResponse {
+        policy: ClipboardPolicy,
+    }
+    let (identity_pem, ca_pem) = storage.load_identity()?;
+    let client = client::checkin_client(&ca_pem, &identity_pem)?;
+    let resp = client
+        .get(cfg.clipboard_policy_url())
+        .send()
+        .context("clipboard-policy request failed")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        bail!("clipboard-policy refused [{status}]: {body}");
+    }
+    Ok(resp
+        .json::<PolicyResponse>()
+        .context("parsing clipboard-policy response")?
+        .policy)
+}
+
+/// The last-persisted clipboard policy, or the default (off) when never synced.
+pub fn load_clipboard_policy(storage: &Storage) -> ClipboardPolicy {
+    match storage.load_clipboard_policy() {
+        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        None => ClipboardPolicy::default(),
     }
 }
 

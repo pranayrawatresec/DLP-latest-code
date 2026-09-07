@@ -16,6 +16,7 @@ var incidentsRouter = require('./routes/incidents');
 var encryptionRouter = require('./routes/encryption');
 var trustedReadersRouter = require('./routes/trustedReaders');
 var readDenyPolicyRouter = require('./routes/readDenyPolicy');
+var clipboardPolicyRouter = require('./routes/clipboardPolicy');
 var groupsRouter = require('./routes/groups');
 var { attachUser } = require('./middleware/auth');
 
@@ -48,6 +49,7 @@ app.use('/api/incidents', incidentsRouter);
 app.use('/api/encryption', encryptionRouter);
 app.use('/api/trusted-readers', trustedReadersRouter);
 app.use('/api/read-deny-policy', readDenyPolicyRouter);
+app.use('/api/clipboard-policy', clipboardPolicyRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

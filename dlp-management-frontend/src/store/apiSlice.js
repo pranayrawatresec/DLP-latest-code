@@ -19,7 +19,7 @@ const baseQuery = async (args, apiCtx, extra) => {
 export const apiSlice = createApi({
   reducerPath: 'api',
   baseQuery,
-  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy', 'Group'],
+  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy', 'ClipboardPolicy', 'Group'],
   endpoints: (b) => ({
     // Enrollment tokens
     getEnrollmentTokens: b.query({
@@ -196,6 +196,19 @@ export const apiSlice = createApi({
       invalidatesTags: ['ReadDenyPolicy'],
     }),
 
+    // Endpoint clipboard policy — the per-session helper the DLPAgent service spawns
+    // applies it (monitor = audit a sensitive copy, enforce = clear the clipboard).
+    getClipboardPolicy: b.query({
+      query: () => '/clipboard-policy',
+      transformResponse: (res) => res?.policy || null,
+      providesTags: ['ClipboardPolicy'],
+    }),
+    updateClipboardPolicy: b.mutation({
+      // body: { mode, blockImages, failBlock }
+      query: (body) => ({ url: '/clipboard-policy', method: 'PUT', body }),
+      invalidatesTags: ['ClipboardPolicy'],
+    }),
+
     // Endpoint groups — per-machine/per-group policy targeting. The Default group
     // holds every unassigned machine and uses the global read-deny policy.
     getGroups: b.query({
@@ -278,6 +291,8 @@ export const {
   useDeleteTrustedReaderMutation,
   useGetReadDenyPolicyQuery,
   useUpdateReadDenyPolicyMutation,
+  useGetClipboardPolicyQuery,
+  useUpdateClipboardPolicyMutation,
   useGetGroupsQuery,
   useCreateGroupMutation,
   useUpdateGroupMutation,

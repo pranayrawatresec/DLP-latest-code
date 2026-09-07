@@ -714,6 +714,10 @@ impl Config {
         format!("{}/agent/read-deny-policy", self.server_url.trim_end_matches('/'))
     }
 
+    pub fn clipboard_policy_url(&self) -> String {
+        format!("{}/agent/clipboard-policy", self.server_url.trim_end_matches('/'))
+    }
+
     /// Produce an effective config whose `[usb]` section has the synced
     /// trusted destinations merged in (encrypt-on-write M6). The
     /// console-authored whitelist takes precedence (first-match-wins) and any

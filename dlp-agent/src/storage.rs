@@ -15,6 +15,7 @@ const KEYRING_FILE: &str = "keyring.sealed"; // DPAPI-sealed (machine scope) KEK
 const TRUSTED_DEST_FILE: &str = "trusted-destinations.json"; // METADATA ONLY — never key bytes
 const TRUSTED_READERS_FILE: &str = "trusted-readers.json"; // sanctioned-reader allowlist (metadata)
 const READ_DENY_POLICY_FILE: &str = "read-deny-policy.json"; // endpoint read-deny policy (metadata)
+const CLIPBOARD_POLICY_FILE: &str = "clipboard-policy.json"; // endpoint clipboard policy (metadata)
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentMeta {
@@ -182,6 +183,19 @@ impl Storage {
     /// Raw bytes of the last-persisted read-deny policy, or `None` when never synced.
     pub fn load_read_deny_policy(&self) -> Option<Vec<u8>> {
         std::fs::read(self.path(READ_DENY_POLICY_FILE)).ok()
+    }
+
+    /// Persist the last-synced clipboard policy (metadata only) so the per-session
+    /// helper keeps applying it if the server is briefly unreachable (fail-secure).
+    pub fn store_clipboard_policy(&self, json: &[u8]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        std::fs::write(self.path(CLIPBOARD_POLICY_FILE), json).context("writing clipboard policy")
+    }
+
+    /// Raw bytes of the last-persisted clipboard policy, or `None` when never synced.
+    pub fn load_clipboard_policy(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.path(CLIPBOARD_POLICY_FILE)).ok()
     }
 }
 

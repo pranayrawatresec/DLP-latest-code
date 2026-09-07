@@ -11,6 +11,7 @@ import ProtectedDocuments from './pages/ProtectedDocuments'
 import TrustedDestinations from './pages/TrustedDestinations'
 import TrustedReaders from './pages/TrustedReaders'
 import ReadDenyPolicy from './pages/ReadDenyPolicy'
+import ClipboardPolicy from './pages/ClipboardPolicy'
 import Groups from './pages/Groups'
 import AppLayout from './components/layout/AppLayout'
 import ProtectedRoute from './components/ProtectedRoute'
@@ -60,6 +61,10 @@ function App() {
         <Route
           path="read-deny-policy"
           element={<RequirePermission permission="read_deny_policy:read"><ReadDenyPolicy /></RequirePermission>}
+        />
+        <Route
+          path="clipboard-policy"
+          element={<RequirePermission permission="clipboard_policy:read"><ClipboardPolicy /></RequirePermission>}
         />
         <Route
           path="groups"

@@ -426,6 +426,36 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
   }
 });
 
+// --- GET /agent/clipboard-policy ---------------------------------------
+// The endpoint clipboard policy (mode / block-images / fail behaviour). The
+// per-session clipboard helper the DLPAgent service spawns applies this: monitor
+// = classify + audit a sensitive copy, enforce = clear the clipboard so the paste
+// yields nothing. Metadata only, no secrets, and NEVER any clipboard content.
+app.get('/agent/clipboard-policy', async (req, res, next) => {
+  try {
+    const agent = await requireKnownAgent(req, res, 'agent-clip');
+    if (!agent) return;
+
+    // A single global policy (id=1) today; group targeting can mirror read-deny later.
+    const { rows } = await pool.query('select * from clipboard_policy where id = 1');
+    const row = rows[0] || { mode: 'off', block_images: false, fail_block: true };
+    const policy = {
+      mode: row.mode,
+      blockImages: row.block_images ?? false,
+      failBlock: row.fail_block ?? true,
+    };
+
+    await audit('agent-clip', 'agent.clipboard_policy_delivered', agent.id, {
+      mode: policy.mode,
+      blockImages: policy.blockImages,
+    });
+
+    return res.status(200).json({ policy });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- POST /agent/incidents ---------------------------------------------
 // An agent reports a detection. The verdict carries hashes and ids ONLY —
 // never captured file content (evidence blobs are a later phase). Identity
