@@ -1,0 +1,41 @@
+-- 022_ml_policy_deny_unclassified.sql — the "deny what the classifier has not seen
+-- yet" posture. One column on the ml_policy singleton, delivered to agents at
+-- GET /agent/ml-policy alongside the rest of the ML policy.
+--
+-- WHAT IT DOES
+--   The agent now keeps a local cache of what the model said about a file, keyed by
+--   the SHA-256 of the first 4 MiB the kernel already hands it. Three things fill
+--   that cache: a watcher classifies a file when it is closed after writing, a
+--   throttled discovery walker backfills what predates the agent, and the write
+--   path stores the result it computes anyway. The kernel READ path — the one an
+--   exfil process (RustDesk/AnyDesk/RDP, an untrusted reader) travels — only ever
+--   LOOKS UP that cache; it never runs inference, because it has a 500 ms budget and
+--   a single-threaded message loop for the whole machine.
+--
+--   deny_unclassified decides what a cache MISS means on that read path:
+--     false (DEFAULT) — behave exactly as the agent does today: decide on IDM/EDM
+--                       fingerprints alone and mark the ML block 'not_classified'.
+--                       The miss is queued for background classification, so the
+--                       NEXT read of the same bytes is answered from the cache.
+--                       No new denials, ever.
+--     true            — return NO VERDICT to the driver, which denies the read per
+--                       its fail-secure setting and caches nothing. The queued
+--                       classification then makes the retry authoritative.
+--
+-- WHY IT DEFAULTS false
+--   With it on, the FIRST read of every file the classifier has not met yet is
+--   denied to an exfil-channel process. On a freshly deployed endpoint that is every
+--   legacy file on the disk — an estate-wide outage dressed as a security control.
+--   It is safe only AFTER the endpoint's discovery sweep has completed and coverage
+--   has been verified in the console, which is why it ships off and the console
+--   makes turning it on a deliberate, confirmed action.
+--
+--   It is also inert while the ML policy itself is inert (disabled, or no class
+--   marked sensitive): the read path is byte-identical to the pre-cache agent then,
+--   whatever this flag says. Fail-secure never means fail-loud-on-day-one.
+--
+-- Metadata only — a boolean. Applied inside a transaction by db/migrate.js, so no
+-- BEGIN/COMMIT here.
+
+ALTER TABLE ml_policy
+  ADD COLUMN deny_unclassified BOOLEAN NOT NULL DEFAULT false;

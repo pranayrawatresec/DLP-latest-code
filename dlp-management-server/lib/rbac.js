@@ -19,6 +19,7 @@ const ROLE_PERMISSIONS = {
     'trusted_readers:read', // review the sanctioned-reader allowlist (read-deny policy)
     'read_deny_policy:read', // review the endpoint read-deny policy (mode/scope/posture)
     'clipboard_policy:read', // review the endpoint clipboard policy (mode/images/fail)
+    'ml_policy:read', // review the ML classifier policy (classes/thresholds/posture)
     'groups:read', // view endpoint groups (targeting) + assign machines (agents.manage)
   ],
   policy_author: [
@@ -34,6 +35,8 @@ const ROLE_PERMISSIONS = {
     'read_deny_policy:write',
     'clipboard_policy:read', // the endpoint clipboard policy is policy
     'clipboard_policy:write',
+    'ml_policy:read', // which document classes are sensitive is policy
+    'ml_policy:write',
     'groups:read', // endpoint groups are a policy-targeting construct
     'groups:write', // create/rename/delete groups + author their per-group policy
   ],
@@ -54,6 +57,7 @@ const ROLE_PERMISSIONS = {
     'trusted_readers:read', // review the sanctioned-reader allowlist (metadata only)
     'read_deny_policy:read', // review the endpoint read-deny policy (metadata only)
     'clipboard_policy:read', // review the endpoint clipboard policy (metadata only)
+    'ml_policy:read', // review the ML classifier policy (metadata only)
     'groups:read', // review endpoint groups + their targeting (metadata only)
   ],
 };

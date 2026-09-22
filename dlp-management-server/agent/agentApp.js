@@ -18,6 +18,11 @@
 //                         (docs/index-bundle-format.md).
 //   POST /agent/incidents mTLS. An agent reports a detection verdict
 //                         (hashes/ids only — never captured content).
+//   GET  /agent/ml-policy mTLS. The ML document-classification policy (the
+//                         second, independent detection signal next to
+//                         IDM/EDM fingerprinting): which of the 29 business
+//                         function classes an admin marked sensitive, and at
+//                         what confidence. Metadata only — ids and numbers.
 // =====================================================================
 const fs = require('fs');
 const path = require('path');
@@ -39,6 +44,15 @@ app.use(express.json({ limit: '64kb' }));
 
 function str(v, max = 255) {
   return v == null ? null : String(v).slice(0, max);
+}
+
+// pg returns NUMERIC as a STRING (it will not fit an IEEE double losslessly in
+// the general case, so node-postgres refuses to guess). Our confidences are
+// NUMERIC(4,3) — three decimals, always exactly representable — so converting
+// is safe here, and it is REQUIRED: the agent parses these as JSON numbers, and
+// "0.800" on the wire would break a `confidence >= threshold` comparison.
+function num(v) {
+  return v == null ? null : Number(v);
 }
 
 // --- Org Root Key + KEK unwrap (Node built-in crypto only) -------------
@@ -456,6 +470,90 @@ app.get('/agent/clipboard-policy', async (req, res, next) => {
   }
 });
 
+// --- GET /agent/ml-policy ----------------------------------------------
+// The ML document-classification policy. The agent carries an ONNX classifier
+// that predicts ONE of 29 business-function classes for a document; this route
+// tells it WHICH of those classes the site treats as sensitive and at what
+// confidence. That signal is ORed with IDM/EDM fingerprinting on the endpoint —
+// it can only ADD sensitivity, never downgrade a fingerprint hit.
+//
+// Metadata only: label ids, numbers and booleans. No secrets, no model file, no
+// document text ever crosses this surface (independent of the Org Root Key).
+//
+// Fail-secure shape: with enabled=false, or with an EMPTY labels array, the ML
+// signal is INERT on the endpoint — so a missing singleton row (or an admin who
+// enabled the feature before choosing classes) can never start blocking. The
+// agent persists this response and keeps applying it when we are unreachable.
+// denyUnclassified rides the same envelope and is inert under those same
+// conditions; it defaults FALSE everywhere it can be absent (see below).
+app.get('/agent/ml-policy', async (req, res, next) => {
+  try {
+    const agent = await requireKnownAgent(req, res, 'agent-ml');
+    if (!agent) return;
+
+    // A single global policy (id=1) today; group targeting can mirror read-deny
+    // later. The fallback mirrors the migration defaults but with the safest
+    // possible reading: disabled => the agent runs no ML at all.
+    const { rows } = await pool.query('select * from ml_policy where id = 1');
+    const row = rows[0] || {
+      enabled: false, min_confidence: 0.700, action: 'audit',
+      fail_block: true, deny_unclassified: false, model_version: 'V6.2.01',
+    };
+
+    // The classes an admin marked sensitive, in the model's FROZEN logits order
+    // (ml_labels.idx) so the agent's list is stable and diffable across syncs.
+    // min_confidence is NULL when the label inherits the policy-wide floor —
+    // delivered as null, resolved agent-side, never silently substituted here.
+    const labRes = await pool.query(
+      `select s.label_id, s.min_confidence
+         from ml_sensitive_labels s
+         join ml_labels l on l.id = s.label_id
+        order by l.idx`
+    );
+
+    const policy = {
+      enabled: row.enabled ?? false,
+      // NUMERIC arrives as a string from pg — convert (see num() above).
+      minConfidence: num(row.min_confidence) ?? 0.7,
+      action: row.action || 'audit',
+      failBlock: row.fail_block ?? true,
+      // The posture switch for the kernel READ path. That path has a 500 ms reply
+      // budget on a single-threaded loop, so it never runs inference — it looks the
+      // file's content hash up in the agent's classification cache. This says what
+      // a MISS means: false (default) = decide on fingerprints alone exactly as
+      // before and queue the file for background classification; true = reply NO
+      // VERDICT so the driver denies the read and the queued classification makes
+      // the retry authoritative. Delivered explicitly rather than defaulted
+      // agent-side: an old row, or a row we could not read, must read as FALSE
+      // here — the failure mode of this switch is a denial storm, not a leak.
+      denyUnclassified: row.deny_unclassified ?? false,
+      // The label space + graph this policy was authored against. An agent
+      // carrying a DIFFERENT model must not silently reuse these thresholds:
+      // index 6 only means FIN under this version.
+      modelVersion: row.model_version || 'V6.2.01',
+      labels: labRes.rows.map((r) => ({
+        id: r.label_id,
+        minConfidence: num(r.min_confidence),
+      })),
+    };
+    // updatedBy/updatedAt are console provenance — deliberately NOT on this
+    // surface: an endpoint has no business learning admin identities.
+
+    await audit('agent-ml', 'agent.ml_policy_delivered', agent.id, {
+      enabled: policy.enabled,
+      labelCount: policy.labels.length,
+      // Which endpoints actually RECEIVED the deny posture, and when. The console
+      // save is audited separately; this is the delivery half, and it is what an
+      // auditor reads when an estate starts denying first reads.
+      denyUnclassified: policy.denyUnclassified,
+    });
+
+    return res.status(200).json({ policy });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // --- POST /agent/incidents ---------------------------------------------
 // An agent reports a detection. The verdict carries hashes and ids ONLY —
 // never captured file content (evidence blobs are a later phase). Identity
@@ -487,8 +585,26 @@ app.post('/agent/incidents', async (req, res, next) => {
     const sealedSha256 = str(body.sealedSha256, 64);
     const idmN = Array.isArray(verdict.idm) ? verdict.idm.length : 0;
     const edmN = Array.isArray(verdict.edm) ? verdict.edm.length : 0;
-    const detectionType =
+    const fingerprintType =
       idmN && edmN ? 'idm+edm' : edmN ? 'edm' : idmN ? 'idm' : null;
+    // The ML classifier is the SECOND, independent signal. It contributes only
+    // when the agent actually ran it (status 'ok') AND its own fusion said the
+    // predicted class is one the admin marked sensitive at or above threshold —
+    // we badge what the endpoint decided, we do not re-derive it here (the agent
+    // holds the policy that was in force at detection time). Anything else
+    // ('unavailable' / 'skipped' / 'empty', or sensitive=false) is not a hit.
+    const mlHit = !!(verdict.ml && verdict.ml.status === 'ok' && verdict.ml.sensitive === true);
+    // OR, never AND: fingerprinting cannot see an unregistered document and the
+    // model cannot name which document leaked. A verdict with NO ml key — every
+    // agent shipped before this feature — yields exactly today's three values,
+    // which is the point: 'idm' | 'edm' | 'idm+edm' | null are unchanged.
+    const detectionType = mlHit
+      ? (fingerprintType ? `${fingerprintType}+ml` : 'ml')
+      : fingerprintType;
+    // detection_incidents.detection_type is plain `text` with no length or CHECK
+    // constraint (migration 005), so the longer 'idm+edm+ml' stores as-is — no
+    // truncation, no migration needed. verdict_json is JSONB, so the additive
+    // `ml` block persists verbatim with no schema change either.
 
     const { rows } = await pool.query(
       `insert into detection_incidents

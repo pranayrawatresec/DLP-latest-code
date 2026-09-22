@@ -21,6 +21,7 @@
     "test:encryption": "node test/encryption.test.js",
     "test:readers": "node test/trustedReaders.test.js",
     "test:groups": "node test/groups.test.js",
+    "test:mlpolicy": "node test/mlPolicy.test.js",
     "e2e:detection": "node scripts/detection-e2e.js"
   },
   "dependencies": {
