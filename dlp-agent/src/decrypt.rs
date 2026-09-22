@@ -193,6 +193,7 @@ fn wire_verdict(file_name: &str, file_sha256: &str) -> Verdict {
         extraction: Extraction::Ok { format: "dlpenc".into() },
         idm: Vec::new(),
         edm: Vec::new(),
+        ml: None,
     }
 }
 

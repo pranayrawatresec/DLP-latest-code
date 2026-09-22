@@ -9,9 +9,10 @@
 //! Each entry stores the exact JSON POST body (spec §4 wire shape). We persist
 //! the serialized body rather than a typed struct because `detect::Verdict` is
 //! serialize-only; storing the ready-to-POST bytes also means a flush re-sends
-//! byte-for-byte what would have been sent live. Writes use the temp-file→rename
-//! pattern (mirroring `Storage::store_index_bundle`) so a crash mid-write can't
-//! corrupt the queue.
+//! byte-for-byte what would have been sent live. Each entry is written with
+//! [`crate::atomicfile::write_atomic`] — flushed to disk before its name
+//! appears — so a crash or power cut can lose an incident that was mid-write but
+//! can never leave a torn one in the queue.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -84,10 +85,9 @@ impl IncidentQueue {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let stem = format!("{now:039}-{}", std::process::id());
-        let tmp = self.dir.join(format!("{stem}.tmp"));
         let dest = self.dir.join(format!("{stem}.json"));
-        std::fs::write(&tmp, json_body).context("writing queued incident (temp)")?;
-        std::fs::rename(&tmp, &dest).context("committing queued incident")?;
+        crate::atomicfile::write_atomic(&dest, json_body.as_bytes())
+            .context("committing queued incident")?;
         Ok(())
     }
 
@@ -105,6 +105,21 @@ impl IncidentQueue {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            // An entry that is not JSON can never be delivered — the server
+            // rejects it every time, and because a failed send STOPS the flush,
+            // it would block every incident queued behind it, forever. Torn
+            // entries can only come from a build before queue writes were made
+            // atomic; set them aside (kept for forensics, out of the queue) so
+            // the rest of the audit trail reaches the console.
+            if serde_json::from_str::<serde_json::Value>(&body).is_err() {
+                let aside = path.with_extension("corrupt");
+                let _ = std::fs::rename(&path, &aside);
+                tracing::warn!(
+                    bytes = body.len(),
+                    "queued incident is not valid JSON (torn by a crash) — set aside so the rest of the queue can flush"
+                );
+                continue;
+            }
             match send(&body) {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&path);
@@ -155,8 +170,8 @@ mod tests {
     fn flush_stops_and_retains_on_failure() {
         let base = temp_dir("retain");
         let q = IncidentQueue::new(&base);
-        q.enqueue("a").unwrap();
-        q.enqueue("b").unwrap();
+        q.enqueue("{\"n\":\"a\"}").unwrap();
+        q.enqueue("{\"n\":\"b\"}").unwrap();
         // Fail on the first send: nothing should be removed.
         let flushed = q.flush(|_| anyhow::bail!("server down"));
         assert_eq!(flushed, 0);
@@ -165,14 +180,48 @@ mod tests {
     }
 
     #[test]
+    fn a_torn_entry_is_set_aside_instead_of_blocking_the_queue_forever() {
+        let base = temp_dir("torn");
+        let q = IncidentQueue::new(&base);
+        q.enqueue("{\"n\":1}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        q.enqueue("{\"n\":3}").unwrap();
+        // Simulate a crash-torn entry that sorts BETWEEN the two good ones —
+        // the head-of-line position that used to stop every later flush.
+        let entries = q.entries();
+        let torn = entries[0].with_file_name({
+            let n = entries[0].file_name().unwrap().to_string_lossy().to_string();
+            n.replacen(".json", "0.json", 1)
+        });
+        std::fs::write(&torn, b"{\"n\":2, \"trunc").unwrap();
+        assert_eq!(q.len(), 3);
+
+        let mut sent = Vec::new();
+        let flushed = q.flush(|body| {
+            // A real server rejects a body that is not JSON; model that.
+            serde_json::from_str::<serde_json::Value>(body)?;
+            sent.push(body.to_string());
+            Ok(())
+        });
+        assert_eq!(flushed, 2, "both good incidents must be delivered past the torn one");
+        assert_eq!(sent, vec!["{\"n\":1}".to_string(), "{\"n\":3}".to_string()]);
+        assert!(q.is_empty(), "the torn entry must leave the queue");
+        assert!(
+            torn.with_extension("corrupt").exists(),
+            "the torn entry is kept aside for forensics, not deleted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn bound_drops_oldest_when_full() {
         let base = temp_dir("bound");
         let q = IncidentQueue::with_cap(&base, 2);
-        q.enqueue("one").unwrap();
+        q.enqueue("\"one\"").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        q.enqueue("two").unwrap();
+        q.enqueue("\"two\"").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        q.enqueue("three").unwrap(); // drops "one"
+        q.enqueue("\"three\"").unwrap(); // drops "one"
         assert_eq!(q.len(), 2, "queue must stay bounded at cap");
 
         let mut sent = Vec::new();
@@ -180,7 +229,7 @@ mod tests {
             sent.push(b.to_string());
             Ok(())
         });
-        assert_eq!(sent, vec!["two".to_string(), "three".to_string()]);
+        assert_eq!(sent, vec!["\"two\"".to_string(), "\"three\"".to_string()]);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

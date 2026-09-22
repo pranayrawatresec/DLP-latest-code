@@ -80,6 +80,14 @@ pub struct Config {
     #[serde(default)]
     pub webupload: WebuploadConfig,
 
+    /// Optional ML document-classifier settings (`[ml]`) — where the ONNX model
+    /// and tokenizer live on this endpoint and the cost bounds for one inference.
+    /// An absent section yields defaults, so existing configs keep parsing. This
+    /// is the LOCAL half only: whether the classifier actually contributes
+    /// sensitivity is the console's `ml-policy` decision (see `crate::mlpolicy`).
+    #[serde(default)]
+    pub ml: MlConfig,
+
     /// Sanctioned-reader allowlist (`[[trusted_readers]]`) — the applications
     /// allowed to read sensitive content locally under the read-deny
     /// **allowlist** posture (`[kguard] exfil_posture = "allowlist"`). Every
@@ -586,6 +594,300 @@ fn default_encrypt_sensitive() -> EncryptMode {
     EncryptMode::EncryptSensitive
 }
 
+/// ML document-classifier configuration (`[ml]`). Every field is defaulted so the
+/// whole section — and any individual field — may be omitted.
+///
+/// SPLIT OF AUTHORITY: this section says only WHERE the model lives and what one
+/// inference is allowed to cost on this machine. WHETHER the classifier makes a
+/// document sensitive (and at what confidence, for which business functions) is
+/// console-managed policy delivered over mTLS ([`crate::mlpolicy::MlPolicy`]) —
+/// an endpoint can never widen its own detection by editing `agent.toml`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MlConfig {
+    /// LOCAL kill switch, default `true`. This exists for one job: taking the
+    /// model off a machine that cannot run it (missing model file, a box where
+    /// the inference cost is unacceptable) without touching central policy. The
+    /// console policy is the real switch — `enabled = true` here with an inert
+    /// console policy still classifies nothing.
+    pub enabled: bool,
+    /// The ONNX graph. Default: `model\model.onnx` beside the agent executable
+    /// (the MSI drops the model into the install dir), falling back to the
+    /// standard install path when the exe path cannot be resolved.
+    pub model_path: PathBuf,
+    /// The HuggingFace fast tokenizer (WordPiece) that MUST match the backbone
+    /// the model was trained with — a mismatched vocab silently produces
+    /// nonsense labels. Default: `model\tokenizer.json` beside the model.
+    pub tokenizer_path: PathBuf,
+    /// Raw text is truncated to this many CHARACTERS before tokenizing. Default
+    /// 200000 — the reference pipeline's `text.max_chars`. Changing it diverges
+    /// from the trained preprocessing; treat it as a compatibility constant.
+    pub max_chars: usize,
+    /// Cap on the number of 512-token chunks fed to one `run()` call. Default 0
+    /// = UNLIMITED, which is the only value that reproduces the reference
+    /// pipeline (it mean-pools every chunk of the document). Any non-zero value
+    /// is a pure cost bound that DIVERGES from the reference — the document is
+    /// then classified from a prefix, so the truncation must be recorded on the
+    /// result (chunk count) and never silently presented as a full-document
+    /// verdict.
+    pub max_chunks: usize,
+    /// Chunks pushed through the ENCODER per forward pass, when the split graphs
+    /// (`model/onnx_split/`) are staged. Default 8.
+    ///
+    /// THIS IS THE MEMORY DIAL, and the reason the split model exists. The
+    /// monolithic `model.onnx` seals the mean-pooling inside itself, so every
+    /// chunk of a document must go through the encoder in ONE call: about 65 MB
+    /// of attention activations per chunk, measured at ~5 GB for a 72-chunk
+    /// document, which is enough to exhaust an 8 GiB endpoint and abort the
+    /// service. With the split pair the encoder only ever holds this many chunks
+    /// at once and peak memory stops depending on document length:
+    ///
+    /// ```text
+    ///   peak  ~=  350 MB  +  65 MB * micro_batch_size
+    ///   4 -> ~650 MB      8 -> ~940 MB      16 -> ~1.5 GB
+    /// ```
+    ///
+    /// 8 matches the `micro_batch_size` the model's own card specifies for the
+    /// reference PyTorch path. Changing it does NOT change the answer — the mean
+    /// is a running sum divided by the count, and the non-linear head runs once
+    /// on the pooled vector — so tune it purely for the RAM of the fleet.
+    ///
+    /// Ignored when only the monolithic graph is staged: it has no seam to batch
+    /// at.
+    pub micro_batch_size: usize,
+    /// ONNX Runtime intra-op thread count. Default 1: the agent is a background
+    /// service on a user's PC and must not fight the interactive workload for
+    /// cores; inference latency matters far less than the endpoint staying
+    /// responsive.
+    pub intra_threads: usize,
+
+    // -----------------------------------------------------------------------
+    // AT-REST / AT-CREATION / ON-DEMAND PIPELINE
+    //
+    // The knobs below do not change WHAT the model says or WHEN a document is
+    // sensitive — they bound what the coverage machinery is allowed to cost on
+    // this endpoint. The model may never run on the synchronous kernel READ
+    // up-call (500 ms budget, single-threaded message loop, an 8-timeout IPC
+    // breaker for the whole machine), so instead three off-path producers — a
+    // creation watcher, a throttled at-rest walker and a bounded on-demand queue
+    // — fill `ml::cache` and the read path does a HashMap lookup. Every default
+    // here is deliberately the CHEAP one: a producer that never runs costs
+    // coverage (a first read falls back to fingerprints), while a producer that
+    // runs too hard costs the customer their endpoint and gets the agent
+    // switched off, which costs all protection.
+    //
+    // Each default is taken from the owning module's own constant rather than
+    // re-typed here, so a tuning change lands in one place.
+    // -----------------------------------------------------------------------
+    /// Hard entry cap on the verdict cache (`ml::cache`). Default 200000 — tens
+    /// of MB resident, since a record is a 32-byte hash plus a label and a
+    /// handful of numbers (never a path, a name or content). Reaching the cap
+    /// evicts least-recently-used entries; eviction costs coverage, never
+    /// safety, because a missing entry is a MISS and a miss can never say "not
+    /// sensitive".
+    pub cache_max_entries: usize,
+    /// Depth of the on-demand classify queue (`ml::queue`) — the hand-off from a
+    /// read-path cache miss to the background worker. Default 256. The enqueue
+    /// NEVER waits (it is called from the kguard message loop); a full queue
+    /// drops its OLDEST job and counts it, so a non-zero `dropped` counter means
+    /// this endpoint is missing coverage, not merely that it is busy.
+    pub queue_capacity: usize,
+    /// Run the at-creation watcher (`ml::watch`): one `ReadDirectoryChangesW`
+    /// thread per scope that classifies a file once it stops being written.
+    /// Default true — it is the cheapest of the three producers (it only ever
+    /// looks at files somebody actually touched) and it is what keeps the cache
+    /// current between walker sweeps.
+    pub watch_enabled: bool,
+    /// Run the at-rest discovery walker (`ml::walk`): the throttled sweep that
+    /// backfills files which predate the agent or arrived while it was stopped.
+    /// Default true. It is also the component that earns the right to enable
+    /// `denyUnclassified` — its completion record is the coverage evidence.
+    pub walk_enabled: bool,
+    /// Walker throughput ceiling, in files classified per minute. Default 120
+    /// (two per second).
+    ///
+    /// WHY SO LOW. This runs on an employee's PC while they work, and the cost
+    /// of a file is not the forward pass alone: it is a 4 MiB read, a text
+    /// extraction (a PDF or a `.docx` is a decompress plus a parse) and then
+    /// ~10–100 ms of DistilBERT. At 120/min a 100k-file profile is covered in
+    /// about fourteen hours — one overnight — which is the right trade for a
+    /// one-time backfill that must never be noticed. Raise it for a scripted
+    /// pre-deployment sweep on a machine nobody is using; do not raise it fleet-
+    /// wide to "finish sooner". The walker throttles itself further on top of
+    /// this when the disk is slow or the classify queue is deep.
+    ///
+    /// `0` means UNLIMITED — the module's own convention, kept here rather than
+    /// re-interpreted, and the right setting for a scripted pre-deployment sweep
+    /// on a machine nobody is using. Never ship it to a live endpoint.
+    pub walk_files_per_minute: u32,
+    /// Hours between full re-sweeps. Default 6; `0` keeps that default rather
+    /// than meaning "start the next sweep the instant this one ended".
+    ///
+    /// A re-sweep is NOT how the cache stays correct — content change needs no
+    /// invalidation at all, because different bytes are a different key, and the
+    /// watcher covers everything the user touches. It exists for what the
+    /// watcher structurally cannot see: files that landed while the service was
+    /// stopped, a volume that was offline, and a notification buffer that
+    /// overflowed. Six hours costs one sweep per shift.
+    pub walk_interval_hours: u64,
+    /// Let the at-rest walker proactively classify source and config files too
+    /// (`.py`, `.json`, `.html`, …), not just real documents. Default `false`.
+    ///
+    /// Measured on a real developer profile, the full extractor-supported
+    /// extension set made the walker classify 125,744 files to find 126 real
+    /// documents — a 17.5-hour sweep for 0.10% signal. With this off, the
+    /// walker admits only [`crate::ml::filter::DOCUMENT_EXTENSIONS`] (docx,
+    /// xlsx, pptx, pdf, zip, txt, md, csv, tsv); everything else still gets
+    /// classified the moment it is actually created (the at-creation watcher)
+    /// or actually read on an exfil channel (the on-demand path) — neither of
+    /// which is gated by this flag. Set `true` on a site that wants source
+    /// trees proactively covered too and is willing to pay the sweep time.
+    pub walk_scan_source_files: bool,
+    /// Skip files larger than this, in bytes. Default 67108864 (64 MiB).
+    ///
+    /// Not a model-cost bound: only the first 4 MiB of a file is ever hashed or
+    /// classified (that is all the driver ships on the read path, so that is all
+    /// a producer may hash, or it would mint a key the read path can never
+    /// match). It bounds I/O and keeps the producers off multi-gigabyte
+    /// artefacts — VM images, mailbox archives, media — that a user may be
+    /// actively streaming. A skipped file is not a hole: if it is ever read on an
+    /// exfil path, the on-demand trigger classifies it from the bytes the kernel
+    /// already handed us.
+    pub max_file_bytes: u64,
+    /// Trees the watcher watches and the walker sweeps. **Normally EMPTY** — see
+    /// [`Config::ml_scopes`], which derives them from the read-deny watch-set
+    /// (`[kguard] watch_paths`) so the two cannot drift. Set this only to
+    /// override that derivation on a site whose data lives somewhere the driver's
+    /// watch-set does not describe (a second fixed volume, say). Absolute paths.
+    pub scopes: Vec<PathBuf>,
+}
+
+/// `model\` beside the agent executable (the MSI install dir). Falls back to the
+/// standard install path when `current_exe` fails (service hosts, odd loaders) so
+/// the default is never an empty/relative path.
+fn default_model_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\DLPAgent"))
+        .join("model")
+}
+
+fn default_model_path() -> PathBuf {
+    default_model_dir().join("model.onnx")
+}
+
+fn default_tokenizer_path() -> PathBuf {
+    default_model_dir().join("tokenizer.json")
+}
+
+/// The volume the driver attaches on fixed media, as `"C:"` (no trailing
+/// separator). Read from `%SystemDrive%` with a hard fallback, and validated to
+/// be exactly a drive designator so a mangled environment cannot turn a scope
+/// into a relative path the watcher would resolve against its own cwd.
+fn system_drive() -> String {
+    std::env::var("SystemDrive")
+        .ok()
+        .map(|s| s.trim().trim_end_matches(['\\', '/']).to_string())
+        .filter(|s| s.len() == 2 && s.ends_with(':') && s.starts_with(|c: char| c.is_ascii_alphabetic()))
+        .unwrap_or_else(|| "C:".to_string())
+}
+
+/// The fixed (wildcard-free) leading part of one driver watch-path, normalised
+/// to `\Segment\Segment` with no trailing separator.
+///
+/// `\Users\*\OneDrive` → `\Users`. Truncating at the first wildcard yields a
+/// SUPERSET of what the driver matches, which is the safe direction: the extra
+/// files cost the per-file filter a cheap rejection, whereas guessing narrower
+/// would leave files the driver adjudicates with nothing in the cache. A path
+/// that is nothing but separators (or nothing but a wildcard) collapses to the
+/// volume root, `\` — legal, and reported by the caller because a whole-volume
+/// scope is almost always a misconfiguration.
+fn watch_path_fixed_prefix(raw: &str) -> String {
+    let mut out = String::new();
+    for seg in raw.split(['\\', '/']) {
+        // Win32 resolves `Windows.` and `Windows ` to `Windows`; compare the
+        // same way `ml::filter` does so the two agree about what a segment is.
+        let seg = seg.trim_end_matches([' ', '.']);
+        if seg.is_empty() {
+            continue;
+        }
+        if seg.contains('*') || seg.contains('?') {
+            break;
+        }
+        out.push('\\');
+        out.push_str(seg);
+    }
+    if out.is_empty() {
+        out.push('\\');
+    }
+    out
+}
+
+/// Drop duplicate and nested scopes, keeping the outermost.
+///
+/// Both producers are RECURSIVE, so `C:\Users` already covers `C:\Users\Public`.
+/// Leaving both in would give the watcher two `ReadDirectoryChangesW` threads
+/// delivering the same notifications and the walker two passes over the same
+/// files — pure cost, and a doubled sweep is exactly the kind of load that gets
+/// an endpoint agent switched off. Comparison is segment-wise and case-
+/// insensitive (`ml::filter::split_segments`, the same rule the exclusion lists
+/// use), so `C:\UsersData` is never treated as nested under `C:\Users`.
+fn prune_nested_scopes(scopes: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut keyed: Vec<(Vec<String>, PathBuf)> = scopes
+        .into_iter()
+        .filter_map(|p| {
+            let raw = p.to_string_lossy().to_string();
+            let segs = crate::ml::filter::split_segments(&raw);
+            if segs.is_empty() {
+                None
+            } else {
+                Some((segs, p))
+            }
+        })
+        .collect();
+    // Shortest first, so an ancestor is always considered before its children.
+    keyed.sort_by_key(|(s, _)| s.len());
+    let mut kept: Vec<(Vec<String>, PathBuf)> = Vec::new();
+    for (segs, path) in keyed {
+        let covered = kept
+            .iter()
+            .any(|(k, _)| segs.len() >= k.len() && segs[..k.len()] == k[..]);
+        if !covered {
+            kept.push((segs, path));
+        }
+    }
+    kept.into_iter().map(|(_, p)| p).collect()
+}
+
+impl Default for MlConfig {
+    fn default() -> Self {
+        MlConfig {
+            enabled: true, // local kill switch only — the console policy still gates it
+            model_path: default_model_path(),
+            tokenizer_path: default_tokenizer_path(),
+            max_chars: 200_000, // reference pipeline text.max_chars
+            max_chunks: 0,      // 0 = unlimited = reference-faithful
+            // Chunks per encoder pass when the split graphs are staged. The
+            // memory dial; matches the reference pipeline's micro_batch_size.
+            micro_batch_size: crate::ml::engine::DEFAULT_MICRO_BATCH_SIZE,
+            intra_threads: 1,
+            // Pipeline defaults come from the owning modules so there is exactly
+            // one place to tune each of them.
+            cache_max_entries: crate::ml::cache::DEFAULT_MAX_ENTRIES,
+            queue_capacity: crate::ml::queue::DEFAULT_CAPACITY,
+            watch_enabled: true,
+            walk_enabled: true,
+            walk_files_per_minute: crate::ml::walk::DEFAULT_FILES_PER_MINUTE,
+            walk_interval_hours: crate::ml::walk::DEFAULT_RESCAN_INTERVAL_SECS / 3_600,
+            walk_scan_source_files: false, // document tier by default — see the field doc
+
+            max_file_bytes: crate::ml::filter::DEFAULT_MAX_FILE_BYTES,
+            scopes: Vec::new(), // empty ⇒ derived from [kguard] watch_paths
+        }
+    }
+}
+
 /// A single TOML rule (`[[usb.rules]]`). Exactly one matcher should be set; the
 /// first present matcher (serial → vid/pid → bus type → any) is used.
 #[derive(Debug, Clone, Deserialize)]
@@ -664,6 +966,7 @@ impl Config {
                 notify: NotifyConfig::default(),
                 crypto: CryptoConfig::default(),
                 webupload: WebuploadConfig::default(),
+                ml: MlConfig::default(),
                 trusted_readers: Vec::new(),
             }
         };
@@ -716,6 +1019,67 @@ impl Config {
 
     pub fn clipboard_policy_url(&self) -> String {
         format!("{}/agent/clipboard-policy", self.server_url.trim_end_matches('/'))
+    }
+
+    /// Agent-facing ML document-classification policy endpoint (enabled,
+    /// thresholds, action, fail-block, selected label ids). Served over the same
+    /// mTLS listener as check-in; metadata only — the MODEL itself is shipped by
+    /// the installer, never over this surface.
+    pub fn ml_policy_url(&self) -> String {
+        format!("{}/agent/ml-policy", self.server_url.trim_end_matches('/'))
+    }
+
+    /// THE scope list for the ML at-creation watcher and the at-rest walker.
+    ///
+    /// ONE SCOPE LIST, NOT TWO. The read-deny watch-set (`[kguard] watch_paths`,
+    /// itself pushed down from the console read-deny policy) already says which
+    /// fixed-volume files the driver classifies an untrusted reader against. The
+    /// whole point of this pipeline is to have an answer ready for exactly those
+    /// reads, so deriving from that set is not a convenience — a second,
+    /// independently-edited list would drift, and the drift would be silent and
+    /// one-directional: files inside the driver's watch-set but outside the
+    /// pipeline's scopes are read-adjudicated with nothing in the cache, which is
+    /// the coverage hole this feature exists to close. [`MlConfig::scopes`] is
+    /// therefore an OVERRIDE, empty by default, not the normal way to configure
+    /// this.
+    ///
+    /// Three translations are needed, because the two lists are not the same kind
+    /// of string:
+    ///
+    /// * **Volume-relative → absolute.** `watch_paths` entries are volume-
+    ///   relative (`\Users`), matched by the driver on whichever volume it is
+    ///   attached to. A user-mode watcher needs a real directory, so each entry
+    ///   is anchored to the SYSTEM drive — which is the only fixed volume the
+    ///   agent attaches (`readdenypolicy::attach_fixed_volume("C:")`), so it is
+    ///   also the only fixed volume whose reads ever up-call. Data on a second
+    ///   fixed volume needs the override, and needs the attach extended too.
+    /// * **Wildcards → their fixed prefix.** `\Users\*\OneDrive` becomes
+    ///   `C:\Users`: a superset, so coverage is never lost, and the per-file
+    ///   filter throws the extra away cheaply.
+    /// * **Nesting → the outermost.** `\Users` plus `\Users\Public` is one tree;
+    ///   watching it twice would double every notification and sweep it twice.
+    ///
+    /// With `watch_paths` empty (a site that has not turned on fixed-volume
+    /// scanning) the fallback is the user-profile root. It is the one directory
+    /// on a Windows endpoint that is certain to hold the documents this feature
+    /// is about, and an empty list would otherwise mean the producers never
+    /// start, the cache stays empty, and every read misses — a feature that looks
+    /// deployed and does nothing.
+    pub fn ml_scopes(&self) -> Vec<PathBuf> {
+        if !self.ml.scopes.is_empty() {
+            return prune_nested_scopes(self.ml.scopes.clone());
+        }
+        let drive = system_drive();
+        let scopes: Vec<PathBuf> = if self.kguard.watch_paths.is_empty() {
+            vec![PathBuf::from(format!("{drive}\\Users"))]
+        } else {
+            self.kguard
+                .watch_paths
+                .iter()
+                .map(|p| PathBuf::from(format!("{drive}{}", watch_path_fixed_prefix(p))))
+                .collect()
+        };
+        prune_nested_scopes(scopes)
     }
 
     /// Produce an effective config whose `[usb]` section has the synced
@@ -1014,6 +1378,241 @@ sealer_health_timeout_secs = 30
         let cfg: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(cfg.kguard.removable_write_block_at, 0.05);
         assert_eq!(cfg.kguard.sealer_health_timeout_secs, 30);
+    }
+
+    #[test]
+    fn ml_section_defaults_when_absent() {
+        // A pre-ML config must keep parsing, with the model bounds at their
+        // reference-faithful defaults and the LOCAL switch on (the console policy
+        // is what actually turns classification on).
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert!(cfg.ml.enabled);
+        assert_eq!(cfg.ml.max_chars, 200_000);
+        assert_eq!(cfg.ml.max_chunks, 0); // 0 = unlimited = reference pipeline
+        assert_eq!(cfg.ml.intra_threads, 1);
+        // Defaults point beside the agent exe; only the leaf names are pinned.
+        assert!(cfg.ml.model_path.ends_with("model.onnx"));
+        assert!(cfg.ml.tokenizer_path.ends_with("tokenizer.json"));
+        assert_eq!(cfg.ml.model_path.parent(), cfg.ml.tokenizer_path.parent());
+        assert_eq!(
+            cfg.ml.model_path.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("model"))
+        );
+    }
+
+    #[test]
+    fn ml_section_parses_when_set() {
+        let toml_str = format!(
+            "{BASE}
+[ml]
+enabled = false
+model_path = \"D:\\\\models\\\\v6\\\\model.onnx\"
+tokenizer_path = \"D:\\\\models\\\\v6\\\\tokenizer.json\"
+max_chars = 50000
+max_chunks = 8
+intra_threads = 2
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(!cfg.ml.enabled);
+        assert_eq!(cfg.ml.model_path, PathBuf::from("D:\\models\\v6\\model.onnx"));
+        assert_eq!(cfg.ml.tokenizer_path, PathBuf::from("D:\\models\\v6\\tokenizer.json"));
+        assert_eq!(cfg.ml.max_chars, 50_000);
+        assert_eq!(cfg.ml.max_chunks, 8);
+        assert_eq!(cfg.ml.intra_threads, 2);
+    }
+
+    #[test]
+    fn ml_partial_section_keeps_other_defaults() {
+        // Per-field defaulting: setting one knob must not reset the rest.
+        let toml_str = format!("{BASE}\n[ml]\nmax_chunks = 4\n");
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.ml.max_chunks, 4);
+        assert!(cfg.ml.enabled);
+        assert_eq!(cfg.ml.max_chars, 200_000);
+        assert_eq!(cfg.ml.intra_threads, 1);
+    }
+
+    #[test]
+    fn ml_pipeline_defaults_when_absent() {
+        // A pre-pipeline config keeps parsing, and every producer knob lands on
+        // the owning module's own constant (no re-typed numbers to drift).
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert_eq!(cfg.ml.cache_max_entries, crate::ml::cache::DEFAULT_MAX_ENTRIES);
+        assert_eq!(cfg.ml.cache_max_entries, 200_000);
+        assert_eq!(cfg.ml.queue_capacity, crate::ml::queue::DEFAULT_CAPACITY);
+        assert_eq!(cfg.ml.queue_capacity, 256);
+        assert!(cfg.ml.watch_enabled);
+        assert!(cfg.ml.walk_enabled);
+        assert_eq!(
+            cfg.ml.walk_files_per_minute,
+            crate::ml::walk::DEFAULT_FILES_PER_MINUTE
+        );
+        assert_eq!(
+            cfg.ml.walk_interval_hours * 3_600,
+            crate::ml::walk::DEFAULT_RESCAN_INTERVAL_SECS
+        );
+        assert_eq!(cfg.ml.max_file_bytes, crate::ml::filter::DEFAULT_MAX_FILE_BYTES);
+        assert_eq!(cfg.ml.max_file_bytes, 64 * 1024 * 1024);
+        // Scopes are DERIVED, not configured (see `ml_scopes`).
+        assert!(cfg.ml.scopes.is_empty());
+        // Document tier by default — the walker must NOT proactively sweep
+        // source/config files unless a site opts in.
+        assert!(!cfg.ml.walk_scan_source_files);
+    }
+
+    #[test]
+    fn ml_pipeline_knobs_parse_and_do_not_reset_neighbours() {
+        let toml_str = format!(
+            "{BASE}
+[ml]
+cache_max_entries = 1000
+queue_capacity = 8
+watch_enabled = false
+walk_files_per_minute = 30
+walk_interval_hours = 24
+max_file_bytes = 1048576
+scopes = [\"D:\\\\Projects\"]
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.ml.cache_max_entries, 1_000);
+        assert_eq!(cfg.ml.queue_capacity, 8);
+        assert!(!cfg.ml.watch_enabled);
+        assert_eq!(cfg.ml.walk_files_per_minute, 30);
+        assert_eq!(cfg.ml.walk_interval_hours, 24);
+        assert_eq!(cfg.ml.max_file_bytes, 1_048_576);
+        assert_eq!(cfg.ml.scopes, vec![PathBuf::from("D:\\Projects")]);
+        // Untouched knobs keep their defaults, including the model bounds.
+        assert!(cfg.ml.walk_enabled);
+        assert!(cfg.ml.enabled);
+        assert_eq!(cfg.ml.max_chars, 200_000);
+        assert_eq!(cfg.ml.intra_threads, 1);
+        assert!(!cfg.ml.walk_scan_source_files);
+    }
+
+    #[test]
+    fn walk_scan_source_files_can_be_opted_into() {
+        let toml_str = format!(
+            "{BASE}
+[ml]
+walk_scan_source_files = true
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.ml.walk_scan_source_files);
+        // A site opting in still keeps the other pipeline defaults.
+        assert_eq!(
+            cfg.ml.walk_files_per_minute,
+            crate::ml::walk::DEFAULT_FILES_PER_MINUTE
+        );
+    }
+
+    #[test]
+    fn ml_scopes_derive_from_the_read_deny_watch_set() {
+        // The whole point: ONE scope list. `\Users` and `\Data` are what the
+        // driver adjudicates reads against, so they are what the producers cover.
+        let toml_str = format!(
+            "{BASE}
+[kguard]
+scan_fixed = true
+watch_paths = [\"\\\\Users\", \"\\\\Data\"]
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let drive = super::system_drive();
+        assert_eq!(
+            cfg.ml_scopes(),
+            vec![
+                PathBuf::from(format!("{drive}\\Users")),
+                PathBuf::from(format!("{drive}\\Data")),
+            ]
+        );
+    }
+
+    #[test]
+    fn ml_scopes_truncate_wildcards_and_drop_nested_duplicates() {
+        let toml_str = format!(
+            "{BASE}
+[kguard]
+watch_paths = [\"\\\\Users\\\\*\\\\OneDrive\", \"\\\\Users\", \"\\\\Users\\\\Public\", \"\\\\Data\"]
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let drive = super::system_drive();
+        // The wildcard entry widens to `\Users`, which then absorbs the literal
+        // `\Users` and the nested `\Users\Public`: one recursive watch, not three.
+        assert_eq!(
+            cfg.ml_scopes(),
+            vec![
+                PathBuf::from(format!("{drive}\\Users")),
+                PathBuf::from(format!("{drive}\\Data")),
+            ]
+        );
+    }
+
+    #[test]
+    fn ml_scopes_override_wins_and_is_pruned_too() {
+        let toml_str = format!(
+            "{BASE}
+[kguard]
+watch_paths = [\"\\\\Users\"]
+
+[ml]
+scopes = [\"E:\\\\Share\", \"E:\\\\Share\\\\Team\", \"E:\\\\SharePoint\"]
+"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        // The override REPLACES the derivation (no `\Users`), and `E:\SharePoint`
+        // survives — a name that merely starts with another scope's text is not
+        // nested under it.
+        assert_eq!(
+            cfg.ml_scopes(),
+            vec![PathBuf::from("E:\\Share"), PathBuf::from("E:\\SharePoint")]
+        );
+    }
+
+    #[test]
+    fn ml_scopes_fall_back_to_the_profile_root_when_nothing_is_watched() {
+        // No fixed-volume watch-set at all: the producers still need somewhere to
+        // look, or the cache stays empty and every read misses forever.
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert!(cfg.kguard.watch_paths.is_empty());
+        assert_eq!(
+            cfg.ml_scopes(),
+            vec![PathBuf::from(format!("{}\\Users", super::system_drive()))]
+        );
+    }
+
+    #[test]
+    fn watch_path_fixed_prefix_normalises_every_shape_the_driver_accepts() {
+        assert_eq!(super::watch_path_fixed_prefix(r"\Users"), r"\Users");
+        assert_eq!(super::watch_path_fixed_prefix(r"Users\Ana"), r"\Users\Ana");
+        assert_eq!(super::watch_path_fixed_prefix(r"\Users\"), r"\Users");
+        assert_eq!(super::watch_path_fixed_prefix("/Users//Ana/"), r"\Users\Ana");
+        // Wildcard ⇒ keep the fixed prefix only (a SUPERSET, never narrower).
+        assert_eq!(super::watch_path_fixed_prefix(r"\Users\*\OneDrive"), r"\Users");
+        assert_eq!(super::watch_path_fixed_prefix(r"\Data\?\x"), r"\Data");
+        // Degenerate entries collapse to the volume root rather than to "".
+        assert_eq!(super::watch_path_fixed_prefix(r"\"), r"\");
+        assert_eq!(super::watch_path_fixed_prefix(""), r"\");
+        assert_eq!(super::watch_path_fixed_prefix(r"\*"), r"\");
+    }
+
+    #[test]
+    fn ml_policy_url_matches_agent_surface() {
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert_eq!(
+            cfg.ml_policy_url(),
+            "https://dlp-server.internal:8443/agent/ml-policy"
+        );
+        // Trailing slashes on server_url must not double up (same as neighbours).
+        let mut trailing = cfg.clone();
+        trailing.server_url = "https://dlp-server.internal:8443/".into();
+        assert_eq!(
+            trailing.ml_policy_url(),
+            "https://dlp-server.internal:8443/agent/ml-policy"
+        );
     }
 
     #[test]

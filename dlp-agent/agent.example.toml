@@ -188,3 +188,197 @@ org_name = "Data Loss Prevention"
 aumid = "Resec.DLP.Agent"   # must match the installer-registered shortcut AUMID
 dedup_secs = 5              # suppress a repeat block of the same (channel,file) within N s
 max_per_minute = 20         # global storm cap (0 = unlimited)
+
+# --- ML document classification ----------------------------------------------
+# The SECOND detection signal, beside IDM/EDM fingerprinting. Fingerprinting
+# answers "does this contain material from a REGISTERED protected document";
+# the classifier answers "what business function does this document serve",
+# against the frozen 29-label V6.2.01 taxonomy. A file is sensitive when EITHER
+# fires — each covers the other's blind spot, and fingerprinting cannot see a
+# document nobody registered.
+#
+# SPLIT OF AUTHORITY. This section is the LOCAL half only: where the model lives
+# on this endpoint and what one inference may cost. WHETHER the classifier
+# contributes at all — which of the 29 classes count as sensitive, the confidence
+# floor, audit vs block, fail-secure posture — is authored in the console and
+# delivered over mTLS at GET /agent/ml-policy. With no class marked sensitive the
+# classifier is inert no matter what is set here.
+#
+# Inference runs ON THIS PC: document text never leaves the endpoint, and it
+# keeps working with the server unreachable. Cost is roughly 10 ms for a short
+# note and a few hundred ms for a long PDF, so the model runs on the write /
+# USB / clipboard / browser-upload paths but NOT on the synchronous kernel
+# read-deny up-call (see ML-CLASSIFICATION-RUNBOOK.md).
+[ml]
+enabled = true              # LOCAL kill switch. false = never classify on this
+                            # endpoint, whatever the console policy says.
+
+# The three artifacts, staged by scripts\stage-ml-model.ps1. The sidecar is
+# DERIVED (model_path + ".json") and is deliberately not configurable — the label
+# space and chunk geometry must travel with the weights so they cannot drift.
+model_path     = 'C:\dlp\model\model.onnx'
+tokenizer_path = 'C:\dlp\model\tokenizer.json'
+
+# DEVELOPER BENCH: to run `scan` / `classify` straight out of the repository
+# without staging anything, point at Document_classification\ instead. The layout
+# there already matches what the resolver expects (model\, backbone\, runtime\):
+#
+#   model_path     = 'D:\DLP_GUIDE\Document_classification\model\model.onnx'
+#   tokenizer_path = 'D:\DLP_GUIDE\Document_classification\backbone\tokenizer.json'
+#
+# and drop onnxruntime.dll at Document_classification\runtime\ — copy it from
+# <site-packages>\onnxruntime\capi\onnxruntime.dll after `pip install onnxruntime`.
+# Without it every ONNX test SKIPS while still printing "ok"; run the suite with
+# DLP_ML_STRICT=1 to turn that skip into a failure.
+
+# ONNX Runtime is NOT linked in and NOT downloaded at build time (a defence build
+# must be reproducible offline). It is resolved at first use, in this order:
+#   1. <ml root>\runtime\onnxruntime.dll   <- the shipped location; ALWAYS use it
+#   2. $ORT_DYLIB_PATH
+#   3. the bare file name, via the OS loader path
+# <ml root> is the PARENT of the model directory, so the line above implies
+# C:\dlp\runtime\onnxruntime.dll. Do not rely on step 3: with nothing staged the
+# loader binds whatever onnxruntime.dll it finds first on the machine, which
+# surfaces as a confusing "graph_optimization_level is not valid" at load.
+
+max_chars     = 0           # 0 = accept the bound the model declares (200000).
+                            # Any other value must MATCH it or the classifier
+                            # refuses to load: the bound applies before a single
+                            # token exists, so a lower one would silently shorten
+                            # every document before the model saw it.
+max_chunks    = 0           # 0 = unlimited = reference-faithful. A non-zero cap
+                            # bounds inference cost by classifying only the
+                            # document's LEADING chunks — a real behaviour
+                            # change, so a capped result carries chunksTruncated.
+intra_threads = 1           # ONNX Runtime threads per operator. One by default:
+                            # this runs while an employee works, and a classifier
+                            # that pegs every core is a support ticket.
+
+# --- ML coverage pipeline (at-creation / at-rest / on-demand) -----------------
+# THE PROBLEM. The kernel READ up-call is synchronous: the driver blocks the
+# reading thread, hands us up to 4 MiB of the file and wants an answer inside
+# 500 ms, and eight consecutive timeouts trip the IPC breaker for the WHOLE
+# machine. A DistilBERT pass costs 10-100 ms typically and ~640 ms on a long
+# document, and the guard's message loop is single-threaded — so the model may
+# NEVER run on that path. Until now that meant a file authored on C: this morning
+# had never met the model at all, and RustDesk/AnyDesk/RDP reading it out was
+# adjudicated on fingerprints alone. Fingerprinting cannot see a document nobody
+# registered.
+#
+# THE FIX, and what these knobs bound. The model runs OFF the hot path and
+# deposits its answer in a content-keyed cache; the read path does a microsecond
+# lookup. Three producers fill it:
+#   at creation  a directory watcher classifies a file once it stops being written
+#   at rest      a throttled walker backfills what predates the agent
+#   on demand    a read-path miss enqueues the bytes the kernel already gave us,
+#                so the NEXT read of that content hits
+# The cache stores what the MODEL said (label + score), never what the POLICY
+# concluded — so marking a new class sensitive in the console changes the whole
+# estate's behaviour on the next read, with nothing to re-scan.
+#
+# NONE OF IT RUNS WHILE THE CONSOLE POLICY IS INERT. With no class marked
+# sensitive there is no cache file, no threads and no disk traffic: the endpoint
+# behaves exactly as it did before this feature existed. It is safe to deploy
+# ahead of the console change that turns it on.
+
+# cache_max_entries = 200000   # hard cap on cached verdicts (~tens of MB: a record
+                               # is a 32-byte hash, a label and a few numbers —
+                               # never a path, a name or content). Eviction is LRU
+                               # and costs coverage, never safety: a missing entry
+                               # is a MISS, and a miss can never mean "not
+                               # sensitive".
+# queue_capacity = 256         # depth of the on-demand hand-off. The enqueue never
+                               # waits (it happens on the kernel message loop); a
+                               # full queue drops its OLDEST job and counts it.
+                               # A non-zero drop count means this endpoint is
+                               # missing coverage, not merely that it is busy.
+# watch_enabled = true         # at-creation watcher. The cheapest producer — it
+                               # only looks at files somebody actually touched.
+# walk_enabled  = true         # at-rest walker. Also the component that earns the
+                               # right to turn on denyUnclassified (below).
+# walk_files_per_minute = 120  # walker ceiling. Two files a second sounds timid
+                               # and is deliberate: the cost per file is a 4 MiB
+                               # read + a text extraction (a PDF or .docx is a
+                               # decompress plus a parse) + the forward pass, on a
+                               # PC somebody is using. At 120/min a 100k-file
+                               # profile is covered in about fourteen hours — one
+                               # overnight — for a backfill that happens once.
+                               # Raise it for a scripted pre-deployment sweep on
+                               # an idle machine; do not raise it fleet-wide to
+                               # "finish sooner". The walker throttles itself
+                               # further when the disk is slow or the queue is deep.
+                               # 0 = UNLIMITED — right for a scripted
+                               # pre-deployment sweep on an idle machine, never
+                               # for a live endpoint.
+# walk_interval_hours = 6      # gap between full re-sweeps (0 keeps the 6 h
+                               # default, it does not mean "sweep back-to-back").
+                               # NOT how the cache
+                               # stays correct (different bytes are a different
+                               # key, so content change needs no invalidation) —
+                               # it is for what the watcher structurally cannot
+                               # see: files that landed while the service was
+                               # stopped, a volume that was offline, an overflowed
+                               # notification buffer.
+# max_file_bytes = 67108864    # 64 MiB. Not a model-cost bound — only the first
+                               # 4 MiB of any file is ever hashed or classified
+                               # (that is all the driver ships, so that is all a
+                               # producer may hash, or it would mint a cache key
+                               # the read path can never match). It keeps the
+                               # producers off VM images, mailbox archives and
+                               # media a user may be streaming. A skipped file is
+                               # not a hole: read it on an exfil path and the
+                               # on-demand trigger classifies it there and then.
+
+# scopes: WHICH TREES the watcher watches and the walker sweeps. Normally LEAVE
+# THIS UNSET. The scopes are derived from the read-deny watch-set above
+# ([kguard] watch_paths, itself pushed down from the console read-deny policy),
+# because that set already says which files the driver adjudicates reads against
+# and the entire point of this pipeline is to have an answer ready for exactly
+# those reads. A second, separately-edited list would drift, and the drift would
+# be silent and one-directional: files inside the driver's watch-set but outside
+# these scopes get read-adjudicated with nothing in the cache — the coverage hole
+# this feature exists to close.
+#
+# The derivation makes three translations:
+#   * volume-relative -> absolute. `\Users` becomes `C:\Users`, anchored to the
+#     system drive because that is the only fixed volume the agent attaches, and
+#     therefore the only one whose reads ever up-call. Data on a second fixed
+#     volume needs BOTH this override and the attach extended.
+#   * wildcards -> their fixed prefix. `\Users\*\OneDrive` becomes `C:\Users`:
+#     a superset, so coverage is never lost and the per-file filter throws the
+#     extra away cheaply.
+#   * nesting -> the outermost. `\Users` plus `\Users\Public` is ONE recursive
+#     watch, not two.
+# With watch_paths empty the fallback is the user-profile root, because an empty
+# scope list would mean the producers never start and every read misses — a
+# feature that looks deployed and does nothing.
+#
+# Scopes are read ONCE at service start: a later console change to watchPaths
+# takes effect on the next service restart, not on the next resync.
+# scopes = ['D:\Projects', 'E:\Share']
+
+# --- denyUnclassified: NOT a local knob, and a staged rollout ----------------
+# The one setting that can create NEW denials lives in the console (the ML policy
+# at GET /agent/ml-policy), never here — an endpoint must not be able to widen
+# its own enforcement by editing this file. It is off unless the console sends it
+# on, including when the server is too old to know the field.
+#
+# What it does: on a read whose content is NOT in the cache, reply NOVERDICT so
+# the driver fails safe per ExfilReadFailBlock and caches nothing, while the
+# bytes go to the background classifier — so the retry a moment later is
+# authoritative. Deny now, classify, self-heal.
+#
+# THE ROLLOUT ORDER IS NOT OPTIONAL:
+#   1. DEPLOY the agent with the pipeline on and denyUnclassified OFF. Nothing
+#      changes for anyone; the cache fills.
+#   2. LET THE WALKER FINISH. It writes a completion record when every scope has
+#      been swept; that record is the coverage evidence, and at 120 files/min it
+#      is an overnight job, not a coffee break.
+#   3. VERIFY coverage on real endpoints — cache entry counts, the walker's
+#      completion record, a zero or near-zero on-demand drop count.
+#   4. ENABLE it in the console, ideally on a pilot group first.
+# Enabling it at step 1 denies the FIRST read of every legacy file on every
+# endpoint at once. That is a fleet outage, not a control. Two more gates refuse
+# to let it bite regardless: the console policy must be live, and the on-demand
+# worker must be running — a denial nothing can ever clear is an outage with no
+# security gain.

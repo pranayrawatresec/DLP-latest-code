@@ -7,6 +7,7 @@
 //! with non-Windows stubs, so the library still builds and its pure logic still
 //! runs cross-platform (the golden-vector tests are cross-platform).
 
+pub mod atomicfile;
 pub mod browser_host;
 pub mod clipboard;
 pub mod config;
@@ -14,12 +15,15 @@ pub mod crypto;
 pub mod decrypt;
 pub mod detect;
 pub mod exfil;
+pub mod livebundle;
 pub mod netfilter;
 pub mod notify;
 pub mod storage;
 pub mod supervise;
 pub mod trustdest;
 pub mod trustedreaders;
+pub mod ml;
+pub mod mlpolicy;
 pub mod readdenypolicy;
 pub mod clippolicy;
 pub mod usersession;

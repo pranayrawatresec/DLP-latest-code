@@ -46,6 +46,35 @@ unicode-properties = "0.1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 pdf-extract = "0.12.0"
 
+# ML document classification (src/ml) — the second, independent detection signal.
+# TWO dependencies, and only two; both are load-bearing and neither has a
+# realistic in-house substitute.
+#
+# tokenizers: the SAME Rust crate HuggingFace's Python `tokenizers` package binds
+#   to, so `backbone/tokenizer.json` produces byte-identical ids to the reference
+#   pipeline the golden vectors were generated from. A hand-rolled WordPiece would
+#   diverge silently on some normalizer corner (accents, CJK, ß) and change the
+#   model's answer with no error anywhere. default-features = false drops the C++
+#   `esaxx-rs/cpp` suffix-array build, the `indicatif` progress bar and the
+#   `hf-hub` HTTP client — a model download path has no business in an air-gapped
+#   agent. `onig` is re-enabled because tokenizers 0.20 compiles
+#   `src/utils/onig.rs` unconditionally; it is only linked, never used by the
+#   BertNormalizer/WordPiece path this model needs.
+tokenizers = { version = "0.20.4", default-features = false, features = ["onig"] }
+
+# ort: bindings to Microsoft's ONNX Runtime — the only way to execute the graph.
+#   Pinned EXACTLY: an ONNX Runtime API bump silently changes numerics/threading
+#   and the golden vectors are the contract. default-features = false removes
+#   `download-binaries` (a build-time HTTPS fetch from pyke.io — unacceptable in a
+#   defence build) together with its ureq/native-tls build tree, and `ndarray`
+#   (we feed flat Vec<i64> and read a flat &[f32]). `load-dynamic` means the agent
+#   dlopen()s onnxruntime.dll at runtime instead of linking it, so the native
+#   library is a file we ship and can re-sign, not a blob baked into the exe.
+#   `api-17` asks for the ONNX Runtime 1.17 API surface, the oldest that serves
+#   this graph, so any ORT >= 1.17 we ship satisfies it.
+#   See the build recipe at the top of src/ml/engine.rs.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-17"] }
+
 [target.'cfg(windows)'.dependencies]
 # DPAPI (machine-scope) to protect the private key at rest, and the Windows
 # service lifecycle.

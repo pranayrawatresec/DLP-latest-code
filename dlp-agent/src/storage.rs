@@ -2,9 +2,16 @@
 //! clear: on Windows it is sealed with DPAPI (machine scope), so the blob is
 //! decryptable only on this machine. Mirrors the production requirement that a
 //! stolen agent identity cannot be replayed from another PC.
+//!
+//! EVERY write here goes through [`crate::atomicfile::write_atomic`]: a reader —
+//! including this agent after a crash or power cut — sees either the complete
+//! old file or the complete new one, never a truncated policy or a missing
+//! index. See that module for why each of the three older patterns was wrong.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+use crate::atomicfile::write_atomic;
 
 const IDENTITY_FILE: &str = "identity.sealed"; // DPAPI-sealed (key PEM + cert PEM)
 const CA_FILE: &str = "ca.pem"; // trust anchor confirmed at enrollment
@@ -16,6 +23,7 @@ const TRUSTED_DEST_FILE: &str = "trusted-destinations.json"; // METADATA ONLY �
 const TRUSTED_READERS_FILE: &str = "trusted-readers.json"; // sanctioned-reader allowlist (metadata)
 const READ_DENY_POLICY_FILE: &str = "read-deny-policy.json"; // endpoint read-deny policy (metadata)
 const CLIPBOARD_POLICY_FILE: &str = "clipboard-policy.json"; // endpoint clipboard policy (metadata)
+const ML_POLICY_FILE: &str = "ml-policy.json"; // endpoint ML classifier policy (metadata)
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentMeta {
@@ -36,6 +44,17 @@ impl Storage {
         self.dir.join(name)
     }
 
+    /// The state directory itself.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Where the verified index bundle lives — for [`crate::livebundle`], which
+    /// watches it for replacement.
+    pub fn index_bundle_path(&self) -> PathBuf {
+        self.path(INDEX_FILE)
+    }
+
     pub fn has_identity(&self) -> bool {
         self.path(IDENTITY_FILE).exists()
     }
@@ -47,8 +66,8 @@ impl Storage {
             .with_context(|| format!("creating state dir {}", self.dir.display()))?;
         let sealed = seal(identity_pem.as_bytes()).context("sealing identity")?;
         write_private(&self.path(IDENTITY_FILE), &sealed)?;
-        std::fs::write(self.path(CA_FILE), ca_pem).context("writing CA")?;
-        std::fs::write(self.path(META_FILE), serde_json::to_vec_pretty(meta)?)
+        write_atomic(&self.path(CA_FILE), ca_pem.as_bytes()).context("writing CA")?;
+        write_atomic(&self.path(META_FILE), &serde_json::to_vec_pretty(meta)?)
             .context("writing meta")?;
         Ok(())
     }
@@ -72,7 +91,9 @@ impl Storage {
     /// Cache the latest policy bundle for fail-secure enforcement while the
     /// server is unreachable. (Phase 2: bundle is null; this is the hook.)
     pub fn cache_policy(&self, policy_json: &str) -> Result<()> {
-        std::fs::write(self.path(POLICY_FILE), policy_json).context("caching policy")?;
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        write_atomic(&self.path(POLICY_FILE), policy_json.as_bytes()).context("caching policy")?;
         Ok(())
     }
 
@@ -84,20 +105,16 @@ impl Storage {
     }
 
     /// Replace the cached index bundle. Callers must have VERIFIED the bytes
-    /// first — this writes to a temp file and swaps, so the previous verified
-    /// bundle survives a crash mid-write (fail secure).
+    /// first. The replace is atomic and durable, so at every instant the file is
+    /// either the previous verified bundle or the new one — never absent, which
+    /// matters doubly here: with no bundle the kguard write path skips BOTH
+    /// fingerprinting and the ML classifier, and an offline endpoint cannot
+    /// re-download it. Running channels pick the new file up via
+    /// [`crate::livebundle::LiveBundle`] without a restart.
     pub fn store_index_bundle(&self, bytes: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating state dir {}", self.dir.display()))?;
-        let tmp = self.path("index.dlpx.tmp");
-        let dest = self.path(INDEX_FILE);
-        std::fs::write(&tmp, bytes).context("writing index bundle (temp)")?;
-        // Windows rename does not overwrite; the destination is removed only
-        // AFTER the new verified bytes are fully on disk.
-        if dest.exists() {
-            std::fs::remove_file(&dest).context("removing previous index bundle")?;
-        }
-        std::fs::rename(&tmp, &dest).context("swapping index bundle into place")?;
+        write_atomic(&self.path(INDEX_FILE), bytes).context("replacing index bundle")?;
         Ok(())
     }
 
@@ -144,8 +161,7 @@ impl Storage {
     pub fn store_trusted_destinations(&self, json: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating state dir {}", self.dir.display()))?;
-        std::fs::write(self.path(TRUSTED_DEST_FILE), json)
-            .context("writing trusted destinations")
+        write_atomic(&self.path(TRUSTED_DEST_FILE), json).context("writing trusted destinations")
     }
 
     /// Raw bytes of the last-persisted trusted-destinations file, or `None` when
@@ -162,8 +178,7 @@ impl Storage {
     pub fn store_trusted_readers(&self, json: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating state dir {}", self.dir.display()))?;
-        std::fs::write(self.path(TRUSTED_READERS_FILE), json)
-            .context("writing trusted readers")
+        write_atomic(&self.path(TRUSTED_READERS_FILE), json).context("writing trusted readers")
     }
 
     /// Raw bytes of the last-persisted trusted-readers file, or `None` when the
@@ -177,7 +192,7 @@ impl Storage {
     pub fn store_read_deny_policy(&self, json: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating state dir {}", self.dir.display()))?;
-        std::fs::write(self.path(READ_DENY_POLICY_FILE), json).context("writing read-deny policy")
+        write_atomic(&self.path(READ_DENY_POLICY_FILE), json).context("writing read-deny policy")
     }
 
     /// Raw bytes of the last-persisted read-deny policy, or `None` when never synced.
@@ -190,24 +205,45 @@ impl Storage {
     pub fn store_clipboard_policy(&self, json: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("creating state dir {}", self.dir.display()))?;
-        std::fs::write(self.path(CLIPBOARD_POLICY_FILE), json).context("writing clipboard policy")
+        write_atomic(&self.path(CLIPBOARD_POLICY_FILE), json).context("writing clipboard policy")
     }
 
     /// Raw bytes of the last-persisted clipboard policy, or `None` when never synced.
     pub fn load_clipboard_policy(&self) -> Option<Vec<u8>> {
         std::fs::read(self.path(CLIPBOARD_POLICY_FILE)).ok()
     }
+
+    /// Persist the last-synced ML document-classification policy (thresholds and
+    /// selected label IDS — metadata only, NEVER document text or model bytes) so
+    /// the classifier keeps applying the last console decision while the server is
+    /// unreachable. Fail-secure offline: the cache is the fallback, never "off".
+    pub fn store_ml_policy(&self, json: &[u8]) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating state dir {}", self.dir.display()))?;
+        write_atomic(&self.path(ML_POLICY_FILE), json).context("writing ml policy")
+    }
+
+    /// Raw bytes of the last-persisted ML policy, or `None` when never synced.
+    pub fn load_ml_policy(&self) -> Option<Vec<u8>> {
+        std::fs::read(self.path(ML_POLICY_FILE)).ok()
+    }
 }
 
-/// Write with owner-only permissions where the platform supports it.
+/// Write atomically with owner-only permissions where the platform supports
+/// them. The permissions are set on the TEMP file, before it is renamed into
+/// place, so the destination never exists with looser ones even for an
+/// instant.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::atomicfile::write_atomic_with(path, crate::atomicfile::DEFAULT_RETRY_BUDGET, |f| {
+        use std::io::Write;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(bytes)
+    })
+    .with_context(|| format!("writing {}", path.display()))
 }
 
 // ---------------------------------------------------------------------

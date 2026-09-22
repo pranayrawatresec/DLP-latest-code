@@ -51,6 +51,7 @@ fn innocent_verdict(name: &str) -> Verdict {
         extraction: Extraction::Ok { format: "text".into() },
         idm: vec![],
         edm: vec![],
+        ml: None,
     }
 }
 

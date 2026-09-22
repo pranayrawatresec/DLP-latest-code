@@ -9,8 +9,18 @@
 //! map matches back to document positions. Field names are camelCase on the
 //! wire.
 //!
+//! The ML document-classification signal rides along in the OPTIONAL `ml` field
+//! (see [`MlResult`]). It is additive: the field is
+//! `skip_serializing_if = "Option::is_none"`, every construction site in this
+//! file sets `ml: None`, and the fingerprint math below is untouched — so a
+//! verdict produced by a fingerprint-only channel (and every frozen golden
+//! vector) serializes BYTE-FOR-BYTE as it did before the model existed. That
+//! matters because this shape is a protocol the server parses: an unconditional
+//! `"ml": null` on every verdict would be a wire change, and this is not one.
+//!
 //! NEVER log file content or extracted text. The verdict itself carries only
-//! hashes, scores and identifiers.
+//! hashes, scores and identifiers — and that rule binds `ml` too: a label id, a
+//! score and two counts, never a snippet of what was classified.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -54,6 +64,159 @@ pub struct IdmMatch {
     pub matched_hashes: Vec<String>,
 }
 
+/// `ml.status` vocabulary (contract §C). Kept as `&'static str` constants rather
+/// than an enum because [`crate::ml::MlError`] already speaks these exact strings
+/// (`MlError::status()` / `MlError::reason()`), and one vocabulary with one
+/// spelling cannot drift.
+pub const ML_STATUS_OK: &str = "ok";
+pub const ML_STATUS_UNAVAILABLE: &str = "unavailable";
+pub const ML_STATUS_SKIPPED: &str = "skipped";
+pub const ML_STATUS_EMPTY: &str = "empty";
+
+/// `ml.reason` vocabulary (contract §C) — populated only when `status != "ok"`.
+pub const ML_REASON_MODEL_NOT_LOADED: &str = "model_not_loaded";
+pub const ML_REASON_NO_TEXT: &str = "no_text";
+/// The synchronous kernel read up-call (`DLP_REASON_READ`) deliberately does not
+/// run the model: there is no budget for a forward pass in a call the FS stack is
+/// blocked on. That read is decided on fingerprints alone.
+pub const ML_REASON_READ_PATH_SKIP: &str = "read_path_skip";
+/// The classifier was not consulted because the console policy is inert. Channels
+/// normally omit `ml` entirely in that case (keeping the verdict byte-identical
+/// to a pre-model one); this reason exists for a caller that wants the
+/// "deliberately not consulted" fact recorded on the wire.
+pub const ML_REASON_POLICY_OFF: &str = "policy_off";
+pub const ML_REASON_LOAD_FAILED: &str = "load_failed";
+
+/// The ML document-classification result for the scanned item — the SECOND,
+/// independent detection signal, carried inside the existing verdict rather than
+/// beside it so every channel, incident and audit record already knows how to
+/// move it.
+///
+/// `sensitive` is the policy answer, not the model's: it is true only when the
+/// predicted label is one the admin marked AND the confidence reached that
+/// label's threshold (`mlpolicy::MlPolicy::label_is_sensitive`). The fusion in
+/// [`super::decide`] reads only this flag, which is what keeps `decide()` pure
+/// and policy-free.
+///
+/// Content NEVER appears here: a label id, a display name, a score, a chunk count
+/// and a token count. That is deliberate — this struct is written to the incident
+/// report and to the tamper-evident audit log, and neither may hold document text.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MlResult {
+    /// One of [`ML_STATUS_OK`], [`ML_STATUS_UNAVAILABLE`], [`ML_STATUS_SKIPPED`],
+    /// [`ML_STATUS_EMPTY`].
+    pub status: String,
+    /// Which model produced this, e.g. `"V6.2.01"` — so an incident stays
+    /// interpretable after a model update changes the label distribution.
+    pub model_version: String,
+    /// Frozen taxonomy id (`"FIN"`), `None` unless `status == "ok"`.
+    pub label_id: Option<String>,
+    /// Display name (`"Finance"`), `None` unless `status == "ok"`.
+    pub label_name: Option<String>,
+    /// Softmax probability of the winning label; 0.0 when there is none.
+    pub confidence: f64,
+    /// The POLICY verdict on that label (see the struct doc), never the model's
+    /// raw opinion.
+    pub sensitive: bool,
+    pub chunks: usize,
+    /// Present ONLY when `[ml] max_chunks` capped the document — the chunk count
+    /// BEFORE the cap. Its absence therefore means "the whole document was
+    /// classified", which is the reference-faithful default, so no existing
+    /// verdict changes shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks_total: Option<usize>,
+    pub tokens: usize,
+    /// `None` when `status == "ok"`; otherwise one of the `ML_REASON_*` values.
+    pub reason: Option<String>,
+}
+
+impl MlResult {
+    /// A completed classification. `sensitive` is supplied by the caller because
+    /// it is a policy answer (see the struct doc), not a property of the model.
+    pub fn classified(
+        model_version: &str,
+        label_id: &str,
+        label_name: &str,
+        confidence: f64,
+        sensitive: bool,
+        chunks: usize,
+        tokens: usize,
+    ) -> Self {
+        MlResult {
+            status: ML_STATUS_OK.to_string(),
+            model_version: model_version.to_string(),
+            label_id: Some(label_id.to_string()),
+            label_name: Some(label_name.to_string()),
+            confidence,
+            sensitive,
+            chunks,
+            chunks_total: None,
+            tokens,
+            // `reason` is the "why not" field: an answered classification has none.
+            reason: None,
+        }
+    }
+
+    /// Record that a cost bound classified a PREFIX of the document.
+    ///
+    /// A builder rather than an eighth positional argument: truncation is the rare
+    /// case (`[ml] max_chunks` defaults to unlimited), and every call site that
+    /// does not cap keeps reading as it did.
+    pub fn truncated_from(mut self, chunks_total: usize) -> Self {
+        if chunks_total > self.chunks {
+            self.chunks_total = Some(chunks_total);
+        }
+        self
+    }
+
+    /// No prediction: `status` + `reason` say why. Never `sensitive` — a document
+    /// the model did not classify is not a model hit, whatever went wrong.
+    pub fn not_classified(model_version: &str, status: &str, reason: &str) -> Self {
+        MlResult {
+            status: status.to_string(),
+            model_version: model_version.to_string(),
+            label_id: None,
+            label_name: None,
+            confidence: 0.0,
+            sensitive: false,
+            chunks: 0,
+            chunks_total: None,
+            tokens: 0,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    /// The model could not answer (missing, unloadable, inference failure). This
+    /// is the state EGRESS channels weigh `failBlock` against; the kernel read
+    /// path never does (a model that will not load must not deny every read).
+    pub fn unavailable(model_version: &str, reason: &str) -> Self {
+        Self::not_classified(model_version, ML_STATUS_UNAVAILABLE, reason)
+    }
+
+    /// The model was deliberately not run on this path.
+    pub fn skipped(model_version: &str, reason: &str) -> Self {
+        Self::not_classified(model_version, ML_STATUS_SKIPPED, reason)
+    }
+
+    /// There was nothing to classify (empty clipboard, no extractable text). An
+    /// outcome, not a fault — it must never fail-block.
+    pub fn empty(model_version: &str) -> Self {
+        Self::not_classified(model_version, ML_STATUS_EMPTY, ML_REASON_NO_TEXT)
+    }
+
+    /// A prediction was actually produced.
+    pub fn is_ok(&self) -> bool {
+        self.status == ML_STATUS_OK
+    }
+
+    /// The model owed an answer and could not give one — the only state that
+    /// feeds `failBlock`.
+    pub fn is_unavailable(&self) -> bool {
+        self.status == ML_STATUS_UNAVAILABLE
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Verdict {
@@ -62,6 +225,13 @@ pub struct Verdict {
     pub extraction: Extraction,
     pub idm: Vec<IdmMatch>,
     pub edm: Vec<EdmSourceHit>,
+    /// The ML signal, when a channel ran (or deliberately skipped) the
+    /// classifier. `None` = the model was never in the picture, and the verdict
+    /// then serializes exactly as it did before this field existed — see the
+    /// module header. Fingerprint-only producers (`verdict`, `verdict_bytes`,
+    /// `verdict_text`) always leave it `None`; the channel attaches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ml: Option<MlResult>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -106,6 +276,7 @@ pub fn verdict_bytes(content: &[u8], filename: &str, bundle: &Bundle) -> Verdict
                 extraction: Extraction::Unreadable { reason: unreadable.reason.code().into() },
                 idm: Vec::new(),
                 edm: Vec::new(),
+                ml: None,
             };
         }
     };
@@ -118,6 +289,7 @@ pub fn verdict_bytes(content: &[u8], filename: &str, bundle: &Bundle) -> Verdict
         extraction: Extraction::Ok { format: extracted.format },
         idm,
         edm,
+        ml: None,
     }
 }
 
@@ -211,5 +383,6 @@ pub fn verdict_text(text: &str, bundle: &Bundle) -> Verdict {
         extraction: Extraction::Ok { format: "text".into() },
         idm,
         edm,
+        ml: None,
     }
 }

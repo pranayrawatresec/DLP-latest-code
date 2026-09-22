@@ -10,8 +10,19 @@
 //! * this file — the PURE decision (`inspect`) the tests drive directly, plus
 //!   `run_monitor`, the live loop.
 //!
+//! Two detection signals, fused: the cached fingerprint bundle (IDM/EDM) AND the
+//! ONNX document classifier. A clipboard copy is an EGRESS path with an async
+//! budget — nothing is blocked on our message-only window — so unlike the
+//! synchronous kernel read up-call it can afford a forward pass, and it runs one
+//! inline (`detect::decide`). The two are OR-ed, never AND-ed: fingerprinting
+//! cannot see an unregistered document and the model cannot name which document
+//! leaked. Each half answers to its own console action — `[clipboard]
+//! default_action` for the fingerprint half, the ML policy's `action` (and, when
+//! the model is unavailable, its `failBlock`) for the ML half.
+//!
 //! NEVER logs clipboard text or file contents (spec §1.3 / DO-NOT): incidents
-//! carry only hashes, scores, and metadata — exactly like the USB path.
+//! carry only hashes, scores, and metadata — exactly like the USB path. That
+//! binds the ML half too: a label id, a score and two counts, never a snippet.
 
 pub mod enforce;
 pub mod formats;
@@ -36,13 +47,13 @@ pub struct ClipboardDecision {
 /// any EDM row hit, or any matched document reaches the containment or coverage
 /// threshold. Clipboard snippets score low containment / high coverage, and EDM
 /// fires on a copied row — either signal blocks.
+///
+/// This is now the FINGERPRINT HALF only, and it delegates to `detect::decide` so
+/// the band test lives in exactly one place for every channel. The signature is
+/// unchanged on purpose — `tests/clipboard_verdict.rs` gates it — and so is the
+/// answer it gives; the ML half is fused on top of it in [`inspect`].
 pub fn verdict_blocks(v: &Verdict, block_at: f64, coverage_block_at: f64) -> bool {
-    if !v.edm.is_empty() {
-        return true;
-    }
-    v.idm
-        .iter()
-        .any(|m| m.containment >= block_at || m.coverage >= coverage_block_at)
+    detect::decide(v, &detect::Bands::new(block_at, coverage_block_at)).fingerprint
 }
 
 /// Synthesize the placeholder device identity for a clipboard incident. The
@@ -64,7 +75,11 @@ fn clipboard_device() -> DeviceIdentity {
 /// item on the wire (e.g. "(clipboard text)" or a file's basename) — never the
 /// content itself.
 fn verdict_incident(label: &str, verdict: Verdict, block: bool, channel: &str) -> Option<UsbIncident> {
-    let has_match = !verdict.idm.is_empty() || !verdict.edm.is_empty();
+    // A model-only hit is a real detection and must raise a real incident —
+    // otherwise the one case the classifier exists for (an UNREGISTERED sensitive
+    // document) would be blocked with nothing to review.
+    let ml_hit = verdict.ml.as_ref().is_some_and(|m| m.is_ok() && m.sensitive);
+    let has_match = !verdict.idm.is_empty() || !verdict.edm.is_empty() || ml_hit;
     let action = if block { ActionTaken::Blocked } else { ActionTaken::Audited };
     let file_sha256 = verdict.file_sha256.clone();
 
@@ -143,14 +158,44 @@ pub fn inspect(
             }
             let Some(bundle) = bundle else {
                 // No policy: cannot score. Fail per config (only under enforce).
+                // The classifier is deliberately NOT consulted here either: with
+                // no bundle there is no `Verdict` to hang a result on and no
+                // incident to raise, and `fail_block` already covers the copy.
                 return ClipboardDecision { block: cfg.fail_block, incidents: Vec::new() };
             };
-            let verdict = detect::verdict_text(text, bundle);
+            let mut verdict = detect::verdict_text(text, bundle);
+            // The SECOND signal: classify the copied snippet inline. A clipboard
+            // copy is an EGRESS path with an async budget (we are on our own
+            // message-only window, nothing is blocked on us), so unlike the kernel
+            // read up-call it can afford a forward pass. `None` while the console
+            // policy is inert, which leaves the verdict byte-identical.
+            verdict.ml = detect::decide::ml_for_text(text);
             // The signal decides IF the copy is sensitive; default_action decides
             // what to DO about it. `allow_audited` (default) records the incident
             // but never blocks; `block` clears the clipboard on a signal.
-            let signal = verdict_blocks(&verdict, cfg.block_at, cfg.coverage_block_at);
-            let block = signal && cfg.default_action == ClipboardAction::Block;
+            //
+            // FUSION (OR, never AND): a registered document caught by
+            // fingerprinting, or an unregistered one the model puts in a class the
+            // admin marked. Each covers the other's blind spot; ML can only add.
+            let decision = detect::decide(
+                &verdict,
+                &detect::Bands::new(cfg.block_at, cfg.coverage_block_at),
+            );
+            // Each half answers to its OWN console action: the fingerprint half to
+            // `[clipboard] default_action`, the ML half to the ML policy's
+            // `action` (and, when the model is unavailable, to its `failBlock` —
+            // honoured here because a copy is egress).
+            let block = (decision.fingerprint && cfg.default_action == ClipboardAction::Block)
+                || detect::decide::ml_blocks_egress(verdict.ml.as_ref());
+            if decision.sensitive {
+                // Metadata only — never the copied text.
+                tracing::info!(
+                    signal = decision.signal.as_deref().unwrap_or(""),
+                    severity = decision.severity.map(|s| s.as_str()).unwrap_or(""),
+                    block,
+                    "clipboard fusion decision"
+                );
+            }
             let mut incidents = Vec::new();
             if let Some(inc) = verdict_incident("(clipboard text)", verdict, block, channel) {
                 incidents.push(inc);
@@ -169,9 +214,16 @@ pub fn inspect(
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 match detect::verdict(path, bundle) {
-                    Ok(v) => {
-                        let signal = verdict_blocks(&v, cfg.block_at, cfg.coverage_block_at);
-                        let b = signal && cfg.default_action == ClipboardAction::Block;
+                    Ok(mut v) => {
+                        // Same fusion as the text branch, per dropped file.
+                        v.ml = detect::decide::ml_for_path(path);
+                        let decision = detect::decide(
+                            &v,
+                            &detect::Bands::new(cfg.block_at, cfg.coverage_block_at),
+                        );
+                        let b = (decision.fingerprint
+                            && cfg.default_action == ClipboardAction::Block)
+                            || detect::decide::ml_blocks_egress(v.ml.as_ref());
                         block = block || b;
                         if let Some(inc) = verdict_incident(&label, v, b, channel) {
                             incidents.push(inc);
@@ -209,22 +261,6 @@ pub fn inspect(
     }
 }
 
-/// The CA the agent trusts for bundle signatures (mirrors usb/kguard resolve_ca).
-fn resolve_ca(cfg: &Config, storage: &Storage) -> Option<Vec<u8>> {
-    if storage.has_identity() {
-        storage.load_identity().ok().map(|(_, ca)| ca)
-    } else {
-        std::fs::read(&cfg.ca_cert_path).ok()
-    }
-}
-
-/// Load + verify the cached index bundle (mirrors usb/kguard). None → no-policy.
-fn load_verified_bundle(cfg: &Config, storage: &Storage) -> Option<Bundle> {
-    let ca_pem = resolve_ca(cfg, storage)?;
-    storage
-        .load_index_bundle()
-        .and_then(|bytes| Bundle::load(&bytes, &ca_pem).ok())
-}
 
 // ---------------------------------------------------------------------------
 // Windows: the live monitor (message-only clipboard listener).
@@ -247,11 +283,19 @@ where
         "clipboard monitor starting"
     );
 
-    let bundle = load_verified_bundle(cfg, storage);
-    if bundle.is_none() {
+    // Kept current by the watcher: this per-logon helper lives as long as the
+    // user's session, so a one-shot load would miss every document registered
+    // after logon. None → no-policy mode (per `fail_block`, see `inspect`).
+    let live = crate::livebundle::LiveBundle::start(
+        storage.dir(),
+        &cfg.ca_cert_path,
+        "clipboard",
+        crate::livebundle::DEFAULT_POLL_INTERVAL,
+    );
+    if live.current().is_none() {
         tracing::warn!(
             fail_block = cb.fail_block,
-            "no verified index bundle cached — clipboard audit runs in no-policy mode"
+            "no verified index bundle yet — clipboard audit runs in no-policy mode until one is downloaded"
         );
     }
 
@@ -271,7 +315,8 @@ where
         }
 
         let payload = watch::read_snapshot();
-        let decision = inspect(&payload, bundle.as_ref(), &cfg.clipboard);
+        let bundle = live.current();
+        let decision = inspect(&payload, bundle.as_deref(), &cfg.clipboard);
         for inc in decision.incidents {
             report(inc);
         }
@@ -331,6 +376,7 @@ mod tests {
                 matched_hashes: vec!["1".into()],
             }],
             edm: vec![],
+            ml: None,
         }
     }
 
@@ -359,8 +405,63 @@ mod tests {
             extraction: Extraction::Ok { format: "text".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         };
         assert!(!verdict_blocks(&v, 0.30, 0.60));
+    }
+
+    #[test]
+    fn ml_only_hit_still_raises_an_incident() {
+        // The case the classifier exists for: NOTHING is fingerprinted (no idm,
+        // no edm, extraction fine), and the model puts the copied text in a class
+        // the admin marked. Without this the copy would be blocked — or audited —
+        // with nothing for a reviewer to look at.
+        let mut v = matching_verdict();
+        v.idm.clear();
+        v.ml = Some(crate::detect::MlResult::classified(
+            "V6.2.01",
+            "NUC",
+            "Nuclear & Strategic Systems",
+            0.97,
+            true,
+            1,
+            120,
+        ));
+        let inc = verdict_incident("(clipboard text)", v, true, "clipboard")
+            .expect("a model-only hit is a real detection");
+        assert_eq!(inc.kind, IncidentKind::Match);
+        assert_eq!(inc.action_taken, ActionTaken::Blocked);
+        let carried = inc.verdict.expect("the verdict rides along");
+        assert_eq!(carried.ml.unwrap().label_id.as_deref(), Some("NUC"));
+    }
+
+    #[test]
+    fn ml_result_that_the_policy_rejected_raises_nothing() {
+        // The model answered, the policy said the label is not sensitive here →
+        // exactly as quiet as a clean fingerprint verdict.
+        let mut v = matching_verdict();
+        v.idm.clear();
+        v.ml = Some(crate::detect::MlResult::classified(
+            "V6.2.01", "PUB", "Public Information", 1.0, false, 1, 30,
+        ));
+        assert!(verdict_incident("(clipboard text)", v, false, "clipboard").is_none());
+    }
+
+    #[test]
+    fn verdict_blocks_is_the_fingerprint_half_of_the_shared_fusion() {
+        // The signature is frozen by tests/clipboard_verdict.rs; the answer must
+        // stay identical to `detect::decide`'s fingerprint half for the same bands.
+        for v in [matching_verdict(), {
+            let mut m = matching_verdict();
+            m.idm[0].containment = 0.05;
+            m.idm[0].coverage = 0.05;
+            m
+        }] {
+            assert_eq!(
+                verdict_blocks(&v, 0.30, 0.60),
+                detect::decide(&v, &detect::Bands::new(0.30, 0.60)).fingerprint
+            );
+        }
     }
 
     #[test]

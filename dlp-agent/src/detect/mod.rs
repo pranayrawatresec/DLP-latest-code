@@ -9,9 +9,13 @@
 //! server is a breaking protocol change that invalidates every stored
 //! fingerprint — do not "improve" it without a migration plan.
 //!
-//! Pure computation: no I/O, no network, no state.
+//! Pure computation: no I/O, no network, no state — with ONE deliberate
+//! exception: [`decide`], the fusion that unifies this fingerprint signal with
+//! the ML classifier's, keeps its `decide()` pure but also hosts the classify
+//! bridge every channel shares (see that module's header).
 
 pub mod bundle;
+pub mod decide;
 pub mod edm;
 pub mod extract;
 pub mod normalize;
@@ -19,11 +23,17 @@ pub mod shingle;
 pub mod verdict;
 
 pub use bundle::Bundle;
+pub use decide::{decide, Bands, Decision, Severity};
 pub use edm::{match_edm, EdmRowHit, EdmSourceHit};
 pub use extract::{extract_text, ExtractedText, Reason, Unreadable};
 pub use normalize::{normalize, Normalized};
 pub use shingle::{fnv1a64, shingles_of, winnow, Fingerprint, DEFAULT_K, DEFAULT_W};
-pub use verdict::{verdict, verdict_bytes, verdict_text, Extraction, IdmMatch, Verdict};
+pub use verdict::{
+    verdict, verdict_bytes, verdict_text, Extraction, IdmMatch, MlResult, Verdict,
+    ML_REASON_LOAD_FAILED, ML_REASON_MODEL_NOT_LOADED, ML_REASON_NO_TEXT,
+    ML_REASON_POLICY_OFF, ML_REASON_READ_PATH_SKIP, ML_STATUS_EMPTY, ML_STATUS_OK,
+    ML_STATUS_SKIPPED, ML_STATUS_UNAVAILABLE,
+};
 
 use std::collections::HashSet;
 

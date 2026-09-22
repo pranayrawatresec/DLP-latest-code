@@ -177,6 +177,7 @@ mod tests {
                 matched_hashes: vec![],
             }],
             edm: vec![],
+            ml: None,
         }
     }
 
@@ -188,6 +189,7 @@ mod tests {
             extraction: Extraction::Ok { format: "txt".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         }
     }
 
@@ -198,6 +200,7 @@ mod tests {
             extraction: Extraction::Unreadable { reason: "encrypted-zip".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         }
     }
 

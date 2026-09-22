@@ -24,9 +24,17 @@
 //!
 //! Scoring reuses the FROZEN `detect::verdict`/`verdict_text` (DO-NOT change
 //! `detect/`). `detect` is audit-only (no allow/block mapping), so we map the
-//! verdict to allow/warn/block HERE using the same thresholds as
-//! `kguard::should_block` (containment ≥ block_at OR coverage ≥ coverage_block_at
-//! OR any EDM hit ⇒ block; any lesser match ⇒ warn; else allow).
+//! verdict to allow/warn/block HERE, via the shared fusion `detect::decide`:
+//! containment ≥ block_at OR coverage ≥ coverage_block_at OR any EDM hit ⇒ block
+//! (the same bands `kguard::should_block` applies), any lesser match ⇒ warn, else
+//! allow.
+//!
+//! On top of that the ONNX document classifier is fused in as a SECOND,
+//! independent signal — which is what catches the upload this channel could
+//! otherwise never see: a sensitive document nobody ever fingerprinted. It can
+//! only ADD (`sensitive = fingerprint OR ml`); an ML hit maps to block under the
+//! ML policy's `action = "block"` and to warn under `audit`, and an UNAVAILABLE
+//! model honours `failBlock` because a web upload is an egress path.
 //!
 //! NEVER logs or transmits file/upload CONTENT: the reply and any incident carry
 //! only hashes, scores, the match title, and the url/origin metadata.
@@ -40,7 +48,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::detect::Verdict;
+use crate::detect::{self, Verdict};
+use crate::mlpolicy::MlPolicy;
 
 /// Max message the host will accept. Chrome's 1 MB cap is on messages the host
 /// SENDS to the extension; messages FROM the extension may be larger, and a
@@ -160,23 +169,53 @@ pub fn write_message<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer.flush()
 }
 
-/// Map a `detect::Verdict` to a web disposition using the shared thresholds
-/// (mirror `kguard::should_block`). Returns the disposition + the strongest
-/// match (if any) for the reply/incident. Pure — no I/O.
-pub fn map_verdict(v: &Verdict, block_at: f64, coverage_block_at: f64) -> (WebVerdict, Option<MatchInfo>) {
+/// Map a `detect::Verdict` to a web disposition, fusing BOTH detection signals
+/// through `detect::decide` (the fingerprint half is the same band test
+/// `kguard::should_block` applies). Returns the disposition + the strongest match
+/// (if any) for the reply/incident. Pure — no I/O; the ML policy comes in as
+/// `ml`, so this stays exhaustively unit-testable.
+///
+/// Mapping semantics are preserved and extended, in priority order:
+/// * fingerprint hit (EDM row, or an IDM match at/over the bands) → **Block**, as
+///   before;
+/// * an ML hit (a class the admin marked, at/over its threshold) → **Block** when
+///   the ML policy's `action` is `block`, **Warn** when it is `audit` — a brand-new
+///   signal must not silently start denying uploads;
+/// * the model was UNAVAILABLE while the policy is live → **Block** if `failBlock`.
+///   A web upload is egress, so it honours fail-secure (unlike the kernel read
+///   path, which never does);
+/// * a lesser fingerprint match, below the bands → **Warn**, as before;
+/// * nothing → **Allow**.
+pub fn map_verdict(
+    v: &Verdict,
+    block_at: f64,
+    coverage_block_at: f64,
+    ml: &MlPolicy,
+) -> (WebVerdict, Option<MatchInfo>) {
     // Strongest IDM match (verdict already sorts strongest-first) for the UI.
     let strongest = v.idm.first().map(|m| MatchInfo {
         title: m.title.clone(),
         containment: m.containment,
     });
 
-    let block = !v.edm.is_empty()
-        || v
-            .idm
-            .iter()
-            .any(|m| m.containment >= block_at || m.coverage >= coverage_block_at);
-    if block {
+    let decision = detect::decide(v, &detect::Bands::new(block_at, coverage_block_at));
+    // Fail-secure: the model owed an answer on an EGRESS path and could not give
+    // one. Weighed with the fingerprint half, never against it.
+    // An INERT policy (off, or no label selected) contributes nothing at all —
+    // checked explicitly because `failBlock` defaults to true, so a policy that
+    // was never armed must not be able to block on a stale result.
+    let live = !ml.is_inert();
+    let unavailable = live && v.ml.as_ref().is_some_and(|m| m.is_unavailable());
+    if decision.fingerprint || (unavailable && ml.fail_block) {
         return (WebVerdict::Block, strongest);
+    }
+    if live && decision.ml {
+        // OR, never AND: an unregistered document the model puts in a marked
+        // class is caught here even though no fingerprint could ever match it.
+        return (
+            if ml.blocks() { WebVerdict::Block } else { WebVerdict::Warn },
+            strongest,
+        );
     }
     // A lesser match (below block thresholds) → warn (audit but let through).
     if !v.idm.is_empty() || !v.edm.is_empty() {
@@ -196,10 +235,19 @@ pub struct Handled {
 /// Handle one request with INJECTED scanners (so this is unit-testable without a
 /// real `Bundle`). `scan_text` scores raw text; `scan_file` scores a file path.
 /// Either may be absent from the request → an `allow` reply with a reason.
+///
+/// The ML half is attached to the scored verdict HERE, before the disposition is
+/// mapped, because the host is the only place that still holds the upload's
+/// content (the injected scanners consume it). The classifier is reached through
+/// the process-wide handle the same way the policy is (see `src/mlpolicy.rs` for
+/// why that indirection exists): with the policy inert — the shipped default, and
+/// every unit test below — the helpers return `None` and this function behaves
+/// exactly as it did before the model existed.
 pub fn handle_request<FT, FF, FB>(
     req: &Request,
     block_at: f64,
     coverage_block_at: f64,
+    ml: &MlPolicy,
     scan_text: FT,
     scan_file: FF,
     scan_bytes: FB,
@@ -209,13 +257,17 @@ where
     FF: FnOnce(&Path) -> anyhow::Result<Verdict>,
     FB: FnOnce(&[u8], &str) -> Verdict,
 {
+    // Each arm yields the fingerprint verdict AND the ML result for the same
+    // bytes, so the two signals are always about the same thing.
     let verdict = match req.kind {
         ScanKind::ScanText => match &req.text {
-            Some(t) => Ok(scan_text(t)),
+            Some(t) => Ok((scan_text(t), detect::decide::ml_for_text(t))),
             None => Err("scan_text request without text".to_string()),
         },
         ScanKind::ScanFile => match &req.path {
-            Some(p) => scan_file(Path::new(p)).map_err(|e| format!("file scan failed: {e}")),
+            Some(p) => scan_file(Path::new(p))
+                .map(|v| (v, detect::decide::ml_for_path(Path::new(p))))
+                .map_err(|e| format!("file scan failed: {e}")),
             None => Err("scan_file request without path".to_string()),
         },
         ScanKind::ScanBytes => match &req.content_b64 {
@@ -234,7 +286,8 @@ where
                             .as_deref()
                             .and_then(|p| Path::new(p).file_name().map(|s| s.to_string_lossy().into_owned()))
                             .unwrap_or_else(|| "upload".to_string());
-                        Ok(scan_bytes(&bytes, &name))
+                        let ml_result = detect::decide::ml_for_bytes(&bytes, &name);
+                        Ok((scan_bytes(&bytes, &name), ml_result))
                     }
                     Err(e) => Err(format!("scan_bytes base64 decode failed: {e}")),
                 }
@@ -244,10 +297,27 @@ where
     };
 
     match verdict {
-        Ok(v) => {
-            let (disp, mi) = map_verdict(&v, block_at, coverage_block_at);
+        Ok((mut v, ml_result)) => {
+            v.ml = ml_result;
+            let (disp, mi) = map_verdict(&v, block_at, coverage_block_at, ml);
+            // The reason names WHICH signal fired, so the extension's banner can
+            // say something true. A label id is metadata, never content.
+            let ml_label = v
+                .ml
+                .as_ref()
+                .filter(|m| m.is_ok() && m.sensitive)
+                .and_then(|m| m.label_id.clone());
+            let ml_unavailable = v.ml.as_ref().is_some_and(|m| m.is_unavailable());
             let reason = match disp {
                 WebVerdict::Allow => None,
+                // No fingerprint match at all ⇒ the ML half is what fired.
+                _ if mi.is_none() && ml_label.is_some() => Some(format!(
+                    "classified as sensitive ({})",
+                    ml_label.unwrap_or_default()
+                )),
+                _ if mi.is_none() && ml_unavailable => {
+                    "classifier unavailable — fail-secure".to_string().into()
+                }
                 WebVerdict::Block => Some("matched protected content".to_string()),
                 WebVerdict::Warn => Some("partial match — audited".to_string()),
             };
@@ -344,10 +414,16 @@ where
                 continue;
             }
         };
+        // Re-read the ML policy per request, not once per session: a console
+        // change that arrives on the next check-in must take effect on the very
+        // next upload, not when the browser is restarted. It is a cheap
+        // `RwLock` clone of a handful of fields.
+        let ml = crate::mlpolicy::active();
         let handled = handle_request(
             &req,
             block_at,
             coverage_block_at,
+            &ml,
             |t| scan_text(t),
             |p| scan_file(p),
             |b, n| scan_bytes(b, n),
@@ -366,7 +442,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::{EdmRowHit, EdmSourceHit, Extraction, IdmMatch, Verdict};
+    use crate::detect::{EdmRowHit, EdmSourceHit, Extraction, IdmMatch, MlResult, Verdict};
+    use crate::mlpolicy::{MlAction, MlLabelRule};
+
+    /// The shipped default: ML inert. Every pre-existing test below runs under
+    /// it, which is how they prove the fusion changed nothing when the feature
+    /// is off.
+    fn ml_off() -> MlPolicy {
+        MlPolicy::default()
+    }
+
+    /// A live policy that marks NUC sensitive, with the given action.
+    fn ml_on(action: MlAction) -> MlPolicy {
+        MlPolicy {
+            enabled: true,
+            action,
+            labels: vec![MlLabelRule { id: "NUC".into(), min_confidence: None }],
+            ..MlPolicy::default()
+        }
+    }
 
     fn clean() -> Verdict {
         Verdict {
@@ -375,6 +469,7 @@ mod tests {
             extraction: Extraction::Ok { format: "text".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         }
     }
 
@@ -418,22 +513,79 @@ mod tests {
 
     #[test]
     fn map_verdict_blocks_on_containment_and_edm() {
-        assert_eq!(map_verdict(&with_idm(0.5, 0.0), 0.30, 0.60).0, WebVerdict::Block);
+        assert_eq!(map_verdict(&with_idm(0.5, 0.0), 0.30, 0.60, &ml_off()).0, WebVerdict::Block);
         let mut v = clean();
         v.edm.push(EdmSourceHit {
             source_id: "s".into(),
             name: "PII".into(),
             rows_hit: vec![EdmRowHit { row_id: 1, fields: vec!["x".into()] }],
         });
-        assert_eq!(map_verdict(&v, 0.30, 0.60).0, WebVerdict::Block);
+        assert_eq!(map_verdict(&v, 0.30, 0.60, &ml_off()).0, WebVerdict::Block);
     }
 
     #[test]
     fn map_verdict_warns_on_lesser_match_and_allows_clean() {
-        let (disp, mi) = map_verdict(&with_idm(0.10, 0.10), 0.30, 0.60);
+        let (disp, mi) = map_verdict(&with_idm(0.10, 0.10), 0.30, 0.60, &ml_off());
         assert_eq!(disp, WebVerdict::Warn);
         assert_eq!(mi.unwrap().title, "Secret Plan");
-        assert_eq!(map_verdict(&clean(), 0.30, 0.60).0, WebVerdict::Allow);
+        assert_eq!(map_verdict(&clean(), 0.30, 0.60, &ml_off()).0, WebVerdict::Allow);
+    }
+
+    /// An `ok` ML result the policy already judged sensitive (or not).
+    fn ml_result(sensitive: bool) -> MlResult {
+        MlResult::classified("V6.2.01", "NUC", "Nuclear & Strategic Systems", 0.98, sensitive, 1, 40)
+    }
+
+    #[test]
+    fn map_verdict_ml_only_hit_blocks_under_block_action() {
+        // The upload this channel could otherwise never see: nothing registered
+        // matches it, but the model puts it in a class the admin marked.
+        let mut v = clean();
+        v.ml = Some(ml_result(true));
+        let (disp, mi) = map_verdict(&v, 0.30, 0.60, &ml_on(MlAction::Block));
+        assert_eq!(disp, WebVerdict::Block);
+        assert!(mi.is_none(), "no fingerprint match to name");
+    }
+
+    #[test]
+    fn map_verdict_ml_only_hit_warns_under_audit_action() {
+        let mut v = clean();
+        v.ml = Some(ml_result(true));
+        assert_eq!(
+            map_verdict(&v, 0.30, 0.60, &ml_on(MlAction::Audit)).0,
+            WebVerdict::Warn,
+            "a new signal must not silently start denying uploads"
+        );
+    }
+
+    #[test]
+    fn map_verdict_ml_below_policy_is_allow() {
+        // The model answered, the policy said "not sensitive" → nothing fired.
+        let mut v = clean();
+        v.ml = Some(ml_result(false));
+        assert_eq!(map_verdict(&v, 0.30, 0.60, &ml_on(MlAction::Block)).0, WebVerdict::Allow);
+    }
+
+    #[test]
+    fn map_verdict_ml_unavailable_honours_fail_block_on_this_egress_path() {
+        let mut v = clean();
+        v.ml = Some(MlResult::unavailable("V6.2.01", "model_not_loaded"));
+
+        let mut p = ml_on(MlAction::Audit);
+        p.fail_block = true;
+        assert_eq!(map_verdict(&v, 0.30, 0.60, &p).0, WebVerdict::Block, "fail secure");
+
+        p.fail_block = false;
+        assert_eq!(map_verdict(&v, 0.30, 0.60, &p).0, WebVerdict::Allow, "fail open by choice");
+    }
+
+    #[test]
+    fn map_verdict_ml_never_downgrades_a_fingerprint_block() {
+        // Model confidently says PUBLIC, policy is audit-only — the registered
+        // document still blocks.
+        let mut v = with_idm(0.9, 0.9);
+        v.ml = Some(MlResult::classified("V6.2.01", "PUB", "Public Information", 1.0, false, 1, 8));
+        assert_eq!(map_verdict(&v, 0.30, 0.60, &ml_on(MlAction::Audit)).0, WebVerdict::Block);
     }
 
     #[test]
@@ -452,6 +604,7 @@ mod tests {
             &req,
             0.30,
             0.60,
+            &ml_off(),
             |_t| with_idm(0.9, 0.9),
             |_p| unreachable!("scan_file not called for scan_text"),
             |_b, _n| unreachable!("scan_bytes not called for scan_text"),
@@ -475,7 +628,7 @@ mod tests {
             origin: String::new(),
             id: 7,
         };
-        let handled = handle_request(&req, 0.30, 0.60, |_| clean(), |_| Ok(clean()), |_, _| clean());
+        let handled = handle_request(&req, 0.30, 0.60, &ml_off(), |_| clean(), |_| Ok(clean()), |_, _| clean());
         assert_eq!(handled.reply.verdict, WebVerdict::Allow);
         assert!(handled.reply.reason.is_some());
         assert!(handled.incident.is_none());
@@ -500,6 +653,7 @@ mod tests {
             &req,
             0.30,
             0.60,
+            &ml_off(),
             |_t| unreachable!("scan_text not called for scan_bytes"),
             |_p| unreachable!("scan_file not called for scan_bytes"),
             |bytes, name| {
@@ -527,7 +681,7 @@ mod tests {
             origin: String::new(),
             id: 3,
         };
-        let handled = handle_request(&req, 0.30, 0.60, |_| clean(), |_| Ok(clean()), |_, _| clean());
+        let handled = handle_request(&req, 0.30, 0.60, &ml_off(), |_| clean(), |_| Ok(clean()), |_, _| clean());
         // Malformed content must not brick the browser → allow with a reason.
         assert_eq!(handled.reply.verdict, WebVerdict::Allow);
         assert!(handled.reply.reason.is_some());

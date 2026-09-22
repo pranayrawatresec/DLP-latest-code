@@ -11,9 +11,16 @@
 //! 2. We score those bytes with `detect::verdict_bytes()` against the cached,
 //!    signature-verified index bundle. Content is used only for the fingerprint
 //!    math and is NEVER logged.
-//! 3. We apply configurable policy thresholds (SPEC §3): BLOCK if any matched
-//!    document's `containment >= block_at`, or `coverage >= coverage_block_at`,
-//!    or any EDM row hit.
+//! 3. We fuse the two detection signals through `detect::decide` (SPEC §3):
+//!    BLOCK if any matched document's `containment >= block_at`, or
+//!    `coverage >= coverage_block_at`, or any EDM row hit — OR if the ONNX
+//!    document classifier hit a business-function class the admin marked
+//!    sensitive. On a WRITE the model RUNS inline (and deposits its answer in
+//!    `ml::cache`); on the SYNCHRONOUS read up-call it is only ever CONSULTED —
+//!    a content-keyed cache lookup, with a miss handed to the background
+//!    classifier and the read decided on fingerprints alone unless the console
+//!    opted into `denyUnclassified` (see `detect::decide::read_path_ml` and
+//!    `detect::decide::read_path_reply`).
 //! 4. `FilterReplyMessage` returns `{allow|block}` to the driver, which
 //!    quarantines on BLOCK.
 //! 5. On a match we raise an incident, reusing the exact mTLS/offline-queue path
@@ -247,26 +254,6 @@ fn block_note(reason: u32) -> &'static str {
     }
 }
 
-/// The CA the agent trusts for bundle signatures: pinned-at-enrollment when
-/// enrolled, else the installer-provisioned CA file (mirrors main.rs::load_ca /
-/// usb::resolve_ca).
-fn resolve_ca(cfg: &Config, storage: &Storage) -> Option<Vec<u8>> {
-    if storage.has_identity() {
-        storage.load_identity().ok().map(|(_, ca)| ca)
-    } else {
-        std::fs::read(&cfg.ca_cert_path).ok()
-    }
-}
-
-/// Load + verify the cached index bundle. A load/verify failure means "no
-/// bundle" → the guard answers per `fail_block` (fail-secure knob).
-fn load_verified_bundle(cfg: &Config, storage: &Storage) -> Option<Bundle> {
-    let ca_pem = resolve_ca(cfg, storage)?;
-    storage
-        .load_index_bundle()
-        .and_then(|bytes| Bundle::load(&bytes, &ca_pem).ok())
-}
-
 /// Best-effort drive letter from an NT device path. The driver sends a
 /// normalized name like `\Device\HarddiskVolume3\dir\file.txt`, which has no
 /// drive letter; we leave it empty in that case. Only a genuine `X:\...` yields
@@ -335,6 +322,25 @@ fn incident_for(
             device,
             action_taken: action,
             note: Some("unreadable-on-removable".into()),
+            key_id: None,
+            sealed_sha256: None,
+        });
+    }
+
+    // A model hit the console is only AUDITING (`action = "audit"`) did not block,
+    // but it is still a detection: an unregistered document in a category the
+    // admin marked sensitive left the machine. Without this branch the one case
+    // the classifier exists for would pass with nothing to review.
+    if verdict.ml.as_ref().is_some_and(|m| m.is_ok() && m.sensitive) {
+        return Some(UsbIncident {
+            kind: IncidentKind::Match,
+            channel: channel.to_string(),
+            file_name: verdict.file_name.clone(),
+            file_sha256: verdict.file_sha256.clone(),
+            verdict: Some(verdict),
+            device,
+            action_taken: action,
+            note: Some("ml-audited".into()),
             key_id: None,
             sealed_sha256: None,
         });
@@ -535,42 +541,57 @@ where
     let initial = snapshot_config(shared_cfg);
     let kg = &initial.kguard;
 
-    // Load the verified bundle once. None → answer per fail_block until a
-    // bundle is present (fail-secure knob, SPEC §3).
-    let bundle = load_verified_bundle(&initial, storage);
-    if bundle.is_none() {
+    // The verified index, kept CURRENT for the life of this guard: a bundle the
+    // check-in worker downloads later (a newly registered document, or the
+    // first one on a fresh or recovered endpoint) is picked up within
+    // `DEFAULT_POLL_INTERVAL`, with no restart. This used to be a one-shot load,
+    // so a new document was not enforced on USB until the service restarted,
+    // and a guard that started with no index stayed blind even after one was
+    // downloaded. With no bundle the guard answers per `fail_block`
+    // (fail-secure knob, SPEC §3) — see `decide`.
+    let live = crate::livebundle::LiveBundle::start(
+        storage.dir(),
+        &initial.ca_cert_path,
+        "kguard",
+        crate::livebundle::DEFAULT_POLL_INTERVAL,
+    );
+    if live.current().is_none() {
         tracing::warn!(
             fail_block = kg.fail_block,
-            "no verified index bundle cached — kguard answers per fail_block until one is loaded"
+            "no verified index bundle yet — kguard answers per fail_block until one is downloaded (picked up automatically)"
         );
     }
 
     // Connect to \DlpFltPort. Failure here almost always means the driver is
-    // not loaded (operator manual step, SPEC §8).
-    let port_name: Vec<u16> = "\\DlpFltPort".encode_utf16().chain(std::iter::once(0)).collect();
-    let port: HANDLE = unsafe {
-        FilterConnectCommunicationPort(PCWSTR(port_name.as_ptr()), 0, None, 0, None)
-    }
-    .context("FilterConnectCommunicationPort(\\DlpFltPort) failed — is dlpflt.sys loaded?")?;
+    // not loaded (operator manual step, SPEC §8). Also used to RE-connect when
+    // the content generation changes (see the loop below).
+    let connect = || -> Result<HANDLE> {
+        let port_name: Vec<u16> = "\\DlpFltPort".encode_utf16().chain(std::iter::once(0)).collect();
+        let port: HANDLE = unsafe {
+            FilterConnectCommunicationPort(PCWSTR(port_name.as_ptr()), 0, None, 0, None)
+        }
+        .context("FilterConnectCommunicationPort(\\DlpFltPort) failed — is dlpflt.sys loaded?")?;
+        tracing::info!("connected to \\DlpFltPort — this PID is the driver's skip-self identity");
 
-    tracing::info!("connected to \\DlpFltPort — this PID is the driver's skip-self identity");
+        // Send the watch-set config (spec §3.0) so the driver knows whether to
+        // inspect fixed/network volumes and which path prefixes to watch. An empty
+        // watch-set leaves the driver in removable-only mode (backward compatible).
+        send_config(port, &initial.kguard);
 
-    // Send the watch-set config (spec §3.0) so the driver knows whether to
-    // inspect fixed/network volumes and which path prefixes to watch. An empty
-    // watch-set leaves the driver in removable-only mode (backward compatible).
-    send_config(port, &initial.kguard);
-
-    // Fixed-volume attach (console read-deny policy, scan_fixed=on). The driver's
-    // InstanceSetup only accepts a FIXED volume once its config says ScanFixed=1
-    // AND WatchCount>0 — so this attach MUST follow send_config above, or it comes
-    // back STATUS_FLT_DO_NOT_ATTACH. Doing it here (on the guard's own single
-    // \DlpFltPort connection, in the correct order) is what actually puts an
-    // instance on C:; the run-endpoint apply path only writes the registry knobs.
-    // Idempotent: "already attached" is success. Runs each (re)start of the guard.
-    if initial.kguard.exfil_read_block && initial.kguard.scan_fixed {
-        #[cfg(windows)]
-        crate::readdenypolicy::attach_fixed_volume("C:");
-    }
+        // Fixed-volume attach (console read-deny policy, scan_fixed=on). The driver's
+        // InstanceSetup only accepts a FIXED volume once its config says ScanFixed=1
+        // AND WatchCount>0 — so this attach MUST follow send_config above, or it comes
+        // back STATUS_FLT_DO_NOT_ATTACH. Doing it here (on the guard's own single
+        // \DlpFltPort connection, in the correct order) is what actually puts an
+        // instance on C:; the run-endpoint apply path only writes the registry knobs.
+        // Idempotent: "already attached" is success. Runs each (re)connect.
+        if initial.kguard.exfil_read_block && initial.kguard.scan_fixed {
+            #[cfg(windows)]
+            crate::readdenypolicy::attach_fixed_volume("C:");
+        }
+        Ok(port)
+    };
+    let mut port = connect()?;
 
     // Read-deny: run a background tracker that pushes the exfil-channel PID set so
     // the driver's DlpPreRead can DENY sensitive reads by exfil processes. Only
@@ -593,16 +614,55 @@ where
     };
 
     let _ = storage; // identity/CA already consumed above; kept for symmetry
-    let result = message_loop(port, shared_cfg, bundle.as_ref(), health, stop, &mut report);
 
-    // Stop + join the pusher BEFORE closing the port (no use of a closed handle).
+    // THE RECONNECT LOOP. The driver caches verdicts — known-clean and
+    // known-sensitive file ids, per-open verdicts, the known-bad hash ring — all
+    // stamped with a content EPOCH it bumps on exactly one event: an agent
+    // (re)connect (comms.c DlpPortConnect). So when the fingerprint index or the
+    // ML policy changes, a document the driver already cached as CLEAN keeps
+    // being served clean without ever asking us again — a document registered
+    // today stays readable by an exfil tool that read it yesterday. Reconnecting
+    // is the driver's own, designed invalidation: it bumps the epoch (every cached
+    // verdict becomes a miss and is re-scored under the new index) and resets the
+    // IPC circuit breaker. Between the close and the reconnect — milliseconds —
+    // the driver applies its "no agent connected" FailMode, exactly as it does
+    // during a service restart. The PID-push connection is separate and untouched.
+    let result = loop {
+        match message_loop(port, shared_cfg, &live, health, stop, &mut report) {
+            Ok(LoopEnd::ContentChanged) => {
+                unsafe {
+                    let _ = CloseHandle(port);
+                }
+                match connect() {
+                    Ok(p) => {
+                        port = p;
+                        tracing::info!(
+                            index_version = ?live.version(),
+                            "detection content changed (new index or ML policy) — reconnected so the driver drops verdicts cached under the old content"
+                        );
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+            Ok(LoopEnd::Stopped) | Ok(LoopEnd::PortClosed) => {
+                unsafe {
+                    let _ = CloseHandle(port);
+                }
+                break Ok(());
+            }
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(port);
+                }
+                break Err(e);
+            }
+        }
+    };
+
+    // Stop + join the pusher (it uses its OWN connection, never `port`).
     pusher_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = pusher {
         let _ = h.join();
-    }
-
-    unsafe {
-        let _ = CloseHandle(port);
     }
     result
 }
@@ -923,22 +983,60 @@ fn driver_read_deny_mode() -> u32 {
     0
 }
 
+/// Why [`message_loop`] returned.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopEnd {
+    /// The caller's stop flag was set.
+    Stopped,
+    /// The port closed or errored (driver unloaded) — the supervisor retries.
+    PortClosed,
+    /// The fingerprint index or the ML policy changed since this connection was
+    /// made: reconnect, so the driver drops verdicts cached under the old ones.
+    ContentChanged,
+}
+
+/// Everything a verdict the DRIVER caches depends on besides the file's bytes.
+/// When it differs from its value at connect time, those cached verdicts are
+/// stale. The index is identified by how many newer bundles have gone live, the
+/// ML policy by its serialized form (thresholds, labels, action).
+#[cfg(windows)]
+fn content_generation(live: &crate::livebundle::LiveBundle) -> (u64, String) {
+    (
+        live.reloads(),
+        serde_json::to_string(&crate::mlpolicy::active()).unwrap_or_default(),
+    )
+}
+
+/// How long the receive waits before re-checking the stop flag and the content
+/// generation. Also bounds how long an index change can wait for a reconnect on
+/// an idle endpoint — the case that matters, because a file the driver cached
+/// clean produces NO up-call that could otherwise trigger it.
+#[cfg(windows)]
+const RECV_WAKE_MS: u32 = 1_000;
+
+#[cfg(windows)]
 fn message_loop<R>(
     port: windows::Win32::Foundation::HANDLE,
     shared_cfg: &Arc<RwLock<Config>>,
-    bundle: Option<&Bundle>,
+    live: &crate::livebundle::LiveBundle,
     health: Option<&Arc<SealerHealth>>,
     stop: Option<&Arc<AtomicBool>>,
     report: &mut R,
-) -> Result<()>
+) -> Result<LoopEnd>
 where
     R: FnMut(UsbIncident),
 {
     use std::mem::size_of;
     use std::sync::atomic::Ordering;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::Storage::InstallableFileSystems::{
         FilterGetMessage, FilterReplyMessage, FILTER_MESSAGE_HEADER, FILTER_REPLY_HEADER,
     };
+    use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use anyhow::Context as _;
 
     #[repr(C)]
     struct ReplyMessage {
@@ -981,16 +1079,44 @@ where
         );
     }
 
-    loop {
-        // Graceful shutdown: checked after each handled message. Note this cannot
-        // interrupt a `FilterGetMessage` that is currently blocked waiting for the
-        // driver — that unblocks only on the next scan or on port close (which the
-        // process exit at service stop forces). Documented limitation.
-        if let Some(s) = stop {
-            if s.load(Ordering::Relaxed) {
-                tracing::info!("kguard stop signalled — ending message loop");
-                return Ok(());
-            }
+    // The receive is OVERLAPPED so the loop can wake without a message: a
+    // `FilterGetMessage` that simply blocked could not notice a stop request or
+    // an index change until the driver next up-called — and a document the
+    // driver has cached clean produces no up-call at all.
+    //
+    // The OVERLAPPED is boxed and lives for the whole loop, and every path that
+    // abandons a pending receive CANCELS it and WAITS for the completion before
+    // the buffer or the OVERLAPPED is touched again — the same rule
+    // `ml::watch::drain_pending` enforces, for the same reason: the kernel
+    // writes into both until the I/O has actually completed.
+    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+        .context("creating the kguard receive event")?;
+    let mut ovl = Box::new(OVERLAPPED { hEvent: event, ..Default::default() });
+    let drain = |ovl: &OVERLAPPED| -> bool {
+        // true = the receive COMPLETED (a message raced the cancel and must be
+        // answered); false = it was cancelled or failed.
+        unsafe {
+            let _ = CancelIoEx(port, Some(ovl));
+            let mut n = 0u32;
+            GetOverlappedResult(port, ovl, &mut n, true).is_ok()
+        }
+    };
+    let connected_generation = content_generation(live);
+    let wants_to_leave = || -> Option<LoopEnd> {
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            return Some(LoopEnd::Stopped);
+        }
+        if content_generation(live) != connected_generation {
+            return Some(LoopEnd::ContentChanged);
+        }
+        None
+    };
+    // Set when a message raced a cancel: answer it, THEN leave.
+    let mut leave_after_reply: Option<LoopEnd> = None;
+
+    let end = 'recv: loop {
+        if let Some(end) = leave_after_reply.take().or_else(wants_to_leave) {
+            break 'recv end;
         }
 
         // Clear any content a PRIOR message left in the buffer before receiving the
@@ -1001,19 +1127,65 @@ where
             unsafe { std::ptr::write_bytes(buf_ptr.add(content_start), 0, content_hw) };
         }
 
+        unsafe {
+            let _ = ResetEvent(event);
+        }
+        *ovl = OVERLAPPED { hEvent: event, ..Default::default() };
         let recv = unsafe {
             FilterGetMessage(
                 port,
                 buf_ptr as *mut FILTER_MESSAGE_HEADER,
                 total_size as u32,
-                None,
+                Some(&mut *ovl),
             )
         };
-        if let Err(e) = recv {
-            // Port closed (driver unloaded) or a transient error: stop the loop
-            // and let the caller decide whether to reconnect.
-            tracing::warn!(error = %e, "FilterGetMessage returned error — ending kguard loop");
-            return Ok(());
+        match recv {
+            Ok(()) => {} // completed synchronously: a message is in the buffer
+            Err(e) if e.code() == ERROR_IO_PENDING.to_hresult() => {
+                // Wait for the message, waking every RECV_WAKE_MS to look at the
+                // stop flag and the content generation.
+                loop {
+                    match unsafe { WaitForSingleObject(event, RECV_WAKE_MS) } {
+                        WAIT_OBJECT_0 => {
+                            let mut n = 0u32;
+                            match unsafe { GetOverlappedResult(port, &*ovl, &mut n, false) } {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    // A signalled event does not prove the I/O
+                                    // finished — drain before leaving either way.
+                                    if drain(&ovl) {
+                                        break;
+                                    }
+                                    tracing::warn!(error = %e, "FilterGetMessage completed with an error — ending kguard loop");
+                                    break 'recv LoopEnd::PortClosed;
+                                }
+                            }
+                        }
+                        WAIT_TIMEOUT => {
+                            if let Some(end) = wants_to_leave() {
+                                if drain(&ovl) {
+                                    // A scan arrived in the same instant: answer
+                                    // it (with the CURRENT bundle), then leave.
+                                    leave_after_reply = Some(end);
+                                    break;
+                                }
+                                break 'recv end;
+                            }
+                        }
+                        other => {
+                            tracing::warn!(code = other.0, "kguard receive wait failed — ending kguard loop");
+                            let _ = drain(&ovl);
+                            break 'recv LoopEnd::PortClosed;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Port closed (driver unloaded) or a transient error: stop the loop
+                // and let the caller decide whether to reconnect.
+                tracing::warn!(error = %e, "FilterGetMessage returned error — ending kguard loop");
+                break 'recv LoopEnd::PortClosed;
+            }
         }
 
         // Fresh config snapshot per scan so a live whitelist re-sync (run-endpoint)
@@ -1061,7 +1233,10 @@ where
             // Score the in-memory content (NO file re-open), or fall back to the
             // configured fail behavior. `req.reason` selects the write vs
             // read-deny incident labelling (verdict semantics are identical).
-            decide(&cfg, kg, bundle, &device_path, content, truncated, req.reason, sealer_healthy)
+            // One snapshot per scan: the whole decision uses a single bundle
+            // even if the watcher swaps in a newer one mid-scan.
+            let bundle = live.current();
+            decide(&cfg, kg, bundle.as_deref(), &device_path, content, truncated, req.reason, sealer_healthy)
         };
 
         // Monitor mode: a read-reason "block" is really a WOULD-block — the driver
@@ -1103,7 +1278,17 @@ where
         if let Some(inc) = incident {
             report(inc);
         }
+    };
+
+    // No receive is pending on any path that reaches here (each break above
+    // either never issued one, saw it complete, or drained it).
+    unsafe {
+        let _ = CloseHandle(event);
     }
+    if end == LoopEnd::Stopped {
+        tracing::info!("kguard stop signalled — ending message loop");
+    }
+    Ok(end)
 }
 
 /// The basename (final path component) of an NT device path, used only to give
@@ -1135,7 +1320,7 @@ fn decide(
     bundle: Option<&Bundle>,
     device_path: &str,
     content: &[u8],
-    _truncated: bool,
+    truncated: bool,
     reason: u32,
     sealer_healthy: bool,
 ) -> (Option<bool>, Option<UsbIncident>) {
@@ -1156,9 +1341,43 @@ fn decide(
     // bundle ⇒ no verdict ⇒ fail per `fail_block` below (unless an Encrypt
     // destination overrides — the monitor seals fail-secure without a bundle).
     let filename = basename_of(device_path);
-    let verdict = bundle.map(|b| detect::verdict_bytes(content, &filename, b));
+    let mut verdict = bundle.map(|b| detect::verdict_bytes(content, &filename, b));
+
+    // The SECOND detection signal, attached to the verdict BEFORE any block
+    // decision is taken — where the contract says it may run, and only there:
+    //
+    // * WRITE scan — the driver is not blocked on our reply the way the read
+    //   up-call is, so the model runs inline on the async budget. This is the
+    //   path that catches a classified document that was never fingerprinted:
+    //   a plan drafted this morning, copied to a stick.
+    // * READ scan (`DLP_REASON_READ`) — a SYNCHRONOUS kernel up-call with the
+    //   filesystem stack waiting on us. A DistilBERT forward pass has no place
+    //   in that budget, so the model is CONSULTED, never run: a content-keyed
+    //   lookup in `ml::cache` (a SHA-256 of the buffer the driver already gave
+    //   us plus a `HashMap` read) answers with what an off-path producer — the
+    //   at-creation watcher, the at-rest walker, or the WRITE deposit two lines
+    //   above — already learned about exactly these bytes. A MISS hands the
+    //   bytes to the background queue and degrades to fingerprints alone, which
+    //   is precisely the pre-cache behaviour.
+    //
+    // Every helper returns `None`/`Inert` while the console policy is inert, so
+    // an endpoint with the feature off produces byte-identical verdicts.
+    let mut read_cache_miss = false;
+    if let Some(v) = verdict.as_mut() {
+        if reason == DLP_REASON_READ {
+            let (ml, miss) = detect::decide::read_path_ml(content, &filename);
+            v.ml = ml;
+            read_cache_miss = miss;
+        } else {
+            // WRITE: classify inline on the async budget AND deposit the answer,
+            // keyed on the driver's prefix, so the same file read later by
+            // RustDesk/AnyDesk is already known (contract P4).
+            v.ml = detect::decide::ml_for_bytes_caching(content, &filename, truncated);
+        }
+    }
     if let Some(v) = &verdict {
-        // DIAGNOSTIC: exactly what the driver shipped for this scan.
+        // DIAGNOSTIC: exactly what the driver shipped for this scan. Label, score
+        // and counts only — NEVER content.
         tracing::info!(
             reason,
             filename = %filename,
@@ -1167,6 +1386,9 @@ fn decide(
             extraction = ?v.extraction,
             idm = v.idm.len(),
             edm = v.edm.len(),
+            ml = v.ml.as_ref().map(|m| m.status.as_str()).unwrap_or("off"),
+            ml_label = v.ml.as_ref().and_then(|m| m.label_id.as_deref()).unwrap_or(""),
+            ml_confidence = v.ml.as_ref().map(|m| m.confidence).unwrap_or(0.0),
             "kguard scan decide"
         );
     }
@@ -1204,19 +1426,29 @@ fn decide(
             // the read-deny cache with a clean verdict we could not actually produce
             // (the startup blind-window fix). The WRITE path keeps today's
             // fail-per-config behaviour exactly.
+            //
+            // DELIBERATELY not an ML-only verdict: without a bundle there is no
+            // `Verdict` to hang a result on, and `fail_block` here already blocks
+            // the write. Synthesising one would mean a second, parallel fail-secure
+            // path through the blind window for no protection gain — the model
+            // cannot name a document either way.
             if reason == DLP_REASON_READ {
                 return (None, None);
             }
             return (Some(kg.fail_block), None);
         }
     };
-    let block = if matches!(v.extraction, detect::Extraction::Unreadable { .. }) {
+    // ---- THE FUSION -----------------------------------------------------
+    // Half 1, FINGERPRINT: unchanged, still the two unit-tested band tests.
+    let fingerprint_block = if matches!(v.extraction, detect::Extraction::Unreadable { .. }) {
         // Content we can't parse. Fail-secure ONLY on the exfil-to-removable/network
         // (write) path, and only when `fail_block` is set: an unverifiable file must
         // not leave the machine. NEVER on the READ (read-deny classify) path — the
         // driver applies its own `ExfilReadFailBlock` policy to unverifiable reads
         // by exfil PIDs; an agent-side block here would deny ordinary binary/image
-        // reads on a genuine-allow verdict.
+        // reads on a genuine-allow verdict. (Unextractable content also yields no
+        // ML answer to weigh — `status = "empty"`, never `unavailable` — so this
+        // branch behaves exactly as it did before the model existed.)
         reason != DLP_REASON_READ && kg.fail_block
     } else if reason == DLP_REASON_READ {
         // Read-deny classify path: keep the `block_at` (0.30) band.
@@ -1226,6 +1458,58 @@ fn decide(
         // apply the tighter containment ceiling (`removable_write_block_at`, 0.15).
         should_block_removable_write(&v, kg)
     };
+
+    // Half 2, ML. BOTH paths weigh a positive model hit; they differ only in what
+    // an UNAVAILABLE model means:
+    //   WRITE — a hit blocks per `action`, and an unavailable model blocks per
+    //           `failBlock` (nothing unverified leaves the machine).
+    //   READ  — a hit blocks per `action`, and an unavailable model blocks NOTHING
+    //           (a model that will not load must not deny every read on the box).
+    // The read arm is what makes the verdict cache mean anything: a document the
+    // walker/watcher classified as NUC is denied to an exfil reader here. An
+    // earlier version wrote `reason != DLP_REASON_READ && ml_blocks_egress(..)`,
+    // which suppressed the fail-block arm by discarding the positive answer with
+    // it — every cache hit replied ALLOW and the whole pipeline was inert.
+    let ml_block = if reason == DLP_REASON_READ {
+        detect::decide::ml_blocks_read(v.ml.as_ref())
+    } else {
+        detect::decide::ml_blocks_egress(v.ml.as_ref())
+    };
+
+    // OR, never AND: fingerprinting cannot see an unregistered document and the
+    // model cannot name which document leaked. ML only ever ADDS.
+    let block = fingerprint_block || ml_block;
+
+    // denyUnclassified (contract P2) — the last word on a read whose content the
+    // model has never seen. See `detect::decide::read_path_reply` for the rule,
+    // and why a denial here deliberately raises NO incident.
+    if detect::decide::read_path_reply(block, read_cache_miss, detect::decide::deny_unclassified())
+        .is_none()
+    {
+        crate::ml::queue::note_deny_unclassified();
+        return (None, None);
+    }
+
+    // `detect::decide` states the same two halves in the channel-independent form
+    // the incident feed reports (`signal`, `severity`); for these bands its
+    // fingerprint half is exactly what the band tests above compute — the
+    // equivalence is asserted in this module's tests.
+    let bands = if reason == DLP_REASON_READ {
+        detect::Bands::new(kg.block_at, kg.coverage_block_at)
+    } else {
+        detect::Bands::new(kg.removable_write_block_at, kg.coverage_block_at)
+    };
+    let decision = detect::decide(&v, &bands);
+    if decision.sensitive {
+        // Metadata only — signal, severity, disposition. Never content.
+        tracing::info!(
+            reason = reason_label(reason),
+            signal = decision.signal.as_deref().unwrap_or(""),
+            severity = decision.severity.map(|s| s.as_str()).unwrap_or(""),
+            block,
+            "kguard fusion decision"
+        );
+    }
     let inc = incident_for(device_path, v, block, &kg.channel_label, reason);
     (Some(block), inc)
 }
@@ -1347,6 +1631,7 @@ mod tests {
                 matched_hashes: vec!["1".into()],
             }],
             edm: vec![],
+            ml: None,
         }
     }
 
@@ -1357,6 +1642,7 @@ mod tests {
             extraction: Extraction::Ok { format: "text".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         }
     }
 
@@ -1391,6 +1677,65 @@ mod tests {
     fn allows_clean_file() {
         let cfg = KguardConfig::default();
         assert!(!should_block(&clean_verdict(), &cfg));
+    }
+
+    // --- Fusion equivalence: the shared `detect::decide` fingerprint half is
+    // --- EXACTLY what these two hand-rolled band tests compute. This is the
+    // --- guard that lets `decide()` (the fn in this file) route both scan
+    // --- reasons through the shared fusion without changing what blocks.
+
+    #[test]
+    fn shared_fusion_fingerprint_half_matches_should_block() {
+        let cfg = KguardConfig::default();
+        let read_bands = crate::detect::Bands::new(cfg.block_at, cfg.coverage_block_at);
+        let write_bands =
+            crate::detect::Bands::new(cfg.removable_write_block_at, cfg.coverage_block_at);
+
+        let mut cases = vec![
+            clean_verdict(),
+            verdict_with(0.0, 0.0),
+            verdict_with(0.14, 0.0),
+            verdict_with(0.15, 0.0),
+            verdict_with(0.20, 0.0),
+            verdict_with(0.30, 0.0),
+            verdict_with(0.0, 0.59),
+            verdict_with(0.0, 0.60),
+            verdict_with(1.0, 1.0),
+        ];
+        let mut edm = clean_verdict();
+        edm.edm.push(crate::detect::EdmSourceHit {
+            source_id: "s".into(),
+            name: "PII".into(),
+            rows_hit: vec![crate::detect::EdmRowHit { row_id: 1, fields: vec!["x".into()] }],
+        });
+        cases.push(edm);
+
+        for v in &cases {
+            assert_eq!(
+                crate::detect::decide(v, &read_bands).fingerprint,
+                should_block(v, &cfg),
+                "read band must agree with should_block"
+            );
+            assert_eq!(
+                crate::detect::decide(v, &write_bands).fingerprint,
+                should_block_removable_write(v, &cfg),
+                "removable-write band must agree with should_block_removable_write"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_fusion_is_inert_without_an_ml_result() {
+        // No `ml` on the verdict (the state every fingerprint-only channel and
+        // every frozen golden vector is in) ⇒ severity/signal come from the
+        // fingerprint half alone, and nothing is added.
+        let cfg = KguardConfig::default();
+        let bands = crate::detect::Bands::new(cfg.block_at, cfg.coverage_block_at);
+        let d = crate::detect::decide(&verdict_with(1.0, 1.0), &bands);
+        assert!(d.sensitive && d.fingerprint && !d.ml);
+        assert_eq!(d.signal.as_deref(), Some("idm"));
+        assert_eq!(d.severity, Some(crate::detect::Severity::High));
+        assert!(!crate::detect::decide(&clean_verdict(), &bands).sensitive);
     }
 
     // --- Removable-write containment threshold (removable_write_block_at) -----
@@ -1635,6 +1980,7 @@ mod tests {
             extraction: Extraction::Unreadable { reason: "encrypted-zip".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         }
     }
 

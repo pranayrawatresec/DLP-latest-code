@@ -801,6 +801,7 @@ mod tests {
             extraction: Extraction::Ok { format: "text".into() },
             idm: vec![],
             edm: vec![],
+            ml: None,
         }
     }
 

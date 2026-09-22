@@ -46,7 +46,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::detect::{self, Bundle, Verdict};
+use crate::detect::{self, Verdict};
 use crate::storage::Storage;
 use crate::supervise::{snapshot_config, SealerHealth};
 use crate::trustdest::{BlockBandPolicy, EncryptMode};
@@ -129,13 +129,16 @@ pub fn run_monitor<R, S>(
         "usb monitor starting"
     );
 
-    // Load the cached, verified bundle once. None → audit logs "no-policy" and
-    // scans are skipped; enforce mode still fails secure via the default action.
-    let bundle = load_verified_bundle(&initial, storage);
-    if bundle.is_none() {
-        tracing::warn!("no verified index bundle cached — usb audit runs in no-policy mode");
-    }
-    let bundle = bundle.map(Arc::new);
+    // The verified index, kept current by `LiveBundle`'s watcher and re-read
+    // once per poll below — the same "fresh snapshot each poll" rule the config
+    // already follows. None → audit logs "no-policy" and scans are skipped;
+    // enforce mode still fails secure via the default action.
+    let live = crate::livebundle::LiveBundle::start(
+        storage.dir(),
+        &initial.ca_cert_path,
+        "usb",
+        crate::livebundle::DEFAULT_POLL_INTERVAL,
+    );
 
     let mut watcher = VolumeWatcher::new();
     let mut auditors: HashMap<String, VolumeAuditor> = HashMap::new();
@@ -153,6 +156,9 @@ pub fn run_monitor<R, S>(
         // Fresh effective-config snapshot each poll so a live whitelist re-sync
         // takes effect without a restart. `cfg` shadows for this iteration.
         let cfg = snapshot_config(shared_cfg);
+        // ...and the index, so a newly downloaded bundle is scanned against on
+        // the next poll instead of after a restart. One value for the whole poll.
+        let bundle = live.current();
         let usb = &cfg.usb;
         let policy = usb.to_policy();
         // EncryptSensitive verdict bands: encrypt_at from [crypto], block band
@@ -340,22 +346,3 @@ where
     }
 }
 
-/// Load and verify the cached index bundle with the pinned CA (spec §3.6 step
-/// 1). A load failure means "keep no bundle" → no-policy mode (fail closed:
-/// nothing is trusted that hasn't verified).
-fn load_verified_bundle(cfg: &Config, storage: &Storage) -> Option<Bundle> {
-    let ca_pem = resolve_ca(cfg, storage)?;
-    storage
-        .load_index_bundle()
-        .and_then(|bytes| Bundle::load(&bytes, &ca_pem).ok())
-}
-
-/// The CA the agent trusts for bundle signatures: pinned-at-enrollment when
-/// enrolled, else the installer-provisioned CA file (mirrors main.rs::load_ca).
-fn resolve_ca(cfg: &Config, storage: &Storage) -> Option<Vec<u8>> {
-    if storage.has_identity() {
-        storage.load_identity().ok().map(|(_, ca)| ca)
-    } else {
-        std::fs::read(&cfg.ca_cert_path).ok()
-    }
-}
