@@ -1809,8 +1809,33 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
 
     /* B. Verdict already decided for this file (any prior open)? O(1). This is the
      *    path that serves EVERY untrusted open after the first classification, so a
-     *    cached DENY here is the repeat attempt to audit — once per open. */
-    cached = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
+     *    cached DENY here is the repeat attempt to audit — once per open.
+     *
+     *    ONLY if it was decided under the CURRENT content epoch. The stream context
+     *    lives as long as the file stays in the cache manager — hours, for a file on
+     *    the desktop — so without this check a verdict outlived every agent
+     *    reconnect, and with it every new fingerprint index and ML policy: a
+     *    document registered today stayed readable by an exfil tool that read it
+     *    (and was answered "clean") yesterday. SensFile / CleanFile / BadHash have
+     *    always compared their epoch; this cache stamped one and never read it.
+     *    A stale verdict is dropped (not just ignored) so the classification below
+     *    re-scores the file under the new content and re-caches it. */
+    {
+        LONG epochNow = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
+        cached = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
+        if ((cached == DLP_EXFIL_DENY || cached == DLP_EXFIL_ALLOW) &&
+            InterlockedCompareExchange(&ctx->Epoch, 0, 0) != epochNow) {
+            InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_UNKNOWN);
+            InterlockedExchange(&ctx->ExfilPositive, 0);
+            cached = DLP_EXFIL_UNKNOWN;
+        }
+        if (cached != DLP_EXFIL_DENY && cached != DLP_EXFIL_ALLOW) {
+            /* About to classify: stamp the epoch the new verdict is decided under.
+             * If the epoch moves again mid-classification, the stored verdict is
+             * stale on the next open and is simply re-scored — the safe direction. */
+            InterlockedExchange(&ctx->Epoch, epochNow);
+        }
+    }
     if (cached == DLP_EXFIL_DENY || cached == DLP_EXFIL_ALLOW) {
         if (cached == DLP_EXFIL_DENY) {
             DlpAuditSilentDeny(FltObjects, Pid);
@@ -2082,6 +2107,16 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
     if (NT_SUCCESS(FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                        (PFLT_CONTEXT *)&ctx)) && ctx != NULL) {
         verdict = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
+        /* Same epoch rule as step B of DlpExfilClassifyAndCache: a verdict decided
+         * under an older content epoch (a new index or ML policy since) is not an
+         * answer. This path is cache-only, so it is treated as UNKNOWN — falling
+         * through to the epoch-checked file-id caches and then the fail-safe — and
+         * the buffered-read classifier re-scores and re-stamps it. */
+        if (verdict != DLP_EXFIL_UNKNOWN &&
+            InterlockedCompareExchange(&ctx->Epoch, 0, 0) !=
+                InterlockedCompareExchange(&gDlpData.Epoch, 0, 0)) {
+            verdict = DLP_EXFIL_UNKNOWN;
+        }
         FltReleaseContext((PFLT_CONTEXT)ctx);
     }
     if (verdict == DLP_EXFIL_UNKNOWN) {
