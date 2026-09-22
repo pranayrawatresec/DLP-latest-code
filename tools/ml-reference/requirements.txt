@@ -1,0 +1,24 @@
+# Dependencies of the torch-free ML reference (tools/ml-reference).
+#
+# Three packages, deliberately. The vendored reference pipeline under
+# Document_classification/ needs torch + transformers, a multi-gigabyte tree we
+# refuse to require on an engineer's box, on CI, or anywhere near an air-gapped
+# build. This reference runs the exported ONNX graph instead and imports the
+# authoritative chunker by path, so it needs:
+#
+#   onnxruntime  runs model/model.onnx on the CPU execution provider. Pinned:
+#                the golden vectors are logits, and a runtime upgrade is a
+#                deliberate act that must be re-verified against the fixture.
+#   numpy        the int64 feed tensors and the softmax. onnxruntime pulls it in
+#                anyway; named here so the version is not incidental.
+#   tokenizers   the Rust HuggingFace fast tokenizer, WITHOUT transformers. It
+#                reads backbone/tokenizer.json directly, which is the same
+#                WordPiece vocabulary and the same normalizer the model trained
+#                with.
+#
+# This is a developer/CI tool. Nothing here ships to a customer site and nothing
+# here is a dependency of the agent or the management server.
+
+onnxruntime==1.29.0
+numpy>=2.0
+tokenizers>=0.20

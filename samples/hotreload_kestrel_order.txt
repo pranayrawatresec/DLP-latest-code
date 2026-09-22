@@ -1,0 +1,12 @@
+OPERATION KESTREL — MOVEMENT AND SUSTAINMENT ORDER 14/26
+Classification: RESTRICTED — for exercise use only
+
+1. Situation. The 3rd Signal Regiment relocates its forward relay detachment from the Tamarind Pass cantonment to the Ashgrove ridge site between 0400 hours on 18 October and 2200 hours on 21 October. The move is conducted in three serials to keep the Kestrel relay net continuously on the air.
+
+2. Mission. Relay Detachment Kestrel establishes the Ashgrove relay by 2200 hours on 21 October without a break in the brigade command net longer than twenty minutes.
+
+3. Execution. Serial one moves the reserve generator, the second mast set and the cryptographic spares under escort of Lieutenant Varghese. Serial two moves the primary shelter once serial one reports the Ashgrove mast erected and tested on frequency plan Juniper. Serial three recovers the Tamarind mast only after Ashgrove has carried traffic for four continuous hours.
+
+4. Sustainment. Fuel for ninety-six hours of generator running is pre-positioned at the Ashgrove quarry dump by the logistics company, reference drawdown voucher KSL-4471. Rations for eleven personnel for five days move with serial two. Spare antenna sections are drawn from store bay seventeen against demand note 88-203.
+
+5. Command and signals. The detachment commander reports each serial crossing the Kaveri culvert checkpoint on the Kestrel net using codeword FALCON-GREEN. Loss of contact for more than thirty minutes is reported to brigade signals immediately and the previous site is held until the fault is cleared.

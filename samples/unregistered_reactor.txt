@@ -1,0 +1,13 @@
+Reactor Core Safety Assessment — Fuel Assembly Integrity Review
+
+This assessment records the periodic evaluation of fuel assembly integrity for the
+pressurised water reactor at the naval propulsion test facility. Coolant loop pressure,
+primary circuit temperature margins and neutron flux distribution were measured across
+three consecutive fuel cycles. Cladding oxidation was within the acceptance envelope for
+all sampled assemblies. Control rod drive mechanism response times remained inside the
+qualified band. The criticality safety analysis was re-run against the revised burnup
+credit methodology and the subcritical margin was confirmed under all credible upset
+conditions. Radiological shielding surveys around the containment boundary recorded dose
+rates consistent with the design basis. Recommendations: continue quarterly assembly
+inspection, revalidate the emergency core cooling injection setpoints, and schedule the
+next full criticality re-analysis before the following refuelling outage.

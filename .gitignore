@@ -15,3 +15,17 @@
 /dlp-minifilter/build/out/*.pdb
 /dlp-minifilter/build/out/*.cat
 /dlp-minifilter/build/out/*.nativecodeanalysis.xml
+# ML model artefacts — hundreds of MB each (final.pt ~800 MB, model/encoder.onnx
+# ~270 MB), over GitHub's 100 MB limit and never source. Staged onto endpoints by
+# scripts/stage-ml-model.ps1 from the release package.
+/Document_classification/
+/Document_classification_split_onnx/
+
+# Per-directory tool state and Python bytecode.
+.claude-flow/
+__pycache__/
+
+# Business documents kept beside the repo, not part of it.
+/DLP-RFP.pdf
+/All features Viyuh_SubTasks*.xlsx
+/BROWSER-UPLOAD-FEATURE-AUDIT.pdf

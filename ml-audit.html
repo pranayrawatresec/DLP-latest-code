@@ -1,0 +1,517 @@
+<title>ML Pipeline Readiness Audit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Public+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+:root{
+  /* light — cool neutrals with a faint green bias, chosen to sit under the pine accent */
+  --paper:#F1F4F2;
+  --surface:#FAFBFA;
+  --ink:#151A18;
+  --ink-2:#39433F;
+  --muted:#616C67;
+  --rule:#D3DAD6;
+  --rule-strong:#B6C0BB;
+  --accent:#1F5C4A;
+  --accent-soft:#E2EDE8;
+
+  --sev-blocker:#9E1F28;
+  --sev-high:#AC530D;
+  --sev-med:#7E6318;
+  --sev-low:#48595F;
+  --sev-ok:#2C6E49;
+  --sev-blocker-bg:#F7E4E5;
+  --sev-high-bg:#F9EADB;
+  --sev-med-bg:#F5EFDC;
+  --sev-low-bg:#E8EDEF;
+  --sev-ok-bg:#E1EFE7;
+
+  --f-display:"Newsreader",Georgia,"Times New Roman",serif;
+  --f-body:"Public Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  --f-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+
+  --measure:68ch;
+  --gut:clamp(18px,4vw,40px);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1413;
+    --surface:#161C1A;
+    --ink:#E3E8E5;
+    --ink-2:#BAC4C0;
+    --muted:#8B9791;
+    --rule:#28302D;
+    --rule-strong:#3A443F;
+    --accent:#6FBFA3;
+    --accent-soft:#172B25;
+
+    --sev-blocker:#F0868D;
+    --sev-high:#E5A469;
+    --sev-med:#D4BC72;
+    --sev-low:#9FB3B9;
+    --sev-ok:#79C79A;
+    --sev-blocker-bg:#2C1618;
+    --sev-high-bg:#2B1D11;
+    --sev-med-bg:#282211;
+    --sev-low-bg:#1A2225;
+    --sev-ok-bg:#132419;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1413;
+  --surface:#161C1A;
+  --ink:#E3E8E5;
+  --ink-2:#BAC4C0;
+  --muted:#8B9791;
+  --rule:#28302D;
+  --rule-strong:#3A443F;
+  --accent:#6FBFA3;
+  --accent-soft:#172B25;
+
+  --sev-blocker:#F0868D;
+  --sev-high:#E5A469;
+  --sev-med:#D4BC72;
+  --sev-low:#9FB3B9;
+  --sev-ok:#79C79A;
+  --sev-blocker-bg:#2C1618;
+  --sev-high-bg:#2B1D11;
+  --sev-med-bg:#282211;
+  --sev-low-bg:#1A2225;
+  --sev-ok-bg:#132419;
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font-family:var(--f-body);font-size:16px;line-height:1.62;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto;padding-inline:var(--gut);padding-block:0 96px}
+p,li{color:var(--ink-2);max-width:var(--measure)}
+h1,h2,h3,h4{text-wrap:balance;margin:0;color:var(--ink)}
+a{color:var(--accent)}
+code,.mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+code{font-size:.86em;background:var(--accent-soft);padding:.1em .35em;border-radius:3px;color:var(--ink)}
+
+/* ---------- masthead ---------- */
+.mast{border-bottom:2px solid var(--ink);padding-block:clamp(36px,7vw,72px) 22px;margin-bottom:34px}
+.eyebrow{
+  font-family:var(--f-mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px;margin-bottom:20px
+}
+.mast h1{
+  font-family:var(--f-display);font-weight:500;letter-spacing:-.02em;
+  font-size:clamp(38px,7.5vw,68px);line-height:1.02
+}
+.mast .sub{
+  font-family:var(--f-display);font-style:italic;font-size:clamp(17px,2.4vw,22px);
+  color:var(--muted);margin-top:14px;max-width:60ch;line-height:1.45
+}
+
+/* ---------- verdict ---------- */
+.verdict{
+  border:1px solid var(--rule-strong);border-left:5px solid var(--sev-blocker);
+  background:var(--surface);padding:clamp(20px,3.4vw,34px);margin-bottom:44px
+}
+.verdict .tag{
+  font-family:var(--f-mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--sev-blocker);font-weight:700
+}
+.verdict h2{font-family:var(--f-display);font-size:clamp(26px,4.4vw,38px);font-weight:500;margin:10px 0 14px;line-height:1.12}
+.verdict p{max-width:72ch}
+.verdict p:last-child{margin-bottom:0}
+
+/* ---------- sections ---------- */
+section{margin-block:60px;scroll-margin-top:24px}
+.sec-head{display:flex;align-items:baseline;gap:14px;border-bottom:1px solid var(--rule-strong);padding-bottom:10px;margin-bottom:26px;flex-wrap:wrap}
+.sec-head h2{font-family:var(--f-display);font-weight:600;font-size:clamp(23px,3.4vw,31px);letter-spacing:-.01em}
+.sec-head .note{font-family:var(--f-mono);font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-left:auto}
+h3{font-family:var(--f-display);font-size:21px;font-weight:600;margin:34px 0 10px}
+h4{font-size:15px;font-weight:700;margin:22px 0 6px;letter-spacing:-.005em}
+
+/* ---------- stat strip ---------- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);margin-bottom:30px}
+.stat{background:var(--surface);padding:16px 18px}
+.stat .n{font-family:var(--f-mono);font-size:26px;font-weight:700;letter-spacing:-.03em;display:block;line-height:1.1}
+.stat .l{font-family:var(--f-mono);font-size:10.5px;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);margin-top:6px;display:block}
+
+/* ---------- findings ---------- */
+.finding{border-top:1px solid var(--rule);padding:18px 0 18px 0;display:grid;grid-template-columns:104px 1fr;gap:4px 20px}
+.finding:last-child{border-bottom:1px solid var(--rule)}
+.sev{
+  font-family:var(--f-mono);font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  padding:3px 8px;border-radius:2px;align-self:start;text-align:center;white-space:nowrap
+}
+.sev.blocker{color:var(--sev-blocker);background:var(--sev-blocker-bg)}
+.sev.high{color:var(--sev-high);background:var(--sev-high-bg)}
+.sev.medium{color:var(--sev-med);background:var(--sev-med-bg)}
+.sev.low{color:var(--sev-low);background:var(--sev-low-bg)}
+.f-body h4{margin:0 0 4px}
+.f-loc{font-family:var(--f-mono);font-size:12px;color:var(--muted);margin-bottom:8px;word-break:break-all}
+.f-body p{margin:0 0 8px;font-size:15px;max-width:74ch}
+.f-body p:last-child{margin-bottom:0}
+.f-fix{border-left:2px solid var(--accent);padding-left:12px;margin-top:10px}
+.f-fix b{font-family:var(--f-mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);display:block;margin-bottom:2px}
+@media (max-width:620px){.finding{grid-template-columns:1fr}.sev{justify-self:start}}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto;border:1px solid var(--rule);margin-block:18px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:520px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--f-mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:500;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td.num{font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td b{color:var(--ink)}
+.bad{color:var(--sev-blocker);font-weight:600}
+.warn{color:var(--sev-high);font-weight:600}
+.good{color:var(--sev-ok);font-weight:600}
+
+/* ---------- log block ---------- */
+pre{
+  font-family:var(--f-mono);font-size:12.5px;line-height:1.7;background:var(--surface);
+  border:1px solid var(--rule);border-left:3px solid var(--rule-strong);
+  padding:14px 16px;overflow-x:auto;margin-block:18px;color:var(--ink-2)
+}
+pre b{color:var(--ink)}
+pre .hl{color:var(--sev-blocker);font-weight:700}
+pre .ok{color:var(--sev-ok);font-weight:700}
+
+/* ---------- ok list ---------- */
+.oklist{list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.oklist li{position:relative;padding-left:26px;font-size:15px;max-width:76ch}
+.oklist li::before{content:"✓";position:absolute;left:0;top:0;color:var(--sev-ok);font-weight:700;font-family:var(--f-mono)}
+
+/* ---------- steps ---------- */
+.steps{counter-reset:s;list-style:none;padding:0;margin:0;display:grid;gap:18px}
+.steps li{counter-increment:s;display:grid;grid-template-columns:34px 1fr;gap:14px;max-width:none}
+.steps li::before{
+  content:counter(s);font-family:var(--f-mono);font-weight:700;font-size:13px;
+  color:var(--accent);border:1px solid var(--accent);border-radius:50%;
+  width:28px;height:28px;display:grid;place-items:center;align-self:start
+}
+.steps b{display:block;color:var(--ink);font-size:15.5px;margin-bottom:2px}
+.steps p{margin:0;font-size:14.5px}
+
+.callout{background:var(--accent-soft);border:1px solid var(--rule);padding:16px 18px;margin-block:20px}
+.callout p{margin:0;max-width:74ch;font-size:15px}
+.callout p + p{margin-top:8px}
+
+footer{border-top:2px solid var(--ink);margin-top:70px;padding-top:18px}
+footer p{font-family:var(--f-mono);font-size:12px;color:var(--muted);max-width:78ch}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow">
+    <span>On-Premise Endpoint DLP</span><span>ML Classification Pipeline</span><span>V6.2.01 · DistilBERT · split ONNX</span>
+  </div>
+  <h1>ML Pipeline Readiness Audit</h1>
+  <p class="sub">All three ingestion channels — at rest, at creation, on write — examined for defects, resource cost and deployability, with every claim adversarially re-tested before it was allowed to stand.</p>
+</header>
+
+<div class="verdict">
+  <div class="tag">Verdict · Not deployable today</div>
+  <h2>One structural defect gates the ship. Everything else can be scheduled.</h2>
+  <p>The ML classifier is serialised behind a single mutex that is held for an <em>entire document</em> (<code>engine.rs:501,547</code>), and the single-threaded kguard message loop must take that same mutex to answer the kernel. A background sweep, a cache compaction, or one inline 200,000-character write scan therefore parks the driver's 500&nbsp;ms <code>FltSendMessage</code> wait. Eight consecutive parks latch <code>DLP_BREAKER_THRESHOLD</code> — and once latched, the agent has no detector and no recovery short of a service restart, while the endpoint sits in total-block fail-secure.</p>
+  <p>The second gate is deployment, not code: <code>[ml] enabled</code> defaults <code>true</code>, the endpoint installer stages no model, and <code>stage-ml-model.ps1</code> cannot stage the split pair at all. The documented rollout therefore produces an endpoint that either blocks all egress or loads the ~5&nbsp;GB monolithic graph onto an 8&nbsp;GiB PC.</p>
+  <p><b>Fix first:</b> a bounded, non-blocking session acquisition on the enforcement path — <code>try_lock</code> with an immediate <code>unavailable</code> fallback, a hard per-document deadline, and <code>max_chunks</code> defaulted to a real number instead of <code>0 = unlimited</code>. That single change converts all four inference-path blockers from <em>"the endpoint can be driven into a latched, unrecoverable outage"</em> into <em>"the write scan occasionally reports unavailable, which <code>fail_block</code> already handles correctly."</em> It is the only item on this list that the 500&nbsp;ms kernel contract makes non-negotiable.</p>
+</div>
+
+<section>
+  <div class="sec-head"><h2>How this was tested</h2><span class="note">Method</span></div>
+  <div class="stats">
+    <div class="stat"><span class="n">14</span><span class="l">Analyst passes</span></div>
+    <div class="stat"><span class="n">203</span><span class="l">Agents total</span></div>
+    <div class="stat"><span class="n">114</span><span class="l">Raw findings</span></div>
+    <div class="stat"><span class="n">74</span><span class="l">Survived refutation</span></div>
+    <div class="stat"><span class="n">20</span><span class="l">Refuted &amp; dropped</span></div>
+    <div class="stat"><span class="n">190</span><span class="l">Verified correct</span></div>
+  </div>
+  <p>Twelve finders were assigned one channel and one lens each — resource cost, crash recovery, concurrency, coverage gaps, Win32 handle hygiene, event semantics, fail-open analysis, fusion correctness, memory lifetime, cache integrity, hostile-input robustness, operability — plus two quantitative analysts for scan time and RAM. Every finding was then put to two independent adversarial verifiers, each instructed to <em>refute</em> and to default to refuted when unsure: one checking whether the code genuinely does what was claimed, one checking whether it is reachable in a shipped configuration. A finding survived only if <b>both</b> failed to refute it. Twenty did not survive. A completeness critic then audited the audit.</p>
+  <p>Alongside that, the real suite was run and the live VM measured. <b>100 of 100 ML tests pass</b> under <code>DLP_ML_STRICT=1</code>, so the ONNX runtime genuinely executed — nothing silently skipped.</p>
+  <div class="callout">
+    <p><b>On the 74 number.</b> The critic found that several findings are the same defect seen from different angles — four of the six duplicated defects are the highest-severity ones. The honest distinct count is <b>~55</b>. The list over-weights exactly where you would triage first, so read the blockers as three structural facts, not six.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>How long to scan a whole disk</h2><span class="note">Question 1 · Not feasible at defaults</span></div>
+  <p>Derived from the shipped constants and validated against a real Windows profile, by replicating <code>filter.rs</code>'s exact eligibility rules against 232,719 files: 125,744 passed the gate (54.0%), of which <b>126 were actual documents</b> — 0.10%.</p>
+  <div class="tw"><table>
+    <thead><tr><th>Estate</th><th>Eligible files</th><th>Binding limit</th><th>First full sweep</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td><b>Light profile</b><br><span style="color:var(--muted)">~20k files, non-developer</span></td><td class="num">~6,000</td><td>Rate limiter</td><td class="num">50 min</td><td class="good">Feasible</td></tr>
+      <tr><td><b>Knowledge worker</b><br><span style="color:var(--muted)">~150k files, document-heavy</span></td><td class="num">81,000</td><td>Inference throughput</td><td class="num">27.9 h</td><td class="warn">Marginal</td></tr>
+      <tr><td><b>Developer machine</b><br><span style="color:var(--muted)">measured, not estimated</span></td><td class="num">125,744</td><td>Rate limiter</td><td class="num">17.5 h</td><td class="bad">Not feasible</td></tr>
+      <tr><td><b>File server / mapped drive</b><br><span style="color:var(--muted)">2M files, opt-in scope only</span></td><td class="num">800,000</td><td>Inference throughput</td><td class="num">11.5 days</td><td class="bad">Never completes</td></tr>
+    </tbody>
+  </table></div>
+  <p><b>The rescan interval cannot keep up.</b> <code>DEFAULT_RESCAN_INTERVAL_SECS</code> is 6 h, which admits 43,200 candidates at 120/min. A measured profile has 125,744 — <b>2.9× over</b>. Above roughly 43,200 eligible files the walker never returns to idle, which is the opposite of the "backstop measured in hours" the module claims.</p>
+
+  <h3>The root cause is the eligibility set, not the rate</h3>
+  <p><code>filter.rs:60-68</code> admits 45 source and config extensions alongside the 5 real document formats. On the measured box, <code>62,750 .html + 30,865 .py</code> — Python and library documentation — were <b>74.5% of the entire sweep</b>. The pipeline spends 17.5 hours to classify 126 files. Splitting the extension list into a document tier (swept by default) and a source tier (opt-in) takes that sweep from 17.5 hours to about 48 minutes, at zero cost to safety: the on-demand read path still classifies a <code>.py</code> the instant it is read on an exfil channel.</p>
+  <p>A second, cheaper win: <code>DEFAULT_EXCLUDED_COMPONENTS</code> is missing <code>site-packages</code>, <code>venv</code> (only <code>.venv</code> is listed), <code>vendor</code>, <code>packages</code>, <code>.tox</code>, <code>.next</code>, and <code>AppData\Local\Packages</code>. Pruning happens before <code>read_dir</code>, so these are strictly free.</p>
+  <p><b>A re-sweep costs the same as the first sweep.</b> The rate-limiter token is taken at <code>walk.rs:955</code>, <em>before</em> the code knows at <code>walk.rs:1094</code> that the file is already cached. So an already-classified file costs a full token — directly contradicting the module's own claim that a repeated sweep "is cheap by construction."</p>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Background RAM</h2><span class="note">Question 2 · Misses target by ~40%</span></div>
+  <div class="tw"><table>
+    <thead><tr><th>State</th><th>RSS</th><th>Driven by</th></tr></thead>
+    <tbody>
+      <tr><td>Idle (model loaded, nothing running)</td><td class="num">380–425 MB</td><td>ONNX session weights, resident permanently</td></tr>
+      <tr><td>Sweeping</td><td class="num">1.05–1.15 GiB</td><td>+ 65 MB × micro_batch 8 of activations</td></tr>
+      <tr><td><b>Measured on your VM after 24 h</b></td><td class="num">1,226 MB working set<br>1,422 MB private</td><td>Matches the predicted sweeping figure</td></tr>
+      <tr><td>Terminal server, 20 sessions</td><td class="num">~5.4 GB</td><td>Weights replicated per helper process</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>The weights are not memory-mapped</h3>
+  <p>The module documentation at <code>engine.rs:70-71</code> states "the 256 MB model is memory-mapped by ONNX Runtime." <b>This is false for the code as written.</b> The entire session builder is three lines (<code>engine.rs:852-855</code>) and sets no mmap option, no arena configuration, no <code>disable_cpu_mem_arena</code>. <code>commit_from_file</code> therefore parses the protobuf and materialises every initializer into the private heap, plus additional pre-packed copies of the MatMul weights at optimisation Level 3. That is why the floor is ~350 MB rather than the ~30 MB a genuinely mapped 253 MiB graph would cost.</p>
+
+  <h3>Loaded eagerly, never unloaded, replicated per session</h3>
+  <p>The session loads at service start (<code>main.rs:712-716</code>) and unloads only when the policy goes inert. Worse, the load happens <em>before</em> the role is consulted (<code>main.rs:712</code> vs <code>:768</code>), so every per-logon <code>clipboard-agent</code> and <code>browser-host</code> carries its own ~268 MB copy — even though those roles are documented as lookup-only and never run inference.</p>
+  <div class="callout">
+    <p><b>Minimum RAM to publish:</b> 8 GiB is workable for a single-user desktop but leaves little headroom during a sweep. Publish <b>8 GiB minimum, 16 GiB recommended</b>, and treat RDS/multi-session hosts as unsupported until the per-process duplication is fixed.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Live evidence: the sweep that never completes</h2><span class="note">Measured on your VM</span></div>
+  <p>This is not a code-reading inference. Your VM's walker has logged exactly twelve lines since 10 September:</p>
+<pre>09-10 10:23  starting at-rest sweep  <b>sweep=1</b>  scopes=1
+09-15 04:45  resumed from checkpoint  sweep=1  candidates=400   <span class="hl">dirs_pending=108</span>
+09-15 05:45  resumed from checkpoint  sweep=1  candidates=766   <span class="hl">dirs_pending=408</span>
+09-16 04:55  resumed from checkpoint  sweep=1  candidates=766   <span class="hl">dirs_pending=408</span>
+09-16 06:45  resumed from checkpoint  sweep=1  candidates=1047  <span class="hl">dirs_pending=659</span></pre>
+  <p>Still <code>sweep=1</code> after seven days. The pending-directory frontier is <b>growing</b>, not shrinking. <code>ml-walk.completed.json</code> does not exist — the first sweep has never finished. Since the last resume 29½ hours ago the checkpoint has not been rewritten once, which means fewer than 200 files were processed in that entire window (checkpoints are written every 200). The thread is alive; the supervisor would have logged a panic or restart and logged neither.</p>
+  <p>The checkpoint also shows <code>scopes_all: ["C:\\"]</code> — <b>the sweep is scanning the entire system volume</b>, not <code>C:\Users</code>. That is the same <code>watch_paths = "\"</code> root-scope setting mapping straight through <code>config.rs:1053-1067</code> into the ML scope.</p>
+  <div class="callout">
+    <p><b>Why this matters beyond the sweep.</b> <code>denyUnclassified</code> is gated on sweep completion, so on this endpoint it <b>can never safely arm</b>. And the pre-classification strategy that closes the Explorer ghost-file window is not actually happening in the field — which is exactly the symptom you reported.</p>
+  </div>
+  <p>Supporting measurements from the same machine: agent CPU at <b>10.2% of a core sustained for 24 hours</b>; a log of 24,503 lines / 3.83 MB, dominated by one WARN every ~2 seconds from the process guard; <code>max_chunks=0</code> (uncapped) live in the deployed config; and a second orphaned <code>dlp-agent.exe</code> with one thread and 2.7 CPU-seconds over 24 hours.</p>
+  <p class="good" style="max-width:74ch"><b>Confirmed working:</b> the split graphs are genuinely live — <code>graph="split+microbatched" micro_batch=8</code> — and a measured USB write block completed in <b>156 ms</b> on the ML signal alone (<code>idm=0 edm=0 ml_label="GOV" ml_confidence=0.92</code>).</p>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Blockers</h2><span class="note">6 confirmed · 3 distinct defects</span></div>
+
+  <div class="finding">
+    <span class="sev blocker">Blocker</span>
+    <div class="f-body">
+      <h4>The write up-call runs DistilBERT inference inline inside the driver's 500 ms wait</h4>
+      <div class="f-loc">dlp-agent/src/kguard/mod.rs:1216 · dlp-minifilter/src/dlpflt.c:1047 · comms.c:666</div>
+      <p>The code asserts that "the driver is not blocked on our reply the way the read up-call is, so the model runs inline on the async budget." That is false. <code>dlpflt.c</code> calls the <em>same</em> <code>DlpQueryVerdict</code> for <code>DLP_REASON_WRITE</code> as for read, and <code>comms.c:666</code> arms one timeout for both.</p>
+      <p>A user copies a 300 KB <code>.docx</code> to USB with a cold cache. The agent extracts ~120k characters, chunks to ~70, and runs ~9 single-threaded encoder passes — several seconds against a 500 ms budget.</p>
+      <div class="f-fix"><b>Fix</b>Treat write like read: cache lookup only, enqueue the miss, accept that a first copy is fingerprint-only — or keep the inline classify but behind a hard deadline with an <code>unavailable</code> fallback.</div>
+    </div>
+  </div>
+
+  <div class="finding">
+    <span class="sev blocker">Blocker</span>
+    <div class="f-body">
+      <h4>A latched circuit breaker is unrecoverable without a service restart, and nothing detects it</h4>
+      <div class="f-loc">dlp-minifilter/src/comms.c:605</div>
+      <p>Once <code>ConsecutiveTimeouts</code> reaches 8, <code>DlpQueryVerdict</code> returns <code>STATUS_PORT_DISCONNECTED</code> <em>before</em> ever calling <code>FltSendMessage</code>. Because the send is short-circuited, no live reply can arrive, so the only reset is reconnection at <code>comms.c:176</code>. Nothing in the agent detects the state.</p>
+      <p>Following the previous finding: one multi-second inline classification stalls the loop while ordinary read up-calls keep arriving. Eight time out. The breaker latches. From that moment <b>the user cannot copy anything to any USB device</b> until the service is restarted.</p>
+      <div class="f-fix"><b>Fix</b>A liveness watchdog: track time since the last <code>FilterGetMessage</code> returned; past ~4 × timeout × threshold, close the port handle and reconnect, which resets the breaker.</div>
+    </div>
+  </div>
+
+  <div class="finding">
+    <span class="sev blocker">Blocker</span>
+    <div class="f-body">
+      <h4>The inference mutex is shared between the background worker and the kguard message loop</h4>
+      <div class="f-loc">src/ml/engine.rs:501, 547 · counted twice in the raw list</div>
+      <p><code>run_split</code> takes <code>sessions.lock()</code> once and holds it for the whole document — every encoder micro-batch plus the head. The background classify worker and the kguard loop are threads of the same process sharing one engine, therefore one mutex. The kguard loop is strictly serial.</p>
+      <p>The sweep enqueues a large report; the worker holds the mutex for ~5 s; the user drags a file to USB; the message-loop thread blocks. Every read up-call in that window burns its 500 ms budget. This is the mechanism behind both blockers above.</p>
+      <div class="f-fix"><b>Fix</b>Release and re-acquire per micro-batch inside <code>run_split</code> — the f64 accumulator is already batch-local, so correctness is unaffected — and give the enforcement path a <code>try_lock</code> with an <code>unavailable</code> fallback.</div>
+    </div>
+  </div>
+
+  <div class="finding">
+    <span class="sev blocker">Blocker</span>
+    <div class="f-body">
+      <h4>Zip decompression is bounded per member but not in aggregate</h4>
+      <div class="f-loc">shared-core · extraction path</div>
+      <p>A 4 MiB <code>zip</code>/<code>docx</code>/<code>xlsx</code>/<code>pptx</code> can inflate without an aggregate output ceiling. This runs as LocalSystem against files arriving from email, USB and the web — an OOM here is a crashed DLP agent, which is a security event, not just a reliability one.</p>
+      <div class="f-fix"><b>Fix</b>Bound total decompressed output across all members, not per member, and abort the extraction when the ceiling is hit.</div>
+    </div>
+  </div>
+
+  <div class="finding">
+    <span class="sev blocker">Blocker</span>
+    <div class="f-body">
+      <h4>A PDF Form XObject that draws itself recurses without a depth limit</h4>
+      <div class="f-loc">pdf-extract · reachable from the enforcement path</div>
+      <p>A self-referencing Form XObject produces unbounded recursion and a stack overflow. A stack overflow in Rust is an immediate abort — not a catchable panic — so <code>catch_unwind</code> in the thread supervisor does not save the process.</p>
+      <div class="f-fix"><b>Fix</b>A recursion depth cap in the XObject walk, and extraction on a thread with a bounded stack so the blast radius is one document rather than the service.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>High severity</h2><span class="note">19 confirmed</span></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>Any file whose first four bytes are "DLPE" bypasses both detectors, on every volume</h4>
+    <div class="f-loc">on-write</div>
+    <p>The magic prefix used to recognise already-encrypted DLP containers is trusted without further verification, so an attacker-controlled file can wear it. This is a deliberate-evasion hole, not a corner case.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>denyUnclassified is armed from a completion record written under a different model version</h4>
+    <div class="f-loc">at-rest / cross-cutting · three findings, one defect</div>
+    <p><code>SweepCompletion::covers_model</code> is itself correct and <em>is</em> honoured by <code>ml-status</code> and the check-in report — but <code>activate_ml</code> ignores it when arming the interlock. After a model upgrade the endpoint enforces a fail-secure deny against coverage the new model never produced.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>An ML policy change is never enforced on files the driver already cached as clean</h4>
+    <div class="f-loc">cross-cutting · the epoch gap</div>
+    <p>An admin marks a label sensitive; files the driver has already deemed clean keep flowing until the agent reconnects. There is no epoch bump to invalidate the driver-side cache.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>The monolithic fallback keeps the unbounded ~5 GB profile with no runtime guard and no warning</h4>
+    <div class="f-loc">shared-core</div>
+    <p>If the split pair is missing, <code>load()</code> silently falls back. With <code>max_chunks = 0</code> shipped as the default and <code>max_chars = 200,000</code>, a long document reaches ~112 chunks × 65 MB — a guaranteed OOM on an 8 GiB endpoint. Your VM <em>does</em> log <code>graph="split+microbatched"</code>, so the backend is observable; nothing warns when it is the wrong one.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>stage-ml-model.ps1 cannot stage the split pair</h4>
+    <div class="f-loc">cross-cutting · deployment</div>
+    <p>Every endpoint deployed by the documented procedure gets the monolithic graph — i.e. the finding above, by default.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>[ml] enabled defaults true and the installer never stages a model</h4>
+    <div class="f-loc">cross-cutting · deployment</div>
+    <p>A single console toggle can therefore put an endpoint into a state where the classifier is enabled but absent.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>The service reports RUNNING before loading its config, and never reports STOPPED on failure</h4>
+    <div class="f-loc">cross-cutting · the wedge you have already hit twice</div>
+    <p>This is the <code>sc stop</code> → 1061 / <code>sc start</code> → 1056 wedge that has needed <code>taskkill</code> on this VM. On a fleet rollout it means manual intervention on every affected endpoint.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>Extraction that succeeds with empty text is treated as clean, not as unreadable</h4>
+    <div class="f-loc">on-write</div>
+    <p>A zip of unsupported members, an image-only PDF, a password-protected document — all yield empty text and are scored benign rather than routed to the unreadable path.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>Unreadable content is allowed out to removable media with the shipped configuration</h4>
+    <div class="f-loc">on-write · <b>severity corrected down by the critic</b></div>
+    <p>Correct that <code>fail_block</code> defaults <code>false</code>, so the write is allowed. <b>But the finding's claim of "no incident" is wrong</b> — <code>incident_for</code> (<code>kguard/mod.rs:335-347</code>) raises <code>UnreadableOnRemovable</code> for every unreadable verdict regardless of blocking. The real disposition is <em>allowed-and-audited</em>. Re-score to medium; the fix is to flip <code>fail_block</code> to true per the project's own fail-secure rule, and to add the missing <code>Unreadable</code> arm in <code>browser_host.rs:209-224</code>, which genuinely lacks one.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>The ML classify worker is spawned unsupervised, and running() keeps reporting true after it dies</h4>
+    <div class="f-loc">shared-core</div>
+    <p>The walker and watcher are wrapped in <code>supervised_thread</code>; the classify worker is not. A dead worker reports healthy, and <code>deny_unclassified</code> — which is conjunctive on <code>running()</code> — keeps believing the pipeline is alive.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>No wall-clock bound on extraction + tokenization + inference for one document</h4>
+    <div class="f-loc">shared-core</div>
+    <p>One pathological file can occupy the single worker indefinitely. Combined with the shared mutex, that is the stall mechanism.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>PDF Flate streams are decompressed with an unbounded read_to_end</h4>
+    <div class="f-loc">shared-core</div>
+    <p>A small PDF can allocate gigabytes.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>put() from the kguard message loop blocks behind a full cache compaction</h4>
+    <div class="f-loc">shared-core</div>
+    <p>Compaction rewrites and fsyncs the log; the enforcement path waits on the same mutex, inside the 500 ms budget.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>A panic in the kguard message loop leaks the port handle and detaches the push thread</h4>
+    <div class="f-loc">on-write</div>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>A &gt;4 MiB container settled mid-write poisons the barren set under the finished file's key</h4>
+    <div class="f-loc">at-creation</div>
+    <p>The watcher fires on create, not on write completion, so a partially-written container is classified and its "nothing extractable" outcome is remembered against the key the finished file will have.</p>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>Sweep backpressure reads queue depth only and ignores the byte budget that actually binds</h4>
+    <div class="f-loc">at-rest</div>
+  </div></div>
+
+  <div class="finding"><span class="sev high">High</span><div class="f-body">
+    <h4>The permanent overflow-flag loop starves the full sweep, so the coverage record is never written</h4>
+    <div class="f-loc">cross-cutting · independently corroborated by your VM</div>
+    <p>A targeted re-sweep resets the full-sweep timer, so the estate-wide sweep can be pushed out indefinitely — one of several mechanisms consistent with the seven-day <code>sweep=1</code> you are seeing.</p>
+  </div></div>
+</section>
+
+<section>
+  <div class="sec-head"><h2>What the critic found that the audit missed</h2><span class="note">Completeness pass</span></div>
+  <h3>Files nobody opened</h3>
+  <p><code>src/ml/labels.rs</code> — the <b>only</b> place index→meaning lives — was named in the brief and never read by any finder. A one-row shift reports a NUC document as ADM and the policy then says "not sensitive." The compile-time guard checks only <em>length</em>, and the tests pin 5 of 29 indices. <code>src/detect/edm.rs</code> (444 lines) also went unread, yet it runs inside the same 500 ms budget every latency claim in this audit is built on.</p>
+  <h3>The rescan schedule runs on the wall clock while the rate limiter runs on the monotonic clock</h3>
+  <p>The token bucket is correctly jump-proof; the 6-hour schedule is not (<code>walk.rs:520-525, 1287, 1308</code>). On an air-gapped endpoint with no NTP, a backward clock correction disables at-rest classification for the length of the correction — with no log line — while a stale completion record keeps <code>denyUnclassified</code> armed.</p>
+  <h3>The verdict log has no cross-process lock, and two writers are a documented mode</h3>
+  <p><code>put</code> appends at a handle position frozen at open. Running <code>dlp-agent usb-guard</code> beside the service — which the code's own comments describe as the way to debug an endpoint — puts two independent writers on one unsynchronised log, overwriting each other's records in place.</p>
+  <h3>At-creation is the thinnest channel, and it has no test file at all</h3>
+  <p><code>run_scope</code> goes straight to <code>ReadDirectoryChangesW</code> with <b>no initial enumeration and no catch-up pass</b>. Every file created during a service restart, a reboot, or the 5-second supervisor restart window produces zero at-creation events, ever. The only backstop is the at-rest sweep — the component this audit proved cannot complete.</p>
+</section>
+
+<section>
+  <div class="sec-head"><h2>What is working correctly</h2><span class="note">190 behaviours positively verified</span></div>
+  <p>This half matters as much as the defects. The audit confirmed, with line-level evidence, that:</p>
+  <ul class="oklist">
+    <li><b>No lock is ever held across I/O or across a classify call in the walker.</b> <code>step()</code> computes under the mutex and drops it before acting (<code>walk.rs:855-858</code>). Lock ordering is acyclic, and mutex poisoning cannot wedge anything — every acquisition recovers the inner value.</li>
+    <li><b>Checkpoint persistence is crash-safe.</b> Temp-file write then rename; a corrupt, truncated, empty or wrong-version cursor is discarded with a warning and counted, never fatal, never half-interpreted.</li>
+    <li><b>A resumed sweep cannot claim coverage it did not achieve.</b> A cursor is rejected on both a scope-list change and a model-version change. Pending-directory truncation is honest — beyond the cap it stores no list and restarts the scope rather than silently dropping directories.</li>
+    <li><b>A targeted re-sweep never renews the estate-wide coverage claim</b> (<code>walk.rs:1207-1215</code>, asserted in tests).</li>
+    <li><b>Symlinks and reparse points are never followed</b>, so a junction pointing at a parent cannot loop forever or turn a scoped sweep into a whole-volume one.</li>
+    <li><b>The agent's own state directory is excluded from both producers</b>, which is what prevents the verdict-log write→notify→classify→write livelock.</li>
+    <li><b>Contract C1 holds everywhere:</b> the cache key is always SHA-256 of the first ≤4 MiB even when the extended whole-file read is used, so a walker-written verdict is reachable from the driver's key.</li>
+    <li><b>A console policy change is honoured immediately against already-cached verdicts.</b> The cache stores the raw prediction, not the sensitive boolean — no re-sweep needed, no stale-policy answers.</li>
+    <li><b>The classify queue never blocks and is bounded in both dimensions</b>, with the byte budget maintained as an O(1) running total on push and pop.</li>
+    <li><b>The walker cannot block SCM's stop timeout</b>, and stop latency inside a sweep is bounded to one step.</li>
+    <li><b>A panic in the walker or watcher does not kill the sweep forever</b> — <code>supervised_thread</code> catches the unwind, logs, and restarts.</li>
+    <li><b>Trailing-dot and trailing-space path evasion is closed</b>, matching Win32 resolution exactly, with tests.</li>
+    <li><b>Hidden and system files are deliberately not excluded</b> — the right default for a DLP product.</li>
+    <li><b>The triple-classify race is closed:</b> <code>enqueue_keyed</code> dedupes on the pending and barren sets, and pending is cleared only after classification returns.</li>
+    <li><b>A never-swept machine cannot arm denyUnclassified</b> — the check is conjunctive on sweep completion, a live policy, and a running worker.</li>
+    <li><b>The split graphs are provably equivalent to the monolithic model</b> and demonstrably live on your VM, with worst-case logit divergence of 2.1×10⁻⁶.</li>
+  </ul>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Fix order</h2><span class="note">Recommendation</span></div>
+  <ol class="steps">
+    <li><b>Bound the enforcement path's session acquisition</b><p><code>try_lock</code> with an <code>unavailable</code> fallback, a hard per-document deadline, per-micro-batch lock release in <code>run_split</code>, and <code>max_chunks</code> defaulted to a real number. Clears four of the six blockers. Non-negotiable — the 500 ms kernel contract makes it so.</p></li>
+    <li><b>Add the breaker watchdog</b><p>Detect a stalled message loop and reconnect the port. Without this, any future stall is still a permanent, silent, total-block outage.</p></li>
+    <li><b>Cap decompression and recursion</b><p>Aggregate output ceiling for zip families; depth limit for PDF Form XObjects; bounded stack for extraction. These are remote-input crashes in a LocalSystem service.</p></li>
+    <li><b>Fix the deployment story</b><p>Teach <code>stage-ml-model.ps1</code> the split layout, verify SHA-256 before use, check the VC++ redistributable version at install, and make the service report STOPPED and exit on activation failure.</p></li>
+    <li><b>Shrink the eligibility set, then stop paying for cache hits</b><p>Document tier by default, source tier opt-in; add the missing directory exclusions; refund or skip the rate-limiter token on an already-classified file. Turns 17.5 hours into roughly 48 minutes and makes the 6-hour rescan interval meaningful again.</p></li>
+    <li><b>Then re-measure the sweep on this VM</b><p>Only after 1–5 will the seven-day <code>sweep=1</code> have a single explanation rather than four candidate ones. The walker currently emits no periodic progress line and no queue-depth metric — add those first, or the next diagnosis will be guesswork too.</p></li>
+  </ol>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Caveats</h2><span class="note">What this audit does not establish</span></div>
+  <p>The scan-time arithmetic assumes ~80 ms per chunk, derived by dividing a documented "~640 ms at eight chunks" by eight rather than measured directly. The eligible-file ratio is measured on <b>one</b> developer machine; the light-profile and file-server ratios are estimates. Mean chunks per file is inferred from file sizes, not from extracted text length — HTML in particular extracts to far less than its byte size.</p>
+  <p>The root cause of your VM's stalled sweep is <b>not</b> established. Four mechanisms in this report could each produce it, and the walker emits too little telemetry to distinguish them from outside. I report the stall as measured fact and the mechanisms as candidates.</p>
+  <p>Separately: your test VM shut itself down cleanly roughly every 45–60 minutes today — not a crash, not host memory pressure, most likely a Windows evaluation-licence timer. That interrupted the final verification pass and will interrupt a video recording too.</p>
+</section>
+
+<footer>
+  <p>203 agents · 14 analyst passes · 114 findings raised, 94 adversarially verified, 74 survived, 20 refuted · 190 behaviours positively confirmed · 100/100 ML tests passing under DLP_ML_STRICT=1 · live measurements from the Windows 10 test VM, 8 GiB / 2 cores, agent uptime 23:58 at time of capture.</p>
+</footer>
+
+</div>

@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Browser Upload Blocking — Feature Audit</title>
+<style>
+  @page { size: A4; margin: 16mm 14mm 18mm 14mm; }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font: 10.5pt/1.55 "Segoe UI", "Helvetica Neue", Arial, sans-serif; color: #1a1f2b; margin: 0; background: #fff; }
+  h1,h2,h3,h4 { color: #0f2038; line-height: 1.25; margin: 0 0 .4em; font-weight: 650; }
+  h1 { font-size: 26pt; letter-spacing: -.4pt; }
+  h2 { font-size: 16pt; margin-top: 1.6em; padding-bottom: .25em; border-bottom: 2.5px solid #0f2038; }
+  h3 { font-size: 12.5pt; margin-top: 1.4em; color: #16324f; }
+  h4 { font-size: 10.8pt; margin-top: 1em; color: #37475e; }
+  p { margin: 0 0 .7em; }
+  ul, ol { margin: 0 0 .8em; padding-left: 1.3em; }
+  li { margin-bottom: .3em; }
+  code { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; font-size: 9pt; background: #eef1f6; padding: .1em .35em; border-radius: 3px; color: #14283f; }
+  pre { font-family: "Cascadia Mono", Consolas, monospace; font-size: 8.5pt; line-height: 1.45; background: #0f2038; color: #d8e2f0; padding: 10px 12px; border-radius: 5px; margin: .5em 0 .9em; white-space: pre-wrap; word-wrap: break-word; }
+  pre .c { color: #8299b5; }
+  pre .k { color: #ffb86b; }
+  a { color: #14539a; text-decoration: none; }
+
+  .cover { height: 246mm; display: flex; flex-direction: column; justify-content: center; page-break-after: always; }
+  .cover .eyebrow { font-size: 10pt; letter-spacing: 2.4pt; text-transform: uppercase; color: #6b7c93; font-weight: 600; margin-bottom: 14px; }
+  .cover h1 { font-size: 33pt; margin-bottom: 14px; }
+  .cover .sub { font-size: 12.5pt; color: #43536b; max-width: 138mm; line-height: 1.5; }
+  .cover .rule { width: 62mm; height: 4px; background: #b3202c; margin: 24px 0; }
+  .cover .meta { margin-top: 28px; font-size: 9.5pt; color: #55647c; }
+  .cover .meta b { color: #1a1f2b; font-weight: 600; }
+  .cover .note { margin-top: 30px; padding: 12px 15px; background: #fdf3f2; border-left: 4px solid #b3202c; font-size: 9.5pt; color: #4a2c2c; max-width: 142mm; }
+
+  table { width: 100%; border-collapse: collapse; margin: .6em 0 1.1em; font-size: 9pt; page-break-inside: avoid; }
+  th { background: #0f2038; color: #fff; text-align: left; padding: 7px 9px; font-weight: 600; font-size: 8.6pt; letter-spacing: .2pt; }
+  td { padding: 6px 9px; border-bottom: 1px solid #dce2ea; vertical-align: top; }
+  tbody tr:nth-child(even) td { background: #f7f9fc; }
+
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 7.6pt; font-weight: 700; letter-spacing: .3pt; color: #fff; white-space: nowrap; }
+  .p0 { background: #b3202c; } .p1 { background: #d4761a; }
+  .p2 { background: #8a7300; } .p3 { background: #3d5a80; }
+  .ok { background: #1f7a4d; } .no { background: #b3202c; } .part { background: #8a7300; }
+
+  .finding { border: 1px solid #d5dce6; border-left: 5px solid #b3202c; border-radius: 4px; padding: 11px 14px 8px; margin: 0 0 13px; page-break-inside: avoid; background: #fff; }
+  .finding.f1 { border-left-color: #d4761a; }
+  .finding.f2 { border-left-color: #8a7300; }
+  .finding.f3 { border-left-color: #3d5a80; }
+  .finding h4 { margin: 0 0 .4em; font-size: 11pt; color: #0f2038; }
+  .finding h4 .pill { vertical-align: 2px; margin-right: 7px; }
+  .finding .loc { font-family: Consolas, monospace; font-size: 8.2pt; color: #6b7c93; margin-bottom: .5em; }
+  .finding dl { margin: 0; }
+  .finding dt { font-weight: 700; font-size: 8.4pt; text-transform: uppercase; letter-spacing: .5pt; color: #6b7c93; margin-top: .5em; }
+  .finding dd { margin: .1em 0 0; }
+
+  .callout { background: #eef4fb; border-left: 4px solid #14539a; padding: 10px 14px; margin: .8em 0 1em; border-radius: 0 4px 4px 0; page-break-inside: avoid; }
+  .callout.warn { background: #fdf3f2; border-left-color: #b3202c; }
+  .callout.good { background: #eef8f1; border-left-color: #1f7a4d; }
+  .callout b { color: #0f2038; }
+
+  .plain { background: #fffdf0; border: 1px dashed #c9b458; padding: 9px 13px; border-radius: 4px; font-size: 9.5pt; margin: .5em 0 1em; page-break-inside: avoid; }
+  .plain b { color: #7a6100; }
+
+  .scorecard { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 1em 0 1.4em; }
+  .score { border: 1px solid #d5dce6; border-radius: 5px; padding: 9px 11px; text-align: center; }
+  .score .n { font-size: 21pt; font-weight: 700; line-height: 1.1; }
+  .score .l { font-size: 7.8pt; color: #6b7c93; text-transform: uppercase; letter-spacing: .5pt; }
+
+  .brk { page-break-before: always; }
+  figure { margin: 1em 0 1.3em; page-break-inside: avoid; }
+  figcaption { font-size: 8.5pt; color: #6b7c93; text-align: center; margin-top: 6px; }
+  .foot { margin-top: 2.2em; padding-top: .8em; border-top: 1px solid #dce2ea; font-size: 8.5pt; color: #6b7c93; }
+  .phase { border: 1px solid #d5dce6; border-radius: 5px; padding: 11px 14px; margin-bottom: 12px; page-break-inside: avoid; }
+  .phase h4 { margin-top: 0; color: #0f2038; font-size: 11pt; }
+  .phase .when { float: right; font-size: 8.5pt; color: #6b7c93; font-weight: 500; }
+</style>
+</head>
+<body>
+
+<section class="cover">
+  <div class="eyebrow">On-Premise Endpoint DLP &nbsp;·&nbsp; Internal Engineering Report</div>
+  <h1>Blocking Sensitive<br>File Uploads in the Browser</h1>
+  <div class="rule"></div>
+  <div class="sub">
+    An engineering audit of the DLP Upload Guard extension and its native host: what we built,
+    the bugs and logic holes in it today, how far it is from the goal of &ldquo;no sensitive file
+    leaves this PC through a browser&rdquo;, and the architecture that would actually get us there.
+  </div>
+  <div class="meta">
+    <b>Scope:</b> <code>dlp-browser-ext/</code> &middot; <code>dlp-agent/src/browser_host.rs</code> &middot;
+    <code>cmd_browser_host</code> in <code>main.rs</code><br>
+    <b>Audience:</b> engineers, product, and anyone who needs to understand the risk &mdash; no browser expertise assumed<br>
+    <b>Date:</b> 9 September 2026 &nbsp;&middot;&nbsp; <b>Feature status:</b> built and unit-tested; never yet run in a real browser
+  </div>
+  <div class="note">
+    <b>Bottom line up front.</b> The feature is a well-shaped skeleton, but as it stands it would
+    <b>not</b> stop a determined user, and it misses several everyday, entirely innocent upload
+    paths &mdash; including uploads to Amazon S3, Google Drive and OneDrive, which is precisely the
+    goal we set. Five defects are severe enough that the block can be bypassed with no technical
+    skill at all. None of them are hard to fix.
+  </div>
+</section>
+
+<h2>1. Executive summary</h2>
+
+<div class="plain">
+  <b>In one paragraph, for a non-engineer:</b> We built a small program that lives inside Chrome and
+  Edge. When you attach a file to a web page, it copies the first few megabytes of that file, asks
+  our DLP agent &ldquo;is this classified?&rdquo;, and cancels the upload if the answer is yes. The
+  idea is right. The problem is that this program lives <i>inside</i> the web page, where the page
+  can see it and talk back to it &mdash; and several of the places it tries to say &ldquo;stop&rdquo;
+  are places where the browser has already stopped listening.
+</div>
+
+<div class="scorecard">
+  <div class="score"><div class="n" style="color:#b3202c">5</div><div class="l">Critical &middot; P0</div></div>
+  <div class="score"><div class="n" style="color:#d4761a">6</div><div class="l">High &middot; P1</div></div>
+  <div class="score"><div class="n" style="color:#8a7300">9</div><div class="l">Medium &middot; P2</div></div>
+  <div class="score"><div class="n" style="color:#3d5a80">2</div><div class="l">Strategic &middot; P3</div></div>
+</div>
+
+<h3>The five things that matter most</h3>
+<ol>
+  <li><b>Paste and drag-and-drop are never actually blocked.</b> The code tries to cancel the action
+      after it has already happened. The user sees a red &ldquo;blocked&rdquo; banner while the
+      classified text sits in the Gmail message body. That is worse than no protection, because it
+      looks like protection and files an incident claiming success.</li>
+  <li><b>Any web page can approve its own uploads.</b> The verdict travels through a channel the
+      page can also write to. Three lines of JavaScript &mdash; in the page, or pasted into the
+      console by a curious user &mdash; turn every verdict into &ldquo;allow&rdquo;.</li>
+  <li><b>Anything we cannot read, we let through.</b> Password-protected ZIP, encrypted DOCX, an
+      unusual format, a fragment of a file &mdash; all produce &ldquo;no match found&rdquo;, which
+      we treat as &ldquo;safe&rdquo;. Our USB channel already has a setting for exactly this case.
+      The browser channel does not.</li>
+  <li><b>Uploads to S3, Google Drive, OneDrive and Dropbox are not covered.</b> Those services never
+      send a file in one piece; they slice it into chunks. Each chunk on its own is meaningless
+      bytes, so every chunk is judged clean and the whole classified document lands in the cloud.</li>
+  <li><b>We only look at the first 4&nbsp;MB.</b> Put the secret on page 200 of a large PDF, or
+      simply pad the file, and we never see it &mdash; and we never record that we did not see it.</li>
+</ol>
+
+<div class="callout warn">
+  <b>Honest framing for the customer.</b> Today this feature is a <i>deterrent and an audit trail</i>
+  for the accidental leak &mdash; the employee who attaches the wrong document to an email. It is
+  not yet a control against someone who is trying. It should not be described as &ldquo;blocks
+  uploads&rdquo; in a proposal or demo script until Phases&nbsp;1 and 2 of the roadmap in §8 are
+  complete.
+</div>
+
+<h3>What is genuinely good about what we have</h3>
+<ul>
+  <li>The <b>architecture split is correct</b>. The browser part is deliberately dumb; the agent
+      holds the detection engine, the fingerprints and the thresholds. No detection data ships
+      inside the browser, where it could be extracted and studied.</li>
+  <li>The <b>native-messaging protocol is clean, versioned and unit-tested</b> &mdash; framing,
+      verdict mapping and incident construction all have real tests in <code>browser_host.rs</code>.</li>
+  <li><b>No content is ever logged or transmitted.</b> Incidents carry hashes, scores, a matched
+      document title and the destination URL only. This holds up under review and matches the
+      product&rsquo;s non-negotiable rules.</li>
+  <li><b>Binary files really are content-inspected</b>, not judged by filename &mdash; the extension
+      reads the bytes and the host runs the same extraction engine as the USB and clipboard channels.</li>
+  <li>The <b>existing documentation is unusually honest</b> about its own limits. That is rare, and
+      worth preserving as the feature grows.</li>
+</ul>
+
+<h2 class="brk">2. What this feature is supposed to do</h2>
+
+<p>Stated plainly: <b>a classified document on an employee&rsquo;s PC must not be able to leave
+through a web browser</b> &mdash; not as a Gmail or Outlook Web attachment, not into SharePoint or
+Google Drive, not into an S3 bucket, not onto a file-sharing site, not pasted into a chat box, and
+not dragged onto a random web page.</p>
+
+<p>This is one of the escape routes the product tracks (alongside USB, clipboard, print, desktop
+email and the network itself). It is the hardest one, for one specific reason:</p>
+
+<div class="callout">
+  <b>Why the network filter alone cannot do this.</b> Our network filter (WFP) can see that Chrome
+  is connecting to <code>drive.google.com</code> on port 443. It cannot see <i>what</i> is inside
+  that connection, because the connection is encrypted end-to-end by TLS. It can only make
+  destination-based decisions: allow this site, block that one. To decide based on the
+  <i>content</i> of an upload, something must look at the data <b>before</b> the browser encrypts
+  it. That is the entire reason the browser extension exists.
+</div>
+
+<h2>3. What we built</h2>
+
+<p>Four moving parts, in the order data flows through them.</p>
+
+<figure>
+<pre><span class="c">┌──────────────────── Google Chrome / Microsoft Edge ─────────────────────┐</span>
+<span class="c">│</span>                                                                       <span class="c">│</span>
+<span class="c">│</span>  <span class="k">THE WEB PAGE</span>  (gmail.com, S3 console, dropbox.com …)                 <span class="c">│</span>
+<span class="c">│</span>       <span class="c">│</span>  user picks / drags / pastes a file                             <span class="c">│</span>
+<span class="c">│</span>       <span class="c">▼</span>                                                                <span class="c">│</span>
+<span class="c">│</span>  <span class="k">inject.js</span>   runs INSIDE the page   <span class="c">— wraps fetch() and XMLHttpRequest</span>  <span class="c">│</span>
+<span class="c">│</span>       <span class="c">│</span>  window.postMessage   <span class="c">◀── ⚠ a channel the page can also write to</span>   <span class="c">│</span>
+<span class="c">│</span>       <span class="c">▼</span>                                                                <span class="c">│</span>
+<span class="c">│</span>  <span class="k">content.js</span>  isolated from the page  <span class="c">— file input, drop, paste, submit</span>  <span class="c">│</span>
+<span class="c">│</span>       <span class="c">│</span>  chrome.runtime.sendMessage                                     <span class="c">│</span>
+<span class="c">│</span>       <span class="c">▼</span>                                                                <span class="c">│</span>
+<span class="c">│</span>  <span class="k">background.js</span>  the service worker; owns the pipe out to Windows      <span class="c">│</span>
+<span class="c">└───────│─────────────────────────────────────────────────────────────────┘</span>
+        <span class="c">│</span>  Chrome native messaging  <span class="c">(4-byte length prefix + JSON, over stdin/stdout)</span>
+        <span class="c">▼</span>
+  <span class="k">dlp-agent.exe browser-host</span>   <span class="c">— our Rust agent, running as the logged-in user</span>
+        <span class="c">│</span>
+        <span class="c">├──▶</span> detect::verdict_bytes()  <span class="c">the same engine USB and clipboard use</span>
+        <span class="c">├──▶</span> allow / warn / block     <span class="c">thresholds from [kguard] in the agent config</span>
+        <span class="c">└──▶</span> incident over mTLS       <span class="c">channel "web-upload"; hashes + URL, never content</span></pre>
+<figcaption>The four parts and the trust boundary. Everything above the pipe lives inside the
+browser, sharing a process with the web page; everything below it is ours.</figcaption>
+</figure>
+
+<h3>The journey of one file, step by step</h3>
+<ol>
+  <li>An employee opens Gmail, clicks <i>Attach</i>, and picks <code>OPORD.pdf</code>.</li>
+  <li>Chrome fires a <code>change</code> event. Our <code>content.js</code> sees it first.</li>
+  <li><code>content.js</code> decides the file is binary (not a <code>.txt</code>), reads the first
+      4&nbsp;MB, and base64-encodes it &mdash; turning raw bytes into a long text string so they can
+      travel through Chrome&rsquo;s messaging system.</li>
+  <li>It hands that to <code>background.js</code>, which forwards it down a pipe to
+      <code>dlp-agent.exe browser-host</code>.</li>
+  <li>The agent decodes it and runs the document-fingerprint engine, producing a score: e.g.
+      &ldquo;42% of this content matches the registered document <i>Operation Himalayan
+      Shield</i>&rdquo;.</li>
+  <li>Containment &ge;&nbsp;0.30, or coverage &ge;&nbsp;0.60, or any exact-data (EDM) match
+      &rArr; <b>block</b>. A weaker match &rArr; <b>warn</b>. Nothing &rArr; <b>allow</b>.</li>
+  <li>The verdict travels back. On <b>block</b>, <code>content.js</code> clears the file input,
+      shows a red banner, and remembers the input so that a later form submit is cancelled too.</li>
+  <li>The agent raises an incident to the management server over mutual TLS &mdash; file hash,
+      score, matched title, destination URL. If the server is unreachable it queues locally and
+      flushes later.</li>
+</ol>
+
+<div class="plain">
+  <b>Two terms you will keep seeing.</b> <b>Isolated world</b> = a private JavaScript sandbox Chrome
+  gives extensions; the web page cannot see or touch anything in it. <b>MAIN world</b> = the
+  page&rsquo;s own JavaScript space; anything we place there, the page can read, rewrite or delete.
+  We are forced into the MAIN world in order to intercept <code>fetch()</code>, and almost every
+  serious problem in this report traces back to that single fact.
+</div>
+
+<h2 class="brk">4. Findings</h2>
+
+<p>Twenty-two issues, ordered by severity. Each names the file, explains the mechanism in plain
+terms, states the real-world consequence, and gives the fix.</p>
+
+<h3>P0 &mdash; Critical: the block does not hold</h3>
+
+<div class="finding">
+  <h4><span class="pill p0">P0-1</span>Paste and drag-and-drop are never actually blocked</h4>
+  <div class="loc">dlp-browser-ext/content.js — the 'drop' handler (~line 196) and the 'paste' handler (~line 222)</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>Both handlers are declared <code>async</code> and call <code>ev.preventDefault()</code> only
+        <i>after</i> <code>await scanFile(...)</code> returns.</dd>
+    <dt>Why it happens</dt>
+    <dd>A browser event can only be cancelled while it is still being delivered. The moment our
+        handler reaches its first <code>await</code>, it returns control to the browser; the browser
+        finishes delivering the event and performs the default action &mdash; pasting the text, or
+        handing the dropped file to the page. Our <code>preventDefault()</code> arrives milliseconds
+        later and is silently ignored. There is no error and no warning: the code reads as if it
+        works.</dd>
+    <dt>What it means</dt>
+    <dd>Copy a classified paragraph and paste it into a Gmail compose window &mdash; the text lands
+        in the message. Drag a classified PDF onto a file-sharing site &mdash; the site receives it.
+        In both cases our red banner appears <i>on top of</i> the successful leak, and an incident
+        is filed recording <code>action_taken = Blocked</code>. A wrong audit trail is worse than a
+        missing one, because it will be believed.</dd>
+    <dt>Fix</dt>
+    <dd>Use the standard <b>block-then-replay</b> pattern: cancel unconditionally and synchronously,
+        hold the payload, scan it, and re-insert it into the page only on an allow verdict. For
+        paste that means <code>preventDefault()</code> immediately, then writing the text back with
+        <code>insertText</code> on allow. For drop it means swallowing the drop and re-dispatching a
+        synthetic <code>DataTransfer</code> on allow. Both patterns are well established; both need
+        real browser tests, which we have never run.</dd>
+  </dl>
+</div>
+
+<div class="finding">
+  <h4><span class="pill p0">P0-2</span>A web page can approve its own uploads</h4>
+  <div class="loc">dlp-browser-ext/inject.js:31–56 (the 'res' listener) and content.js (~line 296)</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The verdict travels from <code>content.js</code> to <code>inject.js</code> as
+        <code>window.postMessage({__dlp:'res', id, verdict})</code>. That is a public broadcast
+        inside the page. Every script on the page can listen to it and, crucially, can send one.
+        The request ids are simply 1, 2, 3&hellip;</dd>
+    <dt>Why it happens</dt>
+    <dd><code>inject.js</code> must live in the page&rsquo;s own JavaScript world in order to wrap
+        <code>fetch()</code>. Extensions have no private channel into that world, so the code uses
+        the only bridge available. This is not a coding slip &mdash; it is a consequence of putting
+        the decision inside the page at all.</dd>
+    <dt>What it means</dt>
+    <dd>This defeats the whole <code>fetch</code>/<code>XHR</code> path, which is the path that
+        covers Gmail, Drive, SharePoint and essentially every modern site. The bypass fits on one
+        line, needs no privileges, no admin rights and no installed software:
+<pre><span class="c">// pasted into the browser console, or shipped in any page's own script</span>
+setInterval(()=&gt;{for(let i=1;i&lt;9999;i++)postMessage({__dlp:'res',id:i,verdict:'allow'})},5)</pre>
+        The message names are visible in the page, so a merely curious user can find this.</dd>
+    <dt>Fix</dt>
+    <dd>Stop treating the page-world hook as the enforcement point (§6 and §7). Short term, make
+        forgery impractical: unguessable random ids, and accept replies only over a
+        <code>MessageChannel</code> port handed across once at <code>document_start</code> before
+        any page script runs. Long term, enforce in the service worker with
+        <code>declarativeNetRequest</code> or blocking <code>webRequest</code>, where the page gets
+        no vote at all.</dd>
+  </dl>
+</div>
+
+<div class="finding">
+  <h4><span class="pill p0">P0-3</span>Content we cannot read is treated as safe</h4>
+  <div class="loc">dlp-agent/src/browser_host.rs — map_verdict (~line 175)</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd><code>map_verdict</code> looks only at the match lists. It never inspects
+        <code>verdict.extraction</code>. When the engine returns
+        <code>Extraction::Unreadable</code> &mdash; encrypted ZIP, password-protected Office file,
+        unsupported format, corrupt header &mdash; the match lists are empty, so the mapping
+        produces <b>allow</b>.</dd>
+    <dt>Why it happens</dt>
+    <dd>An oversight, not a decision: the same team wrote the correct handling elsewhere.
+        <code>kguard/mod.rs:1213</code> explicitly checks for <code>Unreadable</code> and applies a
+        configurable <code>[kguard] fail_block</code> on the exfiltration path. The browser channel
+        never received that check.</dd>
+    <dt>What it means</dt>
+    <dd>&ldquo;Right-click &rarr; add to archive &rarr; set a password&rdquo; defeats content
+        inspection entirely &mdash; and employees do that for legitimate reasons every day, so it
+        will not look suspicious in a review. This also directly contradicts product rule
+        <i>B4 &mdash; fail secure on unreadable egress</i> from the Tier&nbsp;2 plan.</dd>
+    <dt>Fix</dt>
+    <dd>Add the <code>Unreadable</code> branch to <code>map_verdict</code>, honouring a
+        <code>[webupload] fail_block</code> knob mirroring <code>[kguard] fail_block</code>.
+        Sensible production default: unreadable content bound for a <b>non-sanctioned</b>
+        destination is blocked; bound for a sanctioned one it is warned and audited.</dd>
+  </dl>
+</div>
+
+<div class="finding">
+  <h4><span class="pill p0">P0-4</span>Cloud uploads (S3, Drive, OneDrive, Dropbox) are not covered</h4>
+  <div class="loc">dlp-browser-ext/inject.js — partsFromBody (~line 98); architectural</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>We scan whatever is handed to a single <code>fetch()</code> call. Every serious cloud
+        storage service instead performs a <i>resumable</i> or <i>multipart</i> upload: the page
+        slices the file with <code>file.slice(start, end)</code> and sends the pieces as separate
+        requests, typically 256&nbsp;KB to 8&nbsp;MB each.</dd>
+    <dt>Why it happens</dt>
+    <dd>We inspect each slice in isolation. A slice is a headerless fragment of a PDF or DOCX; our
+        extractor cannot identify the format, extraction fails, no match is found, and the verdict
+        is <b>allow</b>. This compounds P0-3: every chunk of every large upload becomes an
+        &ldquo;unreadable, therefore safe&rdquo; decision.</dd>
+    <dt>What it means</dt>
+    <dd>The single most-cited goal for this feature &mdash; stop uploads to cloud storage and S3
+        &mdash; is not met, and it fails silently and consistently rather than occasionally. A demo
+        using a small file on a simple HTML form will pass cleanly and hide this completely.</dd>
+    <dt>Fix</dt>
+    <dd>Two complementary moves. <b>(a) Session reassembly:</b> recognise the resumable protocols
+        (Google&rsquo;s <code>uploadType=resumable</code>, S3 <code>CreateMultipartUpload</code>,
+        Microsoft&rsquo;s <code>createUploadSession</code>) and correlate chunks back to one logical
+        upload. <b>(b) Better &mdash; decide on the source file, not on the bytes on the wire</b>,
+        by correlating with the kernel driver, which already observes Chrome opening the real file
+        on disk (§7, Layer&nbsp;1). Option (b) also resolves P0-5 and most of the performance
+        problems in one move.</dd>
+  </dl>
+</div>
+
+<div class="finding">
+  <h4><span class="pill p0">P0-5</span>Only the first 4&nbsp;MB of a file is ever examined</h4>
+  <div class="loc">content.js:24 MAX_SCAN_BYTES · inject.js:25 · browser_host.rs MAX_SCAN_BYTES</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The cap is applied by truncation, and truncation is then treated as a complete scan. A
+        60&nbsp;MB PDF is judged on its first 4&nbsp;MB; the remaining 56&nbsp;MB is never seen and
+        never recorded as unexamined.</dd>
+    <dt>Why it happens</dt>
+    <dd>The cap itself is a sensible memory and latency limit, copied from the kernel path. The
+        mistake is the missing <i>disposition</i> for the part we skipped.</dd>
+    <dt>What it means</dt>
+    <dd>Deliberate evasion is trivial &mdash; prepend 4&nbsp;MB of holiday photos. Accidental misses
+        are just as likely: a scanned 200-page classified annex easily exceeds 4&nbsp;MB, and the
+        sensitive pages are rarely at the front.</dd>
+    <dt>Fix</dt>
+    <dd>Stream the whole file through the fingerprint engine rather than buffering a prefix &mdash;
+        the engine already works on rolling windows, so this is a plumbing change, not a maths
+        change. Where a hard cap must remain, mark the verdict <code>Partial</code> and apply the
+        same fail-secure rule as P0-3 instead of implying the scan was complete.</dd>
+  </dl>
+</div>
+
+<h3 class="brk">P1 &mdash; High: large holes in coverage</h3>
+
+<div class="finding f1">
+  <h4><span class="pill p1">P1-1</span>Most request body types are not inspected at all</h4>
+  <div class="loc">dlp-browser-ext/inject.js — partsFromBody (~line 98)</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>We only recognise three body shapes: <code>File</code>, <code>Blob</code> and
+        <code>FormData</code>. Everything else passes untouched.</dd>
+    <dt>What it means</dt>
+    <dd>Not covered: a plain <b>string body</b> (very common &mdash; a single-page app reads the file
+        itself with <code>FileReader</code> and posts JSON containing base64), an
+        <code>ArrayBuffer</code> or typed array, <code>URLSearchParams</code>, a
+        <code>ReadableStream</code>, and a body passed inside a <code>Request</code> object
+        (<code>inject.js:139</code> explicitly gives up on that case). Also unhooked entirely:
+        <code>navigator.sendBeacon</code>, WebSocket, and WebRTC data channels.</dd>
+    <dt>Fix</dt>
+    <dd>Handle string/ArrayBuffer/typed-array bodies, and tee <code>ReadableStream</code> bodies.
+        Accept that a list of body shapes will never be complete &mdash; which is the argument for
+        the default-deny model in §7 rather than an ever-growing allowlist of shapes we understand.</dd>
+  </dl>
+</div>
+
+<div class="finding f1">
+  <h4><span class="pill p1">P1-2</span>An <code>about:blank</code> iframe has no hook in it</h4>
+  <div class="loc">dlp-browser-ext/manifest.json — content_scripts</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The content scripts declare <code>all_frames: true</code> but omit
+        <code>match_about_blank</code> (and <code>match_origin_as_fallback</code>). Chrome does not
+        inject into frames with no real URL unless those are set.</dd>
+    <dt>What it means</dt>
+    <dd>A three-line bypass: create an empty <code>&lt;iframe&gt;</code>, take its untouched
+        <code>fetch</code>, upload with it. Same origin, same cookies, no hook. Pages using
+        <code>srcdoc</code>, <code>blob:</code> or sandboxed frames are likewise uncovered.</dd>
+    <dt>Fix</dt>
+    <dd>Add <code>"match_about_blank": true</code> and
+        <code>"match_origin_as_fallback": true</code>. One-line change; then verify in a browser.</dd>
+  </dl>
+</div>
+
+<div class="finding f1">
+  <h4><span class="pill p1">P1-3</span>The name-only fallback is effectively &ldquo;allow&rdquo;</h4>
+  <div class="loc">content.js — scanFile fallback; browser_host.rs — ScanKind::ScanFile</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>When the extension cannot read a file&rsquo;s bytes it falls back to
+        <code>scan_file</code>, sending only the filename. The host then calls
+        <code>detect::verdict(Path::new("OPORD.pdf"))</code>, which tries to open that name as a
+        path on disk, relative to the host process&rsquo;s working directory. It does not exist, the
+        read errors, and <code>handle_request</code> converts errors into <b>allow with a
+        reason</b>.</dd>
+    <dt>What it means</dt>
+    <dd>Every path that fails to read bytes silently succeeds in uploading. The fallback that exists
+        to be conservative is the least conservative branch in the file.</dd>
+    <dt>Fix</dt>
+    <dd>Delete the <code>scan_file</code> path from the browser channel, or make it fail-secure. If
+        we cannot read the content, we cannot clear the upload.</dd>
+  </dl>
+</div>
+
+<div class="finding f1">
+  <h4><span class="pill p1">P1-4</span>Internal errors fail open, contradicting the stated posture</h4>
+  <div class="loc">inject.js — the fetch wrapper's catch block (~line 148)</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The whole hook body is wrapped in <code>try { ... } catch (_e) { /* fall through */ }</code>
+        and then calls the real <code>fetch</code>. Any unexpected error &mdash; and hooking
+        arbitrary sites produces plenty &mdash; results in the upload proceeding unscanned.</dd>
+    <dt>What it means</dt>
+    <dd>The extension advertises fail-secure (<code>SCANNER_UNAVAILABLE_VERDICT = 'block'</code>)
+        but the most likely failure mode in practice, an exception in the hook, fails open. A page
+        can also deliberately provoke one.</dd>
+    <dt>Fix</dt>
+    <dd>Route hook exceptions into the same fail-secure decision as a scanner timeout, and raise an
+        incident so the operator can see the extension is malfunctioning on a given site.</dd>
+  </dl>
+</div>
+
+<div class="finding f1">
+  <h4><span class="pill p1">P1-5</span>Pasted files and images are not scanned</h4>
+  <div class="loc">dlp-browser-ext/content.js — the 'paste' handler</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The handler reads <code>clipboardData.getData('text/plain')</code> only. It ignores
+        <code>clipboardData.files</code> and image items.</dd>
+    <dt>What it means</dt>
+    <dd>Copy a classified file in Explorer, click into Gmail&rsquo;s compose window, press
+        Ctrl+V &mdash; the file is attached and never scanned. Screenshot a classified document and
+        paste the image &mdash; likewise (image content also needs OCR, which is separate work
+        already under way in the repository).</dd>
+    <dt>Fix</dt>
+    <dd>Scan <code>clipboardData.files</code> through the same path as a file input, and route
+        image items to the OCR pipeline once it lands.</dd>
+  </dl>
+</div>
+
+<div class="finding f1">
+  <h4><span class="pill p1">P1-6</span>A fail-secure block leaves no audit trail</h4>
+  <div class="loc">background.js — unavailableReply; content.js — requestVerdict</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>When the native host is missing, crashed or slow, the extension blocks the upload by itself.
+        Incidents, however, are raised by the host &mdash; which by definition is not there.</dd>
+    <dt>What it means</dt>
+    <dd>Enforcement happens with no record: the console shows nothing, the user sees an unexplained
+        block, and support cannot distinguish &ldquo;DLP correctly blocked a leak&rdquo; from
+        &ldquo;the agent is broken on this machine&rdquo;. This breaks the product rule that every
+        enforcement action is audited.</dd>
+    <dt>Fix</dt>
+    <dd>Buffer enforcement events in the service worker (<code>chrome.storage.local</code>) and
+        flush them to the agent when it returns; have the agent post a
+        <code>ScannerUnavailable</code> incident. Surface a per-endpoint browser-channel health
+        state in the console (see §7, Layer&nbsp;4).</dd>
+  </dl>
+</div>
+
+<h3 class="brk">P2 &mdash; Medium: correctness, operability and privacy</h3>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-1</span>Every file is scanned at least twice</h4>
+  <div class="loc">content.js 'change' handler + inject.js fetch/XHR hook</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>Picking a file triggers a full 4&nbsp;MB read, base64 encode and native round-trip. The page
+        then uploads the same file, and the fetch hook does all of it again. There is no cache
+        keyed on content hash.</dd>
+    <dt>What it means</dt>
+    <dd>Doubled latency and memory on every upload (a 4&nbsp;MB file becomes a ~5.5&nbsp;MB string,
+        copied several times), and two incidents on the server for one user action &mdash; which
+        will inflate incident counts and confuse reviewers.</dd>
+    <dt>Fix</dt>
+    <dd>Hash first (streaming SHA-256), then consult a short-lived verdict cache in the service
+        worker keyed on hash + destination origin. Scan once, decide many times.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-2</span>The first upload after a restart is likely to be blocked</h4>
+  <div class="loc">background.js SCAN_TIMEOUT_MS = 8000; main.rs cmd_browser_host (bundle load)</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The first scan after the service worker starts must spawn <code>dlp-agent.exe</code>, which
+        loads and verifies the fingerprint bundle before it can answer. If that exceeds 8 seconds,
+        the extension applies its fail-secure block.</dd>
+    <dt>What it means</dt>
+    <dd>On a cold or loaded machine, users get an unexplained block on their first upload, which
+        succeeds when they retry. Users learn very quickly that retrying defeats DLP &mdash; a
+        behaviour we do not want to teach.</dd>
+    <dt>Fix</dt>
+    <dd>Have the host answer a cheap <code>ping</code> immediately and load the bundle in the
+        background; keep the host warm as part of the DLP service rather than spawning it per
+        browser profile; distinguish &ldquo;starting up&rdquo; from &ldquo;unavailable&rdquo; and
+        hold the upload rather than failing it.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-3</span>The XHR wrapper changes browser semantics</h4>
+  <div class="loc">inject.js — XMLHttpRequest.prototype.send wrapper</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd><code>send()</code> now returns immediately while the real send happens later, after an
+        async scan. Code that calls <code>abort()</code>, sets <code>timeout</code>, or listens to
+        <code>upload.onprogress</code> between those two moments behaves differently from a normal
+        browser.</dd>
+    <dt>What it means</dt>
+    <dd>Site breakage that will be blamed on DLP, and support cost. In particular an
+        <code>abort()</code> during the scan window is ignored, and we then send the request anyway.</dd>
+    <dt>Fix</dt>
+    <dd>Track per-request state, honour an <code>abort()</code> that arrives during the scan, and
+        add regression tests against a harness page that exercises each XHR lifecycle event.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-4</span>The block banner tells the page what it matched</h4>
+  <div class="loc">content.js — verdictText / showBanner</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The banner text includes the matched document&rsquo;s title and is inserted into the
+        page&rsquo;s own DOM, where any script on that page can read it.</dd>
+    <dt>What it means</dt>
+    <dd>A hostile or compromised site learns the titles of classified documents on the endpoint,
+        and an insider gets a clean oracle for probing what is registered. This directly contradicts
+        <code>notify/mod.rs</code>, which deliberately hides detection internals as
+        &ldquo;evasion intel for an insider&rdquo;.</dd>
+    <dt>Fix</dt>
+    <dd>Show a neutral message plus a case reference (&ldquo;Blocked by DLP &mdash; reference
+        A7F32C&rdquo;) and put the detail only in the incident and the desktop toast. Render the
+        banner in a closed shadow root so the page cannot read or restyle it.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-5</span>No stable extension identity, so it cannot be deployed as designed</h4>
+  <div class="loc">manifest.json — no "key", no icons; install-native-host.ps1 -ExtensionId</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>Without a <code>key</code> in the manifest (or a packed CRX), the extension&rsquo;s 32-character
+        id is derived from its install path and differs per machine. But the native host pins that id in
+        <code>allowed_origins</code>, and enterprise force-install policy addresses it by id too.</dd>
+    <dt>What it means</dt>
+    <dd>The documented deployment path cannot actually work at scale as written. There are also no
+        icons, so the extension is unidentifiable in the browser UI.</dd>
+    <dt>Fix</dt>
+    <dd>Generate a signing key once, pin <code>"key"</code> in the manifest, produce a signed CRX,
+        and host an update XML on-premise for air-gapped sites. Add icons and a minimal options page
+        showing health and version.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-6</span>The install script probably writes a manifest Chrome will reject</h4>
+  <div class="loc">install-native-host.ps1 — Set-Content ... -Encoding utf8</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>On Windows PowerShell 5.1 &mdash; the version present on a stock Windows endpoint &mdash;
+        <code>-Encoding utf8</code> writes a UTF-8 <b>byte-order mark</b> at the start of the file.
+        Chrome parses the native-host manifest with a strict JSON reader.</dd>
+    <dt>What it means</dt>
+    <dd>A likely &ldquo;native host not found&rdquo; failure at install time that is painful to
+        diagnose, because everything looks correct on screen. <b>Verify this on a real endpoint</b>
+        before shipping &mdash; it has never been run end to end.</dd>
+    <dt>Fix</dt>
+    <dd>Write the manifest with <code>[System.IO.File]::WriteAllText</code> using a
+        <code>UTF8Encoding($false)</code>, or plain ASCII. Separately, add <code>%*</code> to the
+        <code>.cmd</code> launcher so Chrome&rsquo;s calling-origin argument reaches the host, and
+        have the host verify it &mdash; defence in depth alongside
+        <code>allowed_origins</code>.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-7</span>Policy is local to each endpoint, not delivered by the server</h4>
+  <div class="loc">main.rs cmd_browser_host — block_at / coverage_block_at from [kguard]</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>Thresholds come from the agent&rsquo;s local config file. There is no per-group policy for
+        this channel, no sanctioned/blocked origin list, no per-destination action, and no
+        user-justification or break-glass workflow.</dd>
+    <dt>What it means</dt>
+    <dd>Every other channel in the product is administered from the console; this one is not. An
+        administrator cannot say &ldquo;uploads to our own SharePoint are fine, everything else is
+        blocked&rdquo; &mdash; which is the single most useful rule this feature could offer.</dd>
+    <dt>Fix</dt>
+    <dd>Define a <code>web-upload</code> policy object served over mTLS alongside the other
+        policies: sanctioned origins, per-origin action, thresholds, fail-secure switches, and an
+        override workflow with audited justification.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-8</span><code>[webupload] trusted_origins</code> is parsed but wired to nothing</h4>
+  <div class="loc">dlp-agent/src/config.rs:559–585 — no consumers outside config.rs</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The configuration section exists, parses, and has unit tests. No code reads it. It was
+        intended to seal rather than block uploads to sanctioned destinations.</dd>
+    <dt>What it means</dt>
+    <dd>An administrator can write configuration that appears to be accepted and silently does
+        nothing &mdash; the most dangerous kind of setting in a security product.</dd>
+    <dt>Fix</dt>
+    <dd>Either implement it as part of P2-7, or remove it and fail loudly on an unknown section
+        until it is implemented.</dd>
+  </dl>
+</div>
+
+<div class="finding f2">
+  <h4><span class="pill p2">P2-9</span>No tests, no linting, no build, never run in a browser</h4>
+  <div class="loc">dlp-browser-ext/ — 7 files, no package.json, no CI</div>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The Rust host has good unit tests. The ~700 lines of JavaScript that make every actual
+        enforcement decision have none, and the extension has never been loaded into Chrome. Every
+        P0 in this report would have been caught by a single manual test.</dd>
+    <dt>Fix</dt>
+    <dd>A test harness page with one button per upload vector, driven by Playwright against a real
+        Chrome with the extension loaded and a stub native host; unit tests for the decision logic;
+        both in CI. See §9.</dd>
+  </dl>
+</div>
+
+<h3>P3 &mdash; Strategic</h3>
+
+<div class="finding f3">
+  <h4><span class="pill p3">P3-1</span>Coverage stops at Chrome and Edge, and is switchable off</h4>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>Firefox is unsupported. A portable browser downloaded to the Desktop is unsupported.
+        Starting Chrome with <code>--disable-extensions</code> turns the feature off, including a
+        policy-installed extension.</dd>
+    <dt>What it means</dt>
+    <dd>For a defence customer, &ldquo;the control is off unless the user cooperates&rdquo; is not a
+        control. This is not fixable inside the extension.</dd>
+    <dt>Fix</dt>
+    <dd>Enforcement attestation plus a network kill-switch: the agent watches for browser processes,
+        expects a heartbeat from the extension, and uses the existing WFP filter to block egress for
+        any browser process that is not attested. Details in §7, Layer&nbsp;2.</dd>
+  </dl>
+</div>
+
+<div class="finding f3">
+  <h4><span class="pill p3">P3-2</span>The two halves fail in opposite directions</h4>
+  <dl>
+    <dt>What is wrong</dt>
+    <dd>The extension fails <b>secure</b> (host missing &rArr; block). The host fails <b>open</b>
+        (no fingerprint bundle cached &rArr; allow everything, audit only,
+        <code>main.rs:1456</code>).</dd>
+    <dt>What it means</dt>
+    <dd>The combined behaviour is neither. On a freshly enrolled machine that has the host installed
+        but has not yet received a bundle, every upload is allowed &mdash; and this is the exact
+        state of a machine during its first hours in the field. Both behaviours are documented, but
+        together they are not a coherent posture.</dd>
+    <dt>Fix</dt>
+    <dd>One switch, one owner, one documented default: no usable policy means uploads to
+        non-sanctioned destinations are blocked and the endpoint is reported as degraded in the
+        console.</dd>
+  </dl>
+</div>
+
+<h2 class="brk">5. Coverage today, measured against the goal</h2>
+
+<p>The goal is &ldquo;block sensitive files going anywhere on the internet&rdquo;. Here is where we
+actually stand, per real-world path. This assumes the extension is installed, the host is running,
+and a fingerprint bundle is present &mdash; the best case.</p>
+
+<table>
+  <thead><tr><th style="width:30%">Upload path</th><th style="width:14%">Today</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Simple HTML form, small file (our demo)</td><td><span class="pill ok">BLOCKED</span></td><td>The path everything was tested against.</td></tr>
+    <tr><td>Gmail / Outlook Web attachment</td><td><span class="pill part">PARTIAL</span></td><td>Scanned on file pick, but the page can forge an allow (P0-2), and large attachments chunk (P0-4).</td></tr>
+    <tr><td>Amazon S3 console / presigned multipart</td><td><span class="pill no">NOT BLOCKED</span></td><td>Multipart chunks are unreadable fragments &rArr; allow (P0-4 + P0-3).</td></tr>
+    <tr><td>Google Drive / OneDrive / Dropbox web</td><td><span class="pill no">NOT BLOCKED</span></td><td>Resumable chunked upload, same reason.</td></tr>
+    <tr><td>Paste classified text into webmail body</td><td><span class="pill no">NOT BLOCKED</span></td><td>Cancellation arrives too late (P0-1). Banner shown, text delivered.</td></tr>
+    <tr><td>Paste a copied file into a compose window</td><td><span class="pill no">NOT BLOCKED</span></td><td><code>clipboardData.files</code> is never read (P1-5).</td></tr>
+    <tr><td>Drag a file onto a web page</td><td><span class="pill no">NOT BLOCKED</span></td><td>Same late-cancellation bug (P0-1).</td></tr>
+    <tr><td>File &gt; 4&nbsp;MB with sensitive content past 4&nbsp;MB</td><td><span class="pill no">NOT BLOCKED</span></td><td>Never inspected, never flagged as uninspected (P0-5).</td></tr>
+    <tr><td>Password-protected ZIP or encrypted DOCX</td><td><span class="pill no">NOT BLOCKED</span></td><td>Unreadable is treated as clean (P0-3).</td></tr>
+    <tr><td>Screenshot of a classified document</td><td><span class="pill no">NOT BLOCKED</span></td><td>Needs OCR; separate work already in progress in the repo.</td></tr>
+    <tr><td>Site that posts base64 JSON instead of a file</td><td><span class="pill no">NOT BLOCKED</span></td><td>String bodies are not inspected (P1-1).</td></tr>
+    <tr><td>Upload from an <code>about:blank</code> iframe</td><td><span class="pill no">NOT BLOCKED</span></td><td>No hook is injected there (P1-2).</td></tr>
+    <tr><td>Firefox, or a portable browser</td><td><span class="pill no">NOT BLOCKED</span></td><td>No extension exists for them (P3-1).</td></tr>
+    <tr><td>Chrome started with <code>--disable-extensions</code></td><td><span class="pill no">NOT BLOCKED</span></td><td>The control is switched off (P3-1).</td></tr>
+    <tr><td>Newly enrolled PC, bundle not yet delivered</td><td><span class="pill no">NOT BLOCKED</span></td><td>Host fails open with no policy (P3-2).</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <b>Read this table honestly.</b> One row is green. The feature currently stops the careless
+  mistake on a simple form. Every row below the first two is a normal, everyday way that files
+  actually reach the internet.
+</div>
+
+<h2>6. Why a hook inside the page can never be the whole answer</h2>
+
+<p>This is the single most important idea in the report, and it is worth stating carefully, because
+it determines what we build next.</p>
+
+<p>To intercept <code>fetch()</code>, our code has to run in the page&rsquo;s own JavaScript world.
+In that world, our code and the page&rsquo;s code are <b>peers</b>. They can read each other,
+overwrite each other, and race each other. There is no privilege boundary. Anything we do there is
+by consent, not by force.</p>
+
+<div class="plain">
+  <b>An analogy.</b> Imagine posting a security guard inside a room, and giving the people in that
+  room the power to rewrite the guard&rsquo;s instructions, imitate his radio, or simply ask him to
+  step outside. He will stop honest people who make a mistake. He will not stop anyone who does not
+  want to be stopped. To actually control the door, the guard has to stand <i>outside</i> the room.
+</div>
+
+<p>The practical consequences:</p>
+<ul>
+  <li>The page-world hook is a good <b>content extractor</b> &mdash; it is the only place with easy
+      access to the file object. It is a poor <b>enforcement point</b>.</li>
+  <li>Enforcement must live where the page has no reach: the extension&rsquo;s service worker
+      (which can cancel network requests), the agent, the network filter, and the kernel driver.</li>
+  <li>Coverage should not be an ever-growing list of transports we remember to hook. It should be
+      <b>default-deny</b>: an upload that we have not positively cleared does not go out.</li>
+</ul>
+
+<h2 class="brk">7. What production grade looks like</h2>
+
+<p>Four layers. Each one catches what the layer above it misses, and each is independently useful.
+Three of the four reuse components this project already has.</p>
+
+<figure>
+<pre>  <span class="k">LAYER 4 · ASSURANCE</span>   console health per endpoint · incidents for every action
+                       user justification workflow · break-glass with audit
+  <span class="c">──────────────────────────────────────────────────────────────────────────</span>
+  <span class="k">LAYER 3 · BROWSER</span>     hardened extension: default-deny uploads, enforced in the
+                       service worker, not in the page. Page hook = extractor only.
+  <span class="c">──────────────────────────────────────────────────────────────────────────</span>
+  <span class="k">LAYER 2 · NETWORK</span>     WFP allowlist of destinations  <span class="c">(already built)</span>
+                       + attestation watchdog: an unattested browser gets no egress
+  <span class="c">──────────────────────────────────────────────────────────────────────────</span>
+  <span class="k">LAYER 1 · KERNEL</span>      minifilter read-deny  <span class="c">(already built)</span> — the browser cannot
+                       even read the file, and it tells us the real path on disk
+  <span class="c">──────────────────────────────────────────────────────────────────────────</span>
+  <span class="k">LAYER 0 · POLICY</span>      per-group web-upload policy served from the console over mTLS</pre>
+<figcaption>Defence in depth. The browser is one layer, and deliberately not the load-bearing one.</figcaption>
+</figure>
+
+<h3>Layer 1 &mdash; Use the kernel to solve the hard content problems</h3>
+<p>This is the highest-leverage idea in the report. Our minifilter already watches
+<code>chrome.exe</code> open files and already classifies content from the file system stack. When
+the extension reports &ldquo;an upload of <code>OPORD.pdf</code>, 12&nbsp;MB, is starting&rdquo;, the
+agent can <b>correlate that with the file the browser just opened on disk</b> and make its decision
+against the complete, real file.</p>
+<p>That one change removes four separate problems at once: the 4&nbsp;MB truncation (P0-5), chunked
+cloud uploads (P0-4), the base64 copying overhead (P2-1), and the fragment-is-unreadable failure
+(P0-3 as it applies to chunks). It also gives read-deny as a hard backstop: for the highest
+classifications the browser can simply be denied the read, and no amount of JavaScript trickery
+creates data the browser was never given.</p>
+
+<h3>Layer 2 &mdash; Make the browser prove it is protected</h3>
+<p>The answer to Firefox, portable browsers and <code>--disable-extensions</code> is not more
+extension code. The agent should watch for browser processes and expect a periodic heartbeat from
+our extension inside each one. A browser process running <i>without</i> a valid heartbeat is
+<b>unattested</b>, and the existing WFP filter blocks its network egress by application id. The user
+gets a clear message: this browser is not protected, use the managed one.</p>
+<p>Combined with a destination allowlist &mdash; only sanctioned SaaS reachable at all &mdash; the
+content-inspection job shrinks from &ldquo;the whole internet&rdquo; to &ldquo;the handful of sites
+we approved&rdquo;, which is a problem we can actually solve well.</p>
+
+<h3>Layer 3 &mdash; A hardened extension, built default-deny</h3>
+<p>Invert the model. Instead of &ldquo;let everything through unless we spot something bad&rdquo;,
+the service worker cancels any request carrying a body to a non-sanctioned destination <b>unless it
+holds a fresh approval</b> for that exact content hash, tab and origin. The page-world hook is
+demoted to a content extractor whose output is treated as untrusted input; it can no longer grant
+permission, only supply material for a decision made elsewhere.</p>
+<p>Concretely:</p>
+<ul>
+  <li>Enforce with <code>declarativeNetRequest</code> or blocking <code>webRequest</code> in the
+      service worker. <i>Verify against your Chrome channel:</i> blocking <code>webRequest</code>
+      remains available to <b>policy force-installed</b> extensions, which is exactly our deployment
+      model &mdash; confirm before designing around it.</li>
+  <li>Block-then-replay for paste and drop, so cancellation is synchronous and correct.</li>
+  <li>Hash first, cache verdicts by content hash, scan once.</li>
+  <li>Recognise resumable-upload protocols and decide per logical upload, not per chunk.</li>
+  <li>Unreadable, oversized or unrecognised content follows a configured fail-secure rule, not an
+      accidental allow.</li>
+  <li>Neutral in-page messaging in a closed shadow root; details go to the incident and the desktop
+      toast only.</li>
+  <li>Signed CRX with a pinned key, icons, an on-premise update feed, and GPO/Intune templates for
+      Chrome and Edge.</li>
+</ul>
+
+<h3>Layer 4 &mdash; Assurance, because a silent control is not a control</h3>
+<ul>
+  <li>A console page listing every endpoint&rsquo;s browser-channel state: extension version,
+      host reachable, bundle age, last heartbeat, enforcing or degraded.</li>
+  <li>An incident for <i>every</i> enforcement action, including fail-secure blocks and scanner
+      outages, so &ldquo;blocked correctly&rdquo; and &ldquo;broken&rdquo; are distinguishable.</li>
+  <li>A user-facing block dialog with a case reference and, where policy allows, a justification
+      workflow that records who overrode what and why.</li>
+</ul>
+
+<h2 class="brk">8. Roadmap</h2>
+
+<p>Sequenced so that each phase leaves the product in an honest, shippable state. Estimates assume
+one engineer familiar with the codebase, and include the browser testing that has never been done.</p>
+
+<div class="phase">
+  <span class="when">~1–2 weeks</span>
+  <h4>Phase 1 &mdash; Make the existing feature true</h4>
+  <p>No new capability; make what we claim actually happen.</p>
+  <ul>
+    <li>Fix P0-1 (block-then-replay for paste and drop) and P0-3 (unreadable &rArr; fail-secure).</li>
+    <li>Harden the verdict channel against forgery (P0-2, interim mitigation).</li>
+    <li>Fix P1-2 (<code>match_about_blank</code>), P1-3 (name-only fallback), P1-4 (fail-open catch),
+        P1-5 (pasted files), P1-6 (incidents for fail-secure blocks).</li>
+    <li>Fix P2-6 (install script encoding) and P2-5 (pinned key, icons, signed CRX).</li>
+    <li>Stand up the test harness and CI (P2-9), and run the extension in a real browser for the
+        first time.</li>
+  </ul>
+  <p><b>Exit criteria:</b> every P0 and P1 closed, verified by an automated browser test, and
+  Test&nbsp;E2 in the deploy guide actually ticked.</p>
+</div>
+
+<div class="phase">
+  <span class="when">~2–4 weeks</span>
+  <h4>Phase 2 &mdash; Default-deny and real policy</h4>
+  <ul>
+    <li>Move enforcement into the service worker; page hook becomes an extractor only (closes P0-2
+        properly).</li>
+    <li>Chunked and resumable upload handling (P0-4), plus body types beyond File/Blob/FormData (P1-1).</li>
+    <li>Server-delivered <code>web-upload</code> policy: sanctioned origins, per-origin action,
+        thresholds, fail-secure switches (P2-7, P2-8, P3-2).</li>
+    <li>Verdict cache and hash-first scanning (P2-1); warm host, no first-upload block (P2-2).</li>
+    <li>User-facing block dialog with case reference and justification workflow (P2-4).</li>
+  </ul>
+  <p><b>Exit criteria:</b> a classified file cannot be uploaded to S3, Drive, OneDrive, Dropbox,
+  Gmail or a pastebin from a managed Chrome, demonstrated live.</p>
+</div>
+
+<div class="phase">
+  <span class="when">~3–6 weeks</span>
+  <h4>Phase 3 &mdash; Close the ways around the browser</h4>
+  <ul>
+    <li>Kernel path correlation: decide on the whole real file, not on wire bytes (P0-5, P0-4).</li>
+    <li>Attestation watchdog plus WFP kill-switch for unattested browser processes (P3-1).</li>
+    <li>Console assurance view and channel-health telemetry (Layer 4).</li>
+    <li>Firefox support (WebExtensions; native messaging works the same way).</li>
+  </ul>
+  <p><b>Exit criteria:</b> an unmanaged or extension-disabled browser cannot reach the internet at
+  all; the console can prove, per endpoint, that the channel is enforcing.</p>
+</div>
+
+<div class="phase">
+  <span class="when">follow-on</span>
+  <h4>Phase 4 &mdash; Depth</h4>
+  <ul>
+    <li>OCR for images and screenshots (work already started in the repository).</li>
+    <li>Desktop email (Outlook MAPI/VSTO) and desktop chat clients.</li>
+    <li>Third-party penetration test aimed specifically at this channel, with the bypasses in §4 as
+        the starting checklist.</li>
+  </ul>
+</div>
+
+<h2>9. How we will know it works</h2>
+
+<p>The root cause of every P0 in this report is the same: the JavaScript was never executed in a
+browser. The fix is not more review &mdash; it is a harness.</p>
+
+<ul>
+  <li><b>A vector harness page</b> served locally, with one button per upload path: simple form,
+      form with a large file, drag-drop, paste text, paste file, paste image,
+      <code>fetch</code> with File, with Blob, with FormData, with a string body, with an
+      ArrayBuffer, with a <code>Request</code> object, XHR variants, <code>sendBeacon</code>,
+      chunked upload, upload from an <code>about:blank</code> iframe, upload from a Web Worker.</li>
+  <li><b>Driven by Playwright</b> against a real Chrome with the extension loaded and a stub native
+      host that returns a scripted verdict, asserting on what the server actually received &mdash;
+      not on whether a banner appeared. <i>Data arriving at the destination is the only definition
+      of failure that matters.</i></li>
+  <li><b>Adversarial tests as first-class citizens:</b> the forged-verdict bypass, the
+      <code>about:blank</code> bypass, the password-protected ZIP, the 4&nbsp;MB-padded file, and
+      the chunked upload each become a permanent regression test.</li>
+  <li><b>Fault-injection tests:</b> host missing, host slow, host killed mid-scan, no bundle,
+      service worker restarted &mdash; each must produce a documented verdict <i>and</i> an
+      incident.</li>
+  <li><b>Definition of done</b> for this feature: the coverage table in §5 is all green for the rows
+      in scope, and every red row that remains is a written, agreed limitation in the customer
+      documentation.</li>
+</ul>
+
+<h2>10. Glossary</h2>
+
+<table>
+  <thead><tr><th style="width:26%">Term</th><th>Plain meaning</th></tr></thead>
+  <tbody>
+    <tr><td>Extension / MV3</td><td>A small program that runs inside Chrome or Edge. MV3 is the current rulebook Google requires extensions to follow.</td></tr>
+    <tr><td>Service worker</td><td>The extension&rsquo;s background brain. It has no visible window, may be shut down when idle, and is out of reach of web pages.</td></tr>
+    <tr><td>Content script</td><td>Extension code injected into a web page. It comes in two flavours: <i>isolated</i> (the page cannot touch it) and <i>MAIN world</i> (the page can).</td></tr>
+    <tr><td>Native messaging</td><td>The official pipe that lets a browser extension talk to a normal Windows program &mdash; here, our DLP agent.</td></tr>
+    <tr><td>fetch / XHR</td><td>The two ways JavaScript sends data to a server without reloading the page. Almost every modern upload uses one of them.</td></tr>
+    <tr><td>Multipart / resumable upload</td><td>Splitting a big file into many small pieces and sending them separately, so a dropped connection does not restart the whole upload. Used by S3, Google Drive and OneDrive.</td></tr>
+    <tr><td>Fingerprint / containment</td><td>Our detection maths. It compares a document against registered classified documents and reports how much of the registered content appears in it.</td></tr>
+    <tr><td>Fail-secure / fail-open</td><td>What happens when the safety check itself breaks: fail-secure blocks (safe, sometimes annoying), fail-open allows (convenient, unsafe).</td></tr>
+    <tr><td>WFP</td><td>Windows Filtering Platform &mdash; the Windows facility our agent uses to allow or block network connections per application and destination.</td></tr>
+    <tr><td>Minifilter</td><td>Our kernel driver. It sits inside the Windows file system and can see, and refuse, any attempt to read a file.</td></tr>
+    <tr><td>mTLS</td><td>Mutual TLS: both sides prove who they are with certificates. Agents use it to talk to the management server.</td></tr>
+  </tbody>
+</table>
+
+<div class="foot">
+  Sources read for this audit: <code>dlp-browser-ext/</code> (manifest.json, background.js,
+  content.js, inject.js, install-native-host.ps1, nativehost/com.dlp.browser_host.json, README.md);
+  <code>dlp-agent/src/browser_host.rs</code>; <code>cmd_browser_host</code> and
+  <code>print_browserhost_help</code> in <code>dlp-agent/src/main.rs</code>;
+  <code>dlp-agent/src/config.rs</code> (<code>[webupload]</code>);
+  <code>dlp-agent/src/detect/verdict.rs</code>; <code>dlp-agent/src/kguard/mod.rs</code>
+  (<code>fail_block</code>); <code>dlp-agent/src/notify/mod.rs</code>;
+  <code>dlp-agent/docs/tier2-plan.md</code> §3; <code>DEPLOY-AND-TEST-GUIDE.md</code> §E;
+  <code>dlp-management-server/docs/egress-channels.html</code>.
+  Line numbers are approximate and were correct at commit <code>fcc6600</code>.
+</div>
+
+</body>
+</html>

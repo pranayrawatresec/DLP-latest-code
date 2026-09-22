@@ -1,0 +1,299 @@
+<title>How The Classifier Decides Sensitive</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Public+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+:root{
+  --paper:#F1F4F2; --surface:#FAFBFA; --ink:#151A18; --ink-2:#39433F; --muted:#616C67;
+  --rule:#D3DAD6; --rule-strong:#B6C0BB; --accent:#1F5C4A; --accent-soft:#E2EDE8;
+  --sev-blocker:#9E1F28; --sev-high:#AC530D; --sev-med:#7E6318; --sev-low:#48595F; --sev-ok:#2C6E49;
+  --sev-blocker-bg:#F7E4E5; --sev-ok-bg:#E1EFE7;
+  --f-display:"Newsreader",Georgia,"Times New Roman",serif;
+  --f-body:"Public Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  --f-mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --measure:70ch; --gut:clamp(18px,4vw,40px);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1413; --surface:#161C1A; --ink:#E3E8E5; --ink-2:#BAC4C0; --muted:#8B9791;
+    --rule:#28302D; --rule-strong:#3A443F; --accent:#6FBFA3; --accent-soft:#172B25;
+    --sev-blocker:#F0868D; --sev-high:#E5A469; --sev-med:#D4BC72; --sev-low:#9FB3B9; --sev-ok:#79C79A;
+    --sev-blocker-bg:#2C1618; --sev-ok-bg:#132419;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#0F1413; --surface:#161C1A; --ink:#E3E8E5; --ink-2:#BAC4C0; --muted:#8B9791;
+  --rule:#28302D; --rule-strong:#3A443F; --accent:#6FBFA3; --accent-soft:#172B25;
+  --sev-blocker:#F0868D; --sev-high:#E5A469; --sev-med:#D4BC72; --sev-low:#9FB3B9; --sev-ok:#79C79A;
+  --sev-blocker-bg:#2C1618; --sev-ok-bg:#132419;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--f-body);font-size:16px;line-height:1.63;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1040px;margin:0 auto;padding-inline:var(--gut);padding-block:0 96px}
+p,li{color:var(--ink-2);max-width:var(--measure)}
+h1,h2,h3,h4{text-wrap:balance;margin:0;color:var(--ink)}
+a{color:var(--accent)}
+code,.mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+code{font-size:.86em;background:var(--accent-soft);padding:.1em .35em;border-radius:3px;color:var(--ink)}
+
+.mast{border-bottom:2px solid var(--ink);padding-block:clamp(32px,6vw,60px) 20px;margin-bottom:30px}
+.eyebrow{font-family:var(--f-mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px;margin-bottom:18px}
+.mast h1{font-family:var(--f-display);font-weight:500;letter-spacing:-.02em;font-size:clamp(32px,6vw,54px);line-height:1.05}
+.mast .sub{font-family:var(--f-display);font-style:italic;font-size:clamp(16px,2.2vw,20px);color:var(--muted);margin-top:12px;max-width:62ch;line-height:1.45}
+
+.verdict{border:1px solid var(--rule-strong);border-left:5px solid var(--sev-med);background:var(--surface);padding:clamp(18px,3vw,30px);margin-bottom:40px}
+.verdict .tag{font-family:var(--f-mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--sev-med);font-weight:700}
+.verdict h2{font-family:var(--f-display);font-size:clamp(22px,3.8vw,32px);font-weight:500;margin:8px 0 12px;line-height:1.15}
+.verdict p{max-width:74ch}
+.verdict p:last-child{margin-bottom:0}
+
+section{margin-block:52px}
+.sec-head{display:flex;align-items:baseline;gap:14px;border-bottom:1px solid var(--rule-strong);padding-bottom:10px;margin-bottom:24px;flex-wrap:wrap}
+.sec-head h2{font-family:var(--f-display);font-weight:600;font-size:clamp(21px,3.2vw,28px);letter-spacing:-.01em}
+.sec-head .note{font-family:var(--f-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-left:auto}
+h3{font-family:var(--f-display);font-size:19px;font-weight:600;margin:28px 0 8px}
+
+/* pipeline steps */
+.pipe{list-style:none;padding:0;margin:0;counter-reset:step}
+.pipe>li{counter-increment:step;position:relative;padding:20px 0 20px 56px;border-top:1px solid var(--rule)}
+.pipe>li:last-child{border-bottom:1px solid var(--rule)}
+.pipe>li::before{
+  content:counter(step);position:absolute;left:0;top:20px;
+  font-family:var(--f-mono);font-weight:700;font-size:13px;color:var(--accent);
+  border:1px solid var(--accent);border-radius:50%;width:30px;height:30px;
+  display:grid;place-items:center
+}
+.pipe h4{font-family:var(--f-display);font-size:18px;font-weight:600;margin:0 0 6px}
+.pipe .loc{font-family:var(--f-mono);font-size:11.5px;color:var(--muted);margin-bottom:8px}
+.pipe p{margin:0 0 8px;font-size:15px;max-width:76ch}
+.pipe p:last-child{margin-bottom:0}
+
+pre{font-family:var(--f-mono);font-size:12.5px;line-height:1.7;background:var(--surface);border:1px solid var(--rule);border-left:3px solid var(--rule-strong);padding:14px 16px;overflow-x:auto;margin-block:12px;color:var(--ink-2)}
+pre b{color:var(--ink)}
+.formula{font-family:var(--f-mono);font-size:14px;background:var(--accent-soft);border:1px solid var(--rule);padding:12px 16px;margin-block:12px;color:var(--ink);overflow-x:auto}
+
+.tw{overflow-x:auto;border:1px solid var(--rule);margin-block:16px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:480px}
+th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--f-mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:500;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+td.num{font-family:var(--f-mono);white-space:nowrap}
+
+.callout{background:var(--accent-soft);border:1px solid var(--rule);padding:15px 17px;margin-block:16px}
+.callout p{margin:0;max-width:74ch;font-size:15px}
+.callout p+p{margin-top:8px}
+.callout.warn{background:var(--sev-blocker-bg);border-color:var(--sev-blocker)}
+.callout.ok{background:var(--sev-ok-bg);border-color:var(--sev-ok)}
+
+.status-list{list-style:none;padding:0;margin:0;display:grid;gap:10px}
+.status-list li{position:relative;padding-left:26px;font-size:15px;max-width:78ch}
+.status-list li.good::before{content:"✓";color:var(--sev-ok)}
+.status-list li.bad::before{content:"✗";color:var(--sev-blocker)}
+.status-list li::before{position:absolute;left:0;top:0;font-weight:700;font-family:var(--f-mono)}
+
+.achieved{border:1px solid var(--rule-strong);border-left:5px solid var(--sev-ok);background:var(--surface);padding:clamp(18px,3vw,30px);margin-bottom:28px}
+.achieved .tag{font-family:var(--f-mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--sev-ok);font-weight:700}
+.achieved h2{font-family:var(--f-display);font-size:clamp(22px,3.8vw,32px);font-weight:500;margin:8px 0 12px;line-height:1.15}
+.achieved p{max-width:74ch}
+.achieved h3{margin-top:22px}
+.story{list-style:none;padding:0;margin:14px 0 0;display:grid;gap:14px}
+.story li{display:grid;grid-template-columns:120px 1fr;gap:4px 18px;max-width:none;padding-top:14px;border-top:1px solid var(--rule)}
+.story li:first-child{border-top:none;padding-top:0}
+.story b{font-family:var(--f-mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:500;padding-top:3px}
+.story p{margin:0;font-size:15px;max-width:74ch}
+@media (max-width:620px){.story li{grid-template-columns:1fr}}
+li.resolved{text-decoration:none}
+li.resolved::before{content:"✓"!important;color:var(--sev-ok)!important}
+footer{border-top:2px solid var(--ink);margin-top:60px;padding-top:16px}
+footer p{font-family:var(--f-mono);font-size:12px;color:var(--muted);max-width:78ch}
+</style>
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow"><span>On-Premise Endpoint DLP</span><span>ML Classification Pipeline</span><span>V6.2.01 · DistilBERT · 29 labels</span></div>
+  <h1>How The Classifier Decides Sensitive</h1>
+  <p class="sub">Every step traced to the function that performs it, for the at-rest sweep specifically — what actually happens between "the walker finds a file" and "the fusion layer calls it sensitive."</p>
+</header>
+
+<section class="achieved" style="margin-block:0 28px">
+  <div class="tag">Achieved · verified on the test VM, including 5 hard power-offs · 22 September</div>
+  <h2>The save gap is closed: the agent's files are never missing or half-written after a crash.</h2>
+  <p>This was the first open item for the at-rest channel. The walker's bookmark (<code>ml-walk.checkpoint.json</code>) and its coverage record (<code>ml-walk.completed.json</code>) were saved by <em>deleting the old file, then renaming the new one into place</em>. A crash between those two steps left no file at all. The same pattern was in two other places, including the fingerprint index.</p>
+
+  <h3>What changed</h3>
+  <p>One shared safe-save routine, <code>src/atomicfile.rs</code>, now does every save the agent makes. It never deletes the old file first. It writes the new version to its own temporary file, flushes it to disk, then swaps it in with a single rename. If another program is holding the file, it retries for up to 1.5 seconds instead of giving up.</p>
+  <p>It is used by 12 save sites: the walker's bookmark and coverage record, the fingerprint index, the ML verdict log and its key, the eight policy and identity files in <code>storage.rs</code>, and the USB incident queue.</p>
+
+  <h3>How we know it works</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Evidence</th><th>Old code</th><th>New code</th></tr></thead>
+    <tbody>
+      <tr><td>A reader checking the file while it is saved 300 times (Windows 10 VM)</td><td class="num">file missing 950×</td><td class="num">missing 0×</td></tr>
+      <tr><td>Safe-save test suite, run on the host and on the VM with the DLP driver active</td><td>—</td><td class="num">8 / 8 pass</td></tr>
+      <tr><td>Full agent test suite</td><td>—</td><td class="num">561 / 561 pass</td></tr>
+      <tr><td>Running VM binary <code>779C9DE6…</code>, searched for each version's code</td><td>absent</td><td>present</td></tr>
+      <tr><td>Service stopped mid-sweep, then restarted</td><td>—</td><td>resumed from the saved bookmark (161 files done, 326 folders to go)</td></tr>
+      <tr><td>Coverage record after the sweep finished</td><td>—</td><td>written 14:40:42, 0 errors, 0 stray temp files</td></tr>
+      <tr><td><b>Hard power-off of the VM mid-write</b>, 5 cycles, 12,000–18,000 saves per cycle</td><td class="num">failed 5 / 5<br>(1 missing, 4 zero-filled)</td><td class="num">valid 5 / 5</td></tr>
+      <tr><td>The agent's own files after the fifth power cut</td><td>—</td><td>index v5 verified, verdict cache 3,305 entries, all 7 policy/state files valid, 0 stray temps</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Found and fixed along the way</h3>
+  <ul class="status-list">
+    <li class="good"><b>A new fingerprint index is used without a restart.</b> Every channel loaded the index once at start-up, so a newly downloaded one was ignored until the service restarted. They now pick it up within 3 seconds and keep the last good copy in memory if the file disappears. Verified on the VM: 11 of 11 checks passed, and an endpoint that started with no index was enforcing again within 3 seconds.</li>
+    <li class="good"><b>The ML verdict cache no longer switches itself off.</b> One failed tidy-up of its log (antivirus holding the file) used to stop every later save until a restart.</li>
+    <li class="good"><b>One damaged queued incident can no longer block every incident behind it.</b> It is now set aside so the rest reach the console.</li>
+    <li class="good"><b>The driver no longer serves a stale "clean" answer.</b> The kernel driver kept each file's read-deny verdict for as long as the file stayed in the system cache, and never checked whether it was decided under the current index. So a document read yesterday stayed readable after it was registered today. Fixed in <code>dlpflt.c</code> (both the normal-read and memory-mapped paths); verified on the VM, 6 of 6: the old driver asked the agent 0 times after a reconnect, the fixed one asks again.</li>
+    <li class="good"><b>A newly registered document is enforced without a restart, end to end.</b> Registered in the console, index v5 compiled at 09:49:56, the VM downloaded it at its next check-in, both channels switched to it 1.3 s later, kguard reconnected 0.7 s after that, and an untrusted read of the document was <b>denied</b> 19 s after the download (<code>idm=1</code>). The service kept the same process ID throughout.</li>
+  </ul>
+
+  <div class="callout ok" style="margin-bottom:0">
+    <p><b>Power-cut test: passed.</b> A writer using the new routine and a writer using the old delete-then-rename pattern ran side by side while the VM was hard powered off five times. The new routine's file was complete and valid every time. The old pattern's file was missing once and zero-filled four times: its name survived but its contents never reached the disk.</p>
+    <p>Honest limit: the writer uses the agent's exact save routine, so this is the direct proof. The agent's own files surviving is supporting evidence only, since the agent saves them every few minutes and none of the cuts necessarily landed on one of those saves.</p>
+  </div>
+
+  <h3>The same thing, in beginner terms</h3>
+  <ol class="story">
+    <li><b>The bookmark</b><p>The at-rest sweep reads through every document on the disk, like reading a very long book. Every so often the agent saves a <em>bookmark</em> file that says "I've got up to here", so after a restart it can carry on instead of starting over. When it finishes it saves a second file, a "finished" certificate, which some security features wait for.</p></li>
+    <li><b>The old way</b><p>To update the bookmark, the agent wrote the new one on a sticky note, <em>threw the old bookmark away</em>, then put the sticky note in the book. If the computer crashed or lost power in the moment between "throw away" and "put in", the book had no bookmark at all.</p></li>
+    <li><b>Why it was done that way</b><p>A comment in the code said Windows cannot swap one file for another in a single step, so the old one had to be deleted first. We tested that on both machines. It isn't true: Windows can swap them in one step.</p></li>
+    <li><b>The new way</b><p>Write the new bookmark on a sticky note. Make sure the ink is really dry, meaning the data is actually on the disk and not just in memory. Then swap it in with one movement. At every moment the book has a complete bookmark, either the old one or the new one. It never has none, and never a half-written one.</p></li>
+    <li><b>If someone is holding it</b><p>Sometimes another program, such as antivirus, is holding the bookmark while it checks it. Before, the agent gave up and waited until the next save, 200 files later. Now it waits a moment and tries again.</p></li>
+    <li><b>What it means for you</b><p>After a crash, a reboot or a killed service, the agent always finds a complete, readable file. The worst case is losing the last few seconds of progress, never the whole file. We tested this by pulling the plug on the test machine five times in the middle of saving: the new way came back complete every time, the old way came back missing or blank every time. Because every save now goes through the same routine, the fix covers the fingerprint index and the policy files too, not just the bookmark.</p></li>
+  </ol>
+</section>
+
+<div class="verdict">
+  <div class="tag">At-rest channel: substantially fixed. Full ML pipeline: not production-ready.</div>
+  <h2>The mechanism is sound and now measured. Two blockers outside this channel still gate the ship.</h2>
+  <p>The classification math (chunking, pooling, softmax, thresholding) is correct, tested against golden vectors, and now runs at a realistic sweep time after last round's fixes. That is a genuine, verified improvement to the at-rest channel specifically.</p>
+  <p>It does not make the product deployable on its own. The prior full-pipeline audit found the ONNX session mutex is shared between this sweep and the kernel's synchronous write scan (<code>engine.rs:501,547</code>) — a large document being classified can stall the 500&nbsp;ms driver budget and latch an unrecoverable circuit breaker. That defect is in shared code the at-rest fixes did not touch. It is still there.</p>
+</div>
+
+<section>
+  <div class="sec-head"><h2>The pipeline, step by step</h2><span class="note">src/ml/*.rs</span></div>
+  <p>This is the at-rest path specifically: <code>walk.rs</code> discovers a file, everything past extraction is shared with the at-creation watcher and the on-demand queue — one classification function, three producers.</p>
+
+  <ol class="pipe">
+    <li>
+      <h4>Eligibility gate</h4>
+      <div class="loc">src/ml/filter.rs:231 <code>should_classify</code> — src/ml/walk.rs:1031</div>
+      <p>The walker lists a directory and, for each file, checks extension, size, and directory exclusions before spending anything on it. As of last round, the walker's default extension set is <code>DOCUMENT_EXTENSIONS</code> (docx, xlsx, pptx, pdf, zip, txt, md, csv, tsv) — not the full extractor-supported list. A <code>.py</code> or <code>.json</code> file is skipped by the sweep, not by the classifier: the at-creation watcher and the on-demand read path still classify it the moment it is actually touched.</p>
+    </li>
+    <li>
+      <h4>Read the prefix, compute the cache key</h4>
+      <div class="loc">src/ml/walk.rs:1202 <code>process</code> → src/ml/cache.rs <code>read_for_classification</code></div>
+      <p>The walker reads at most the first <code>4 MiB</code> of the file — <em>contract C1</em>: this must be the exact prefix the kernel driver hashes on the read path, or a verdict computed here could never be found later. The cache key is <code>SHA-256</code> of that prefix. For a handful of container formats (<code>docx/xlsx/pptx/zip/pdf</code>) whose parsers need bytes past the 4&nbsp;MiB mark, the read is escalated to the whole file for extraction — but the KEY stays pinned to the 4&nbsp;MiB prefix either way.</p>
+    </li>
+    <li>
+      <h4>Cache check — cheap path</h4>
+      <div class="loc">src/ml/walk.rs:1217</div>
+      <p><code>self.cache.get(&key, model_version)</code>. If this exact content, under this exact model version, was already classified — by any of the three producers — this is a HashMap lookup and nothing else runs. This is also where last round's fix applies: a hit refunds the rate-limiter token it cost to reach this point, so re-sweeping an already-covered estate is actually cheap.</p>
+    </li>
+    <li>
+      <h4>Miss → extract text</h4>
+      <div class="loc">src/ml/queue.rs <code>classify_job</code> → <code>detect::extract_text</code></div>
+      <p>On a miss the walker hands the bytes to the shared background queue, which calls the extractor: plain decode for text formats, a real parse for <code>docx/xlsx/pptx/pdf/zip</code>. No text extracted (an image, an encrypted archive) is <em>not</em> an error — it is the outcome <code>Barren</code>, and nothing is cached.</p>
+    </li>
+    <li>
+      <h4>Truncate, then chunk</h4>
+      <div class="loc">src/ml/engine.rs:349 <code>prepare</code> · src/ml/chunk.rs</div>
+      <p>Text is truncated to <code>max_chars = 200,000</code> characters (a compatibility constant, matches the sidecar the model was exported with) <em>before</em> tokenizing. What survives is split into overlapping windows sized to the model's own geometry:</p>
+      <div class="formula">max_tokens = 512 &nbsp;·&nbsp; overlap_tokens = 64 &nbsp;·&nbsp; min_tokens = 32</div>
+      <p>Content budget per chunk is <code>512 − 2</code> special tokens = 510; each chunk after the first advances <code>510 − 64 = 446</code> content tokens, so consecutive chunks share a 64-token seam rather than cutting a sentence in half at a hard boundary.</p>
+    </li>
+    <li>
+      <h4>Encode each chunk, mean-pool [CLS]</h4>
+      <div class="loc">src/ml/engine.rs <code>run_split</code></div>
+      <p>Chunks are pushed through the ONNX encoder in groups of <code>micro_batch_size</code> (default 8). Each group emits one 768-wide <code>[CLS]</code> vector per chunk; these are accumulated into a running <code>f64</code> sum and the group's activations are dropped before the next group loads — <em>this is what bounds memory to one micro-batch instead of the whole document</em>. After every chunk has passed through:</p>
+      <div class="formula">pooled = (Σ cls_i) / chunk_count &nbsp;&nbsp;&mdash;&nbsp;&nbsp; one 768-wide vector for the entire document</div>
+      <p>The mean is exact regardless of batch size — summing then dividing once is mathematically identical whether it happens in one pass or eight — which is why the split graph and the old single-call monolithic graph produce byte-identical labels (verified to 2.1×10⁻⁶ max logit divergence in the golden-vector tests).</p>
+    </li>
+    <li>
+      <h4>Classification head, once</h4>
+      <div class="loc">src/ml/engine.rs <code>run_split</code>, head pass</div>
+      <p>The single pooled vector runs through the head network exactly once, producing <code>29</code> raw logits — one per business-function label. This is the one step that is <em>not</em> decomposable across batches (the head is non-linear), which is the whole reason the split design pools first and classifies once rather than averaging per-batch answers.</p>
+    </li>
+    <li>
+      <h4>Softmax, then argmax</h4>
+      <div class="loc">src/ml/engine.rs:404, :626 <code>softmax</code></div>
+      <div class="formula">p_i = exp(logit_i − max(logits)) / Σ exp(logit_j − max(logits))</div>
+      <p>The max-subtraction is not cosmetic: without it a large logit overflows <code>exp()</code> to infinity and every probability becomes <code>NaN</code>, which would then be compared against a policy threshold — tested directly (<code>softmax_does_not_overflow_on_a_large_logit</code>). The winning label is the highest-probability index; ties go to the lowest index, matching NumPy's <code>argmax</code>.</p>
+    </li>
+    <li>
+      <h4>Label lookup</h4>
+      <div class="loc">src/ml/labels.rs:38 <code>LABELS</code> (frozen array, index = model output position)</div>
+      <p>The output index is looked up in a hand-kept, compile-time-length-checked array of 29 entries — <code>FIN</code> (Finance), <code>NUC</code> (Nuclear &amp; Strategic Systems), <code>GOV</code> (Government Reporting), and so on. The model itself carries no label names; a re-ordering of this array would silently relabel every prediction the endpoint makes, which is why the array is documented as frozen and the loader cross-checks its length against the sidecar on startup.</p>
+    </li>
+    <li>
+      <h4>Cache the model's answer — <em>not</em> a sensitivity verdict</h4>
+      <div class="loc">src/ml/cache.rs:238 <code>CachedVerdict::from_prediction</code></div>
+      <p>What gets written to the verdict cache is <code>{model_version, label_id, confidence, chunks, tokens, truncated}</code>. The <code>sensitive</code> boolean is deliberately <em>not</em> one of those fields — it doesn't exist yet at this point. This is the single design decision that makes a live policy change retroactive: an admin marking a new label sensitive changes the answer for every already-cached file on its next lookup, with no re-classification.</p>
+    </li>
+    <li>
+      <h4>Policy evaluation — where "sensitive" is actually decided</h4>
+      <div class="loc">src/mlpolicy.rs:160 <code>MlPolicy::label_is_sensitive</code></div>
+      <div class="formula">sensitive = policy.enabled
+  AND label_id ∈ admin-selected labels
+  AND confidence ≥ (that label's own threshold, else policy.min_confidence [default 0.70])</div>
+      <p>This function runs fresh on every lookup — at read time, at write time, on every cache hit — never once at classification time. An unselected label never counts as sensitive no matter how confident the model is (a document correctly identified as <code>PUB</code> — Public Information — is not a leak, however certain the model is that it's <code>PUB</code>). This is the only place a label becomes a security-relevant fact.</p>
+    </li>
+    <li>
+      <h4>Fusion — the model can only add, never subtract</h4>
+      <div class="loc">src/detect/decide.rs:693 <code>ml_blocks_egress</code> · :726 <code>ml_blocks_read</code></div>
+      <div class="formula">sensitive_overall = fingerprint_hit  OR  ml_sensitive</div>
+      <p>The ML signal and IDM/EDM fingerprinting are independent and additive. Fingerprinting can only recognise a document somebody explicitly registered; the model has never seen this specific document before and says only what <em>kind</em> of document it resembles. Neither signal can cancel the other — there is no code path where a positive fingerprint match is overridden by an ML "not sensitive" result, or vice versa.</p>
+    </li>
+  </ol>
+</section>
+
+<section>
+  <div class="sec-head"><h2>A concrete run, with real numbers</h2><span class="note">Measured, not modelled</span></div>
+  <p>From the VM verification in the previous round — a 3,633-byte PDF, single chunk, cold cache:</p>
+  <pre>content_len=3633  extraction=Ok { format: "pdf" }
+idm=0  edm=0
+ml="ok"  ml_label="GOV"  ml_confidence=0.9215904727874636
+signal="ml"  severity="medium"  block=true</pre>
+  <p>Walking it through the steps above: the file passed the eligibility gate (pdf is in <code>DOCUMENT_EXTENSIONS</code>) → the ≤4&nbsp;MiB prefix was read and hashed → no cache hit → extracted to plain text → one chunk (under 510 tokens, no windowing needed) → one encoder pass, one head pass → softmax gave <code>GOV</code> a 92.16% probability → the console policy had <code>GOV</code> selected with the default 0.70 floor, so <code>0.9216 ≥ 0.70</code> → <code>sensitive=true</code> → fingerprinting found nothing (<code>idm=0 edm=0</code>) but the OR-fusion blocked anyway. Total time for extraction plus inference plus cache write, measured end to end through a live USB copy: <strong>156&nbsp;ms</strong>.</p>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Production readiness — at-rest channel</h2><span class="note">What last round's fixes actually closed</span></div>
+  <ul class="status-list">
+    <li class="good">Eligibility narrowed to <code>DOCUMENT_EXTENSIONS</code> by default — the 17.5-hour sweep for 126 real documents is now a ~48-minute sweep, verified against a real 232,719-file profile.</li>
+    <li class="good">Re-sweeping an already-covered estate no longer re-spends rate-limiter budget — cache hits refund their token (<code>RateLimiter::refund</code>).</li>
+    <li class="good">Directory descent is throttled — a source-heavy subtree with zero eligible files can no longer run unbounded.</li>
+    <li class="good"><code>denyUnclassified</code> startup arming is model-version-aware — a stale completion record from a superseded model can no longer arm a fail-secure deny it didn't earn.</li>
+    <li class="good">A targeted overflow re-sweep can no longer indefinitely defer the full estate-wide sweep.</li>
+    <li class="good">OneDrive/SharePoint placeholder files are skipped rather than force-downloaded to be classified.</li>
+    <li class="good">341 tests pass, including 14 new ones written directly against these six fixes — the mechanism above is not aspirational, it's what the passing golden-vector and pipeline tests actually exercise.</li>
+  </ul>
+  <h3>What is still open in this channel specifically</h3>
+  <ul class="status-list">
+    <li class="bad resolved"><b>Resolved, see the top of this page.</b> The completion/checkpoint write used "temp file, then remove destination, then rename", so a crash in that window could lose the coverage record. It now goes through the shared safe-save routine (<code>src/atomicfile.rs</code>), verified on the VM, including 5 hard power-offs.</li>
+    <li class="bad">The pending-directory list is capped in what gets <em>persisted</em> to the checkpoint, not in what the walker holds in memory while a sweep is running.</li>
+    <li class="bad"><code>ml::walk::run()</code> — the real service loop, with real sleeps and a real stop flag — has no dedicated test. The fixes are tested at the level below it (<code>Walker::step</code>/<code>drive</code> with an injected clock); the loop itself is exercised only by running the actual service.</li>
+  </ul>
+</section>
+
+<section>
+  <div class="sec-head"><h2>Is the ML pipeline production ready?</h2><span class="note">Not yet — and not because of at-rest</span></div>
+  <div class="callout warn">
+    <p><strong>No.</strong> The at-rest channel is meaningfully improved, but two structural defects confirmed in the full pipeline audit live in code every channel shares, and neither was in scope for this round's fixes:</p>
+    <p>1. <code>engine.rs:501,547</code> — the ONNX session mutex is held for an entire document and is shared between the background classify worker and the kernel's synchronous write scan. A large document being classified in the background can stall the 500&nbsp;ms driver reply budget on an unrelated USB copy happening at the same moment.</p>
+    <p>2. <code>dlp-minifilter/src/comms.c:605</code> — eight consecutive stalls of that kind latch an IPC circuit breaker with no detector and no automatic recovery. Past that point the endpoint blocks all USB egress until the service is manually restarted.</p>
+  </div>
+  <p>Both are real, both are reachable under the shipped configuration, and neither is specific to the at-rest sweep — they'd exist even if the walker were perfect. They were flagged as the two items to fix first in the original full-pipeline report, ahead of everything else, specifically because the 500&nbsp;ms kernel contract makes them non-negotiable rather than schedulable.</p>
+  <div class="callout ok">
+    <p>Once those two are closed, the at-rest channel's role in the pipeline is no longer a limiting factor for shipping: the mechanism above is correct, the sweep now runs at a realistic cost, and it is covered by tests that would fail if any of the six fixes regressed.</p>
+  </div>
+</section>
+
+<footer>
+  <p>Every mechanism step above is cited to the function that performs it in the current tree. Confidence math and fusion rule verified against src/ml/engine.rs, src/ml/cache.rs, src/mlpolicy.rs, src/detect/decide.rs and src/detect/verdict.rs. Production-readiness verdict for the two open shared-code blockers carries forward unchanged from the full pipeline audit — this round did not touch on-write, at-creation, or shared-core code.</p>
+</footer>
+
+</div>
