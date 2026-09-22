@@ -12,6 +12,7 @@ const NAV = [
   { to: '/trusted-readers', label: 'Trusted applications', icon: AppWindowIcon, permission: 'trusted_readers:read' },
   { to: '/read-deny-policy', label: 'Read-deny policy', icon: ShieldIcon, permission: 'read_deny_policy:read' },
   { to: '/clipboard-policy', label: 'Clipboard policy', icon: AppWindowIcon, permission: 'clipboard_policy:read' },
+  { to: '/ml-policy', label: 'Classification (ML)', icon: DocumentIcon, permission: 'ml_policy:read' },
   { to: '/groups', label: 'Endpoint groups', icon: LayersIcon, permission: 'groups:read' },
   { to: '/agents', label: 'Agents', icon: MonitorIcon, permission: 'agents.read' },
   { to: '/enrollment-tokens', label: 'Enrollment tokens', icon: KeyIcon, permission: 'enrollment.manage' },

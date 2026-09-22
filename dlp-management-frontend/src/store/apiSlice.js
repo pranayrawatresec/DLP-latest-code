@@ -19,7 +19,7 @@ const baseQuery = async (args, apiCtx, extra) => {
 export const apiSlice = createApi({
   reducerPath: 'api',
   baseQuery,
-  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy', 'ClipboardPolicy', 'Group'],
+  tagTypes: ['EnrollmentToken', 'Agent', 'User', 'Session', 'Audit', 'ProtectedCollection', 'ProtectedDocument', 'IndexStatus', 'Incident', 'TrustedDestination', 'TrustedReader', 'ReadDenyPolicy', 'ClipboardPolicy', 'MlPolicy', 'Group'],
   endpoints: (b) => ({
     // Enrollment tokens
     getEnrollmentTokens: b.query({
@@ -209,6 +209,27 @@ export const apiSlice = createApi({
       invalidatesTags: ['ClipboardPolicy'],
     }),
 
+    // ML document-classification policy — which of the model's 29 business-function
+    // classes count as sensitive, plus the confidence floor and posture. The model
+    // itself runs on the endpoint; only this policy travels, never document content.
+    getMlPolicy: b.query({
+      query: () => '/ml-policy',
+      transformResponse: (res) => res?.policy || null,
+      providesTags: ['MlPolicy'],
+    }),
+    // The model's frozen label space (all 29, in model index order). Static reference
+    // data — it only changes when the model version does, so it rides the same tag.
+    getMlLabels: b.query({
+      query: () => '/ml-policy/labels',
+      transformResponse: (res) => res?.labels || [],
+      providesTags: ['MlPolicy'],
+    }),
+    updateMlPolicy: b.mutation({
+      // body: { enabled, minConfidence, action, failBlock, labels: [{ id, minConfidence }] }
+      query: (body) => ({ url: '/ml-policy', method: 'PUT', body }),
+      invalidatesTags: ['MlPolicy'],
+    }),
+
     // Endpoint groups — per-machine/per-group policy targeting. The Default group
     // holds every unassigned machine and uses the global read-deny policy.
     getGroups: b.query({
@@ -293,6 +314,9 @@ export const {
   useUpdateReadDenyPolicyMutation,
   useGetClipboardPolicyQuery,
   useUpdateClipboardPolicyMutation,
+  useGetMlPolicyQuery,
+  useGetMlLabelsQuery,
+  useUpdateMlPolicyMutation,
   useGetGroupsQuery,
   useCreateGroupMutation,
   useUpdateGroupMutation,

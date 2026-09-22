@@ -49,12 +49,59 @@ function statusBadge(status) {
   return <Badge tone={STATUS_TONES[status] || 'gray'}>{STATUS_LABELS[status] || status}</Badge>
 }
 
+// Detection is no longer one signal. An incident can be raised by FINGERPRINTING
+// (idm/edm — "this is a registered document"), by the ML classifier ("this is a
+// finance/nuclear document, registered or not"), or by BOTH — the agent ORs them.
+// detection_type therefore arrives as 'idm', 'edm', 'idm+edm', 'ml', 'idm+ml',
+// 'edm+ml' or 'idm+edm+ml'. A reviewer must read "both fired" (= critical, two
+// independent signals agree) at a glance, so each signal gets its own chip and the
+// two families get different colours: fingerprints indigo (the colour this page
+// already uses for IDM/EDM match detail), the model violet. Anything we don't
+// recognise degrades to exactly what this page rendered before: one indigo chip.
+const ML_CHIP = 'bg-violet-50 text-violet-700 ring-violet-200'
+const CHIP_SHAPE =
+  'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset'
+
+// Violet is not in the kit's Badge tone set (kit.jsx: green/amber/red/gray/blue/
+// indigo). Rather than widen a shared primitive for one page, this mirrors Badge's
+// shape classes locally — same pill, different family.
+function MlChip({ className = '', children }) {
+  return <span className={`${CHIP_SHAPE} ${ML_CHIP} ${className}`}>{children}</span>
+}
+
 function detectionBadge(type) {
   if (!type) return <span className="text-gray-300">—</span>
-  return <Badge tone="indigo">{type.toUpperCase()}</Badge>
+  const parts = String(type)
+    .split('+')
+    .map((p) => p.trim())
+    .filter(Boolean)
+  if (parts.length === 0) return <span className="text-gray-300">—</span>
+  return (
+    <span className="flex flex-wrap items-center gap-1" title={type}>
+      {parts.map((p, i) => {
+        const k = p.toLowerCase()
+        if (k === 'ml') {
+          return (
+            <MlChip key={`${p}-${i}`}>
+              <span aria-hidden="true">◆</span>ML
+            </MlChip>
+          )
+        }
+        return (
+          <Badge key={`${p}-${i}`} tone="indigo">
+            {p.toUpperCase()}
+          </Badge>
+        )
+      })}
+    </span>
+  )
 }
 
 const pct = (n) => (typeof n === 'number' ? `${Math.round(n * 100)}%` : '—')
+// Model confidence is compared against a threshold an admin typed to two decimals
+// (0.80), so round to one decimal rather than whole percent — "80.0%" vs "79.6%"
+// is the difference between a hit and a miss and the reviewer needs to see it.
+const pct1 = (n) => (typeof n === 'number' ? `${(n * 100).toFixed(1)}%` : '—')
 
 // --- detail + triage modal --------------------------------------------------
 
@@ -124,6 +171,9 @@ function IncidentDetail({ id, onClose }) {
             </Detail>
           </div>
 
+          {/* What the classifier said (second, independent signal) */}
+          {renderMl(inc)}
+
           {/* Matched protected material (resolved server-side, audited) */}
           <div>
             <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
@@ -175,6 +225,87 @@ function IncidentDetail({ id, onClose }) {
         </div>
       )}
     </Modal>
+  )
+}
+
+// Human wording for the non-ok ML statuses / reasons the agent reports. These are
+// deliberately NOT hidden: a classifier that quietly stopped loading looks exactly
+// like a clean endpoint from the incident feed, and that is the failure an auditor
+// most needs to see. Unknown codes fall through as the raw token.
+const ML_STATUS_TEXT = {
+  ok: 'Classified',
+  unavailable: 'Unavailable',
+  skipped: 'Skipped',
+  empty: 'No result',
+}
+const ML_REASON_TEXT = {
+  model_not_loaded: 'model_not_loaded — the model was not loaded on this endpoint',
+  load_failed: 'load_failed — the model failed to load on this endpoint',
+  no_text: 'no_text — no extractable text in the file',
+  read_path_skip: 'read_path_skip — kernel read path, classification runs on write/egress only',
+  policy_off: 'policy_off — ML classification disabled by policy',
+}
+
+// The ML block of the incident detail. Reads the verdict the agent posted; the
+// console detail route returns it as `verdict` (verdict_json in the row), so accept
+// either spelling and treat anything missing as "this build reported no ML at all"
+// — pre-ML incidents must keep rendering exactly as they always did.
+//
+// NOTHING here is file content: label id, display name, score and counts only. The
+// verdict carries no text or snippets and must never be made to.
+function renderMl(inc) {
+  const ml = inc?.verdict?.ml || inc?.verdict_json?.ml
+  if (!ml || typeof ml !== 'object') return null
+
+  const status = typeof ml.status === 'string' ? ml.status : 'empty'
+  const ok = status === 'ok'
+  const sensitive = ml.sensitive === true
+
+  return (
+    <div>
+      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">
+        Document classification
+      </h4>
+      <div
+        className={`rounded-lg border px-3 py-2 text-sm ${
+          ok ? 'border-violet-200 bg-violet-50/40' : 'border-amber-200 bg-amber-50'
+        }`}
+      >
+        {ok ? (
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="flex items-center gap-2">
+                <MlChip className="font-mono">{ml.labelId || '—'}</MlChip>
+                <span className="font-medium text-gray-900">{ml.labelName || '—'}</span>
+              </span>
+              <span className="flex items-center gap-2">
+                <span className="text-gray-600">{pct1(ml.confidence)} confidence</span>
+                <Badge tone={sensitive ? 'red' : 'gray'}>
+                  {sensitive ? 'Judged sensitive' : 'Below threshold'}
+                </Badge>
+              </span>
+            </div>
+            <div className="mt-1 text-xs text-gray-500">
+              {ml.modelVersion ? `model ${ml.modelVersion} · ` : ''}
+              {typeof ml.chunks === 'number' ? `${ml.chunks} chunk${ml.chunks === 1 ? '' : 's'}` : '— chunks'}
+              {typeof ml.tokens === 'number' ? ` · ${ml.tokens} tokens` : ''}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="font-medium text-amber-800">
+              {ML_STATUS_TEXT[status] || status}
+              {ml.reason ? ` — ${ML_REASON_TEXT[ml.reason] || ml.reason}` : ''}
+            </div>
+            <div className="mt-1 text-xs text-amber-700">
+              The classifier contributed nothing to this incident
+              {ml.modelVersion ? ` (model ${ml.modelVersion})` : ''}. Fingerprinting decided it
+              alone.
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   )
 }
 

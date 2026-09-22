@@ -12,6 +12,7 @@ import TrustedDestinations from './pages/TrustedDestinations'
 import TrustedReaders from './pages/TrustedReaders'
 import ReadDenyPolicy from './pages/ReadDenyPolicy'
 import ClipboardPolicy from './pages/ClipboardPolicy'
+import MlPolicy from './pages/MlPolicy'
 import Groups from './pages/Groups'
 import AppLayout from './components/layout/AppLayout'
 import ProtectedRoute from './components/ProtectedRoute'
@@ -65,6 +66,10 @@ function App() {
         <Route
           path="clipboard-policy"
           element={<RequirePermission permission="clipboard_policy:read"><ClipboardPolicy /></RequirePermission>}
+        />
+        <Route
+          path="ml-policy"
+          element={<RequirePermission permission="ml_policy:read"><MlPolicy /></RequirePermission>}
         />
         <Route
           path="groups"
