@@ -1,0 +1,71 @@
+Partner Center attestation submission record
+============================================
+
+Submission     : dlpflt 1.0.0.1 amd64 attestation (FIRST TRIAL RUN)
+Prepared       : 2026-09-23
+DriverVer      : 09/23/2026,1.0.0.1
+Target OS      : Requested Signatures = x64 client entries, 1607 and later only
+                 (1607/1703/1709/1803/1809/19H1/2004/21H2 x64, Win11 22H2/24H2/
+                 25H2/26H1 x64). NOT ticked: all ARM64, all x86, 1506/1511 (TH2),
+                 "Perform test-signing", Certification.
+                 NOTE: the page prints "Leave all checkboxes blank for Attestation
+                 Signing" but then requires at least one OS on upload. The form
+                 wins; the printed note applies to the Certification section.
+Built by       : dlp-minifilter\build\build-driver.bat
+Packaged by    : dlp-minifilter\tools\make-submission.ps1 -Version 1.0.0.1
+
+Signing certificate
+-------------------
+Subject        : CN=RESEC SYSTEMS PRIVATE LIMITED, O=RESEC SYSTEMS PRIVATE LIMITED,
+                 L=Chandigarh, S=Chandigarh, C=IN
+Issuer         : GlobalSign GCC R45 EV CodeSigning CA 2020
+Thumbprint     : 2CE7FCBEF04C279943F175A936E7588D298D254A
+Cert expires   : 2027-08-18
+Key storage    : SafeNet eToken, eToken Base Cryptographic Provider,
+                 container te-7564ff7a-a0bb-4a5c-9008-d82cbcc1c7c2 (non-exportable)
+Timestamp      : 2026-09-23 10:34:11, GlobalSign R45 TSA for CodeSign 202510
+Digest         : SHA256 (file and timestamp)
+
+SHA-256 of the files SUBMITTED
+------------------------------
+dlpflt.cab  13823C6AED7EEC1D18B6C2432F4AB16F52A80D68AD9F9BD30ABABEDB0A76AC21  (30,235 bytes, signed)
+dlpflt.sys  A8922BB88ADA1EB7127508E5202C905C80A38A2C088CE829149D5E79F37BBD72  (39,424 bytes, unsigned)
+dlpflt.inf  0F3B287234C0B6D04BC16AA261F193902BFBB10C7CCCCE17E5774074949AA29A
+dlpflt.cat  FAAF0DC2EB27A7E22A1B0D9AC99BB0E8EF3579C41E57B3EBCBBCF393B19F11E3  (unsigned)
+
+RETURNED from Microsoft -- 2026-09-23, signed_from_microsoft\drivers\dlpflt\
+-----------------------------------------------------------------------------
+dlpflt.sys  1915B46EA4EB7CCB8E5A1F0EEDFCE9C6B6C7E31BA582A15A48090FB39EAF0783  (49,888 B)
+dlpflt.inf  0F3B287234C0B6D04BC16AA261F193902BFBB10C7CCCCE17E5774074949AA29A  (3,052 B, UNCHANGED)
+dlpflt.cat  292C9C46ED51F8D1C9AEFADE04C373DD3358A6D1B769ABE3AD14936EF0BFAE98  (12,076 B)
+
+Microsoft signs BOTH the catalog and the binary. dlpflt.sys grew 39,424 -> 49,888
+bytes because an embedded signature was inserted, so its hash intentionally does
+NOT match what was submitted. The INF is the file that must come back identical
+-- and it did.
+
+Verified 2026-09-23:
+  signtool verify /v /kp dlpflt.sys              -> PASS
+  signtool verify /v /kp /c dlpflt.cat dlpflt.sys -> PASS
+  Chain: Microsoft Windows Hardware Compatibility Publisher
+      -> Microsoft Windows Third Party Component CA 2014
+      -> Microsoft Root Certificate Authority 2010
+  Microsoft-timestamped 2026-09-23 10:50:49/50. Cross-cert chain present on .sys.
+  INF as returned: DriverVer = 09/23/2026,1.0.0.1 ; Altitude = "265000" (dev placeholder)
+
+Known deviations from production (deliberate, this is a trial run)
+-----------------------------------------------------------------
+1. Filter altitude is still the DEV placeholder 265000. Production requires a
+   Microsoft-assigned altitude (request via fsfcomm@microsoft.com). Changing it
+   changes dlpflt.inf, which invalidates this catalog -> new submission.
+2. Driver compiled with /Od (optimisations disabled). Production should decide
+   /O2 vs /Od deliberately. Changing it changes dlpflt.sys -> new submission.
+3. dlpflt.sys carries no embedded EV signature (catalog-only). Optional; consider
+   embed-signing before Inf2Cat for the production submission.
+
+Submission result (fill in)
+---------------------------
+Submitted on      :
+Partner Center ID :
+Signed package    :
+Verified on VM    :

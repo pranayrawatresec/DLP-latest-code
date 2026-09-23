@@ -20,27 +20,40 @@ set PATH=%MSVC%\bin\Hostx64\x64;%PATH%
 set INCLUDE=%SDKROOT%\Include\%SDKVER%\km\crt;%MSVC%\include;%SDKROOT%\Include\%SDKVER%\km;%SDKROOT%\Include\%SDKVER%\shared
 set LIB=%MSVC%\lib\x64;%SDKROOT%\Lib\%SDKVER%\km\x64
 
+rem rc.exe needs the USER-MODE headers (winver.h) which must NOT be on the C
+rem INCLUDE path -- they would shadow the kernel headers. Keep them scoped to
+rem the resource step only.
+set RC=%SDKROOT%\bin\%SDKVER%\x64\rc.exe
+set RCINCLUDE=%SDKROOT%\Include\%SDKVER%\um;%SDKROOT%\Include\%SDKVER%\shared
+
 rem Build from the driver root (parent of this build\ dir) so src\*.c resolves.
 cd /d "%~dp0.."
 
 if not exist build\out mkdir build\out
 
 echo === compile dlpflt.c ===
-cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /sdl /guard:cf /GS /Od /GF /Gy /GR- /kernel ^
+cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /sdl /guard:cf /GS /O2 /GF /Gy /GR- /kernel ^
   /D_WIN64 /D_AMD64_ /DAMD64 /DNTDDI_VERSION=0x0A000000 /D_WIN32_WINNT=0x0A00 ^
   /Fobuild\out\dlpflt.obj src\dlpflt.c
 if errorlevel 1 goto :fail
 
 echo === compile comms.c ===
-cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /sdl /guard:cf /GS /Od /GF /Gy /GR- /kernel ^
+cl.exe /nologo /c /W4 /WX /wd4324 /wd4201 /wd4214 /sdl /guard:cf /GS /O2 /GF /Gy /GR- /kernel ^
   /D_WIN64 /D_AMD64_ /DAMD64 /DNTDDI_VERSION=0x0A000000 /D_WIN32_WINNT=0x0A00 ^
   /Fobuild\out\comms.obj src\comms.c
 if errorlevel 1 goto :fail
 
+echo === compile dlpflt.rc (version resource) ===
+setlocal
+set INCLUDE=%RCINCLUDE%
+"%RC%" /nologo /fo build\out\dlpflt.res src\dlpflt.rc
+if errorlevel 1 (endlocal & goto :fail)
+endlocal
+
 echo === link dlpflt.sys ===
 link.exe /NOLOGO /OUT:build\out\dlpflt.sys /DRIVER /SUBSYSTEM:NATIVE,10.00 /ENTRY:GsDriverEntry ^
   /NODEFAULTLIB /RELEASE /INTEGRITYCHECK /GUARD:CF ^
-  build\out\dlpflt.obj build\out\comms.obj ^
+  build\out\dlpflt.obj build\out\comms.obj build\out\dlpflt.res ^
   fltMgr.lib ntoskrnl.lib hal.lib wdmsec.lib BufferOverflowFastFailK.lib
 if errorlevel 1 goto :fail
 

@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver EV Signing</title>
+<style>
+:root{
+  --bg:#f7f7f5; --surface:#ffffff; --surface-2:#f0efec; --border:#dcdad4;
+  --text:#1f1d1a; --muted:#6b6862; --accent:#8a4b1f; --accent-soft:#f3e6da;
+  --ok:#1f6f43; --ok-soft:#e3f2e8; --warn:#8a6100; --warn-soft:#fdf1d6;
+  --bad:#9b2226; --bad-soft:#fbe4e4; --code-bg:#1d1b18; --code-fg:#e8e4dc;
+  --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15140f; --surface:#1e1c17; --surface-2:#262319; --border:#3a362c;
+    --text:#ece8df; --muted:#9d988c; --accent:#e0a071; --accent-soft:#3a2a1c;
+    --ok:#6fcf97; --ok-soft:#1c3226; --warn:#e2b552; --warn-soft:#33290f;
+    --bad:#f08080; --bad-soft:#3a1e1e; --code-bg:#0f0e0b; --code-fg:#e8e4dc;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15140f; --surface:#1e1c17; --surface-2:#262319; --border:#3a362c;
+  --text:#ece8df; --muted:#9d988c; --accent:#e0a071; --accent-soft:#3a2a1c;
+  --ok:#6fcf97; --ok-soft:#1c3226; --warn:#e2b552; --warn-soft:#33290f;
+  --bad:#f08080; --bad-soft:#3a1e1e; --code-bg:#0f0e0b; --code-fg:#e8e4dc;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+.wrap{max-width:900px; margin:0 auto; padding:32px 16px 96px}
+header.page{border-bottom:2px solid var(--border); padding-bottom:20px; margin-bottom:28px}
+.kicker{font-family:var(--mono); font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--accent); margin:0 0 8px}
+h1{font-size:clamp(26px,5vw,40px); line-height:1.15; margin:0 0 10px; letter-spacing:-.02em}
+.sub{color:var(--muted); margin:0; font-size:15px}
+.meta{font-family:var(--mono); font-size:12px; color:var(--muted); margin-top:12px}
+h2{font-size:clamp(20px,3.5vw,26px); margin:44px 0 6px; letter-spacing:-.01em; scroll-margin-top:16px}
+h2 .num{font-family:var(--mono); color:var(--accent); font-size:.7em; margin-right:10px}
+h3{font-size:17px; margin:26px 0 6px}
+h4{font-size:15px; margin:18px 0 4px; color:var(--muted); font-weight:600}
+p{margin:10px 0}
+ul,ol{margin:10px 0; padding-left:22px}
+li{margin:5px 0}
+code{font-family:var(--mono); font-size:.88em; background:var(--surface-2); border:1px solid var(--border); border-radius:4px; padding:1px 5px; word-break:break-word}
+a{color:var(--accent)}
+.card{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin:16px 0}
+.note{border-left:4px solid var(--accent); background:var(--accent-soft); border-radius:6px; padding:12px 16px; margin:16px 0}
+.note.ok{border-left-color:var(--ok); background:var(--ok-soft)}
+.note.warn{border-left-color:var(--warn); background:var(--warn-soft)}
+.note.bad{border-left-color:var(--bad); background:var(--bad-soft)}
+.note .lbl{font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; display:block; margin-bottom:5px; opacity:.85}
+.note p:first-of-type{margin-top:0} .note p:last-child{margin-bottom:0}
+.codeblock{position:relative; margin:14px 0}
+.codeblock .cap{font-family:var(--mono); font-size:11px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; margin-bottom:5px; display:block}
+pre{background:var(--code-bg); color:var(--code-fg); border-radius:8px; padding:14px 16px; overflow-x:auto; margin:0; font-family:var(--mono); font-size:13px; line-height:1.55}
+pre .c{color:#8a8578}
+.copy{position:absolute; top:26px; right:10px; background:rgba(255,255,255,.1); color:#e8e4dc; border:1px solid rgba(255,255,255,.2); border-radius:5px; font:11px var(--mono); padding:3px 8px; cursor:pointer; opacity:.6}
+.copy:hover{opacity:1}
+.tablewrap{overflow-x:auto; margin:16px 0; border:1px solid var(--border); border-radius:8px}
+table{border-collapse:collapse; width:100%; font-size:14px; background:var(--surface)}
+th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--border); vertical-align:top}
+th{background:var(--surface-2); font-size:12px; letter-spacing:.05em; text-transform:uppercase; color:var(--muted); font-weight:600; white-space:nowrap}
+tr:last-child td{border-bottom:none}
+.pill{display:inline-block; font-family:var(--mono); font-size:11px; padding:2px 8px; border-radius:20px; white-space:nowrap}
+.pill.ok{background:var(--ok-soft); color:var(--ok)}
+.pill.warn{background:var(--warn-soft); color:var(--warn)}
+.pill.bad{background:var(--bad-soft); color:var(--bad)}
+.toc{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:14px 20px}
+.toc ol{margin:6px 0; padding-left:20px; columns:2; column-gap:28px}
+.toc li{break-inside:avoid; margin:3px 0; font-size:14px}
+@media(max-width:600px){ .toc ol{columns:1} }
+.flow{font-family:var(--mono); font-size:12.5px; line-height:1.9; background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:14px 16px; overflow-x:auto; white-space:pre}
+footer{margin-top:56px; padding-top:18px; border-top:1px solid var(--border); color:var(--muted); font-size:13px}
+kbd{font-family:var(--mono); font-size:.85em; border:1px solid var(--border); border-bottom-width:2px; border-radius:4px; padding:1px 5px; background:var(--surface-2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <p class="kicker">DLP · dlp-minifilter · release engineering</p>
+  <h1>Signing <code style="font-size:.85em">dlpflt.sys</code> for production</h1>
+  <p class="sub">End-to-end runbook: EV token → Microsoft Partner Center attestation → a driver that loads on a clean Windows 11 endpoint with test mode <strong>off</strong>.</p>
+  <p class="meta">Written 2026-09-23 · verified against this repo and this PC · supersedes nothing in <code>dlp-minifilter/docs/PRODUCTION-SIGNING.md</code> (this is the executable version of it)</p>
+</header>
+
+<div class="toc">
+  <strong style="font-size:13px; font-family:var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--muted)">Contents</strong>
+  <ol>
+    <li><a href="#s0">The premise correction</a></li>
+    <li><a href="#s1">What I verified in your code</a></li>
+    <li><a href="#s2">The trust chain</a></li>
+    <li><a href="#s3">Phase A — Pre-flight</a></li>
+    <li><a href="#s4">Phase B — Partner Center + EV validation</a></li>
+    <li><a href="#s5">Phase C — Microsoft-assigned altitude</a></li>
+    <li><a href="#s6">Phase D — Release build</a></li>
+    <li><a href="#s7">Phase E — Embed-sign + catalog</a></li>
+    <li><a href="#s8">Phase F — Build the CAB</a></li>
+    <li><a href="#s9">Phase G — EV-sign the CAB</a></li>
+    <li><a href="#s10">Phase H — Submit</a></li>
+    <li><a href="#s11">Phase I — Verify what comes back</a></li>
+    <li><a href="#s12">Phase J — Clean-machine test</a></li>
+    <li><a href="#s13">Phase K — Ship it</a></li>
+    <li><a href="#s14">Also sign the agent</a></li>
+    <li><a href="#s15">Troubleshooting</a></li>
+    <li><a href="#s16">Hard rules</a></li>
+    <li><a href="#s17">Open decisions</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s0"><span class="num">00</span>The premise correction — read this first</h2>
+
+<p>You asked to "first get the attestation certificate." There is no such object. Nothing named an <em>attestation certificate</em> is issued to you at any point in this process, and waiting for one will stall the release. Three different things get conflated under that name, and it is worth separating them before you spend a day looking for the wrong artefact:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>What people call it</th><th>What it actually is</th><th>Where you are</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>"The EV certificate"</strong></td>
+  <td>Your GlobalSign EV code-signing certificate on the SafeNet eToken. It does <em>not</em> let a kernel driver load. Its only two jobs here: prove your company's identity to Microsoft once, and sign the submission package each release.</td>
+  <td><span class="pill ok">You have it</span></td>
+</tr>
+<tr>
+  <td><strong>"The attestation certificate"</strong></td>
+  <td>Does not exist. The closest real step is the <strong>one-time Partner Center identity validation</strong>: Microsoft hands you a small binary file, you sign it with the EV cert, you upload it back. That unlocks the hardware dashboard. Nothing is issued to you — a flag flips on your account.</td>
+  <td><span class="pill warn">Phase B below</span></td>
+</tr>
+<tr>
+  <td><strong>The thing that actually matters</strong></td>
+  <td>The <strong>Microsoft-signed catalog</strong> (<code>dlpflt.cat</code>) that Partner Center returns after attestation signing, signed by <em>Microsoft Windows Hardware Compatibility Publisher</em>. <strong>This</strong> is what makes Windows load your driver without test mode.</td>
+  <td><span class="pill bad">Phase I below</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<span class="lbl">The one-sentence version</span>
+<p>Since Windows 10 1607, the only signature a retail kernel loads is Microsoft's; your EV certificate is the <em>key to the submission counter</em>, not the signature on the driver.</p>
+</div>
+
+<h3>Why your driver refuses to load today</h3>
+<p>It is signed with a self-signed test certificate, which is why every runbook in this repo tells the operator to run <code>bcdedit /set testsigning on</code> and reboot. Confirmed on this machine just now:</p>
+
+<div class="codeblock"><span class="cap">verified output — current state</span><button class="copy">copy</button><pre>Issued to: DLP Minifilter Test
+Issued by: DLP Minifilter Test
+SHA1 hash: 2F44CE9D6797737680DF8E253E16199D21D10FD8
+File is not timestamped.
+
+SignTool Error: A certificate chain processed, but terminated in a root
+	certificate which is not trusted by the trust provider.</pre></div>
+
+<p>That error is the whole problem this document solves.</p>
+
+<!-- ============================================================ -->
+<h2 id="s1"><span class="num">01</span>What I verified in your code and on this PC</h2>
+
+<p>Everything below is measured, not assumed. Commands were run today against <code>D:\DLP_GUIDE</code>.</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Item</th><th>Finding</th><th></th></tr></thead>
+<tbody>
+<tr><td>Driver source</td><td><code>dlp-minifilter/src/dlpflt.c</code> (107 KB) + <code>comms.c</code> (38 KB), header <code>dlpflt.h</code></td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>Build recipe</td><td><code>build/build-driver.bat</code> — direct <code>cl</code>+<code>link</code>, not MSBuild. Links with <code>/INTEGRITYCHECK /GUARD:CF /RELEASE</code>, entry <code>GsDriverEntry</code>. <strong>Correct flags for a signed production driver.</strong></td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>Build output</td><td><code>build/out/dlpflt.sys</code>, 40,840 bytes, built 2026-09-22 14:55</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>Optimisation level</td><td><code>/Od</code> — this is a <em>debug</em> optimisation setting in a script named "build-driver". Release builds should be <code>/O2</code> (or at minimum a deliberate decision).</td><td><span class="pill warn">decide</span></td></tr>
+<tr><td>Current signature</td><td>Self-signed <code>CN=DLP Minifilter Test</code>, untrusted chain, no timestamp → needs test mode</td><td><span class="pill bad">blocks</span></td></tr>
+<tr><td>INF</td><td><code>dlp-minifilter/dlpflt.inf</code> — <code>DefaultInstall.NTamd64</code>, class <code>ContentScreener</code>, <code>CatalogFile = dlpflt.cat</code>, <code>PnpLockDown = 1</code>, <code>DriverVer = 08/25/2026,1.0.0.0</code>, service demand-start (<code>StartType = 3</code>)</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td><strong>Inf2Cat signability</strong></td><td>I ran it today against <code>/os:10_X64</code>: <strong>0 errors, 0 warnings</strong>, catalog generated. Your INF is submission-clean as written.</td><td><span class="pill ok">pass</span></td></tr>
+<tr><td>Filter altitude</td><td><code>265000</code> — a <em>development placeholder</em>, flagged as such in the INF's own comments. Microsoft must assign you a real one.</td><td><span class="pill bad">blocks prod</span></td></tr>
+<tr><td>EV certificate</td><td>Present and usable. <code>CN=RESEC SYSTEMS PRIVATE LIMITED</code>, issued by <code>GlobalSign GCC R45 EV CodeSigning CA 2020</code>, expires <strong>18 Aug 2027</strong>, EKU = Code Signing, chain builds to a trusted root with no errors.</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>EV thumbprint</td><td><code>2CE7FCBEF04C279943F175A936E7588D298D254A</code></td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>Token</td><td>Key container <code>te-7564ff7a-a0bb-4a5c-9008-d82cbcc1c7c2</code> on <em>eToken Base Cryptographic Provider</em>; private key <strong>not exportable</strong> (correct — that is what makes it EV)</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>Token middleware</td><td>SafeNet Authentication Client 10.9 R2 (10.9.6901.0) installed</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>signtool</td><td><code>…\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe</code> (also 22621 and 28000 present)</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>Inf2Cat</td><td><code>…\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe</code> — x86 only, that is normal</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td>stampinf / makecab</td><td>Both present (<code>10.0.26100.0\x64\stampinf.exe</code>, <code>C:\Windows\System32\makecab.exe</code>)</td><td><span class="pill ok">ok</span></td></tr>
+<tr><td><code>infverif.exe</code></td><td><strong>Not installed.</strong> You have WDK signing tools but not the full WDK verifier. Optional — Partner Center runs its own validation.</td><td><span class="pill warn">optional</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Two findings you will want to act on</h3>
+
+<div class="note warn">
+<span class="lbl">Finding 1 — a previous CAB attempt was malformed</span>
+<p><code>D:\DLP_GUIDE\setup.inf</code> and <code>setup.rpt</code> are <code>makecab</code> byproducts left in the repo root, dated <strong>27 Aug 2026 11:05</strong>. Their manifest reads:</p>
+<pre style="background:var(--code-bg); color:var(--code-fg); border-radius:6px; padding:10px 12px; margin:8px 0; font-size:12.5px">[file list]
+1,1,dlpflt\dlpflt.inf,2944
+1,1,dlpflt\dlpflt.sys,51696</pre>
+<p>Two files — <strong><code>dlpflt.cat</code> is missing</strong>. Partner Center rejects a CAB with no catalog; there is nothing for it to sign. If that submission was attempted, that is why it failed. Phase F below builds the CAB correctly. Also: those two files are makecab droppings and should be git-ignored or produced in a build directory instead of the repo root.</p>
+</div>
+
+<div class="note warn">
+<span class="lbl">Finding 2 — the altitude is still a placeholder</span>
+<p><code>[Strings] Altitude = "265000"</code>. The INF's own comment says production requires a Microsoft-assigned value. You can attestation-sign with the placeholder and it will load — but then every customer deployment carries a squatted altitude that can collide with another vendor's filter, and you will have to re-sign the whole package to change it. <strong>Request the altitude in parallel with Phase B</strong> (Phase C) so you sign once.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2"><span class="num">02</span>The trust chain, end to end</h2>
+
+<p>Keep this picture in your head; every phase below is one arrow in it.</p>
+
+<div class="flow">  SafeNet eToken (EV private key, non-exportable)
+         │
+         │  signs, once
+         ▼
+  Partner Center identity validation  ──►  Hardware dashboard unlocked
+         │
+         │  signs, every release
+         ▼
+  dlpflt.cab  ──upload──►  Microsoft attestation service
+                                    │
+                                    │ signs the catalog
+                                    ▼
+                          dlpflt.cat  (Microsoft Windows
+                                       Hardware Compatibility Publisher)
+                                    │
+                                    ▼
+                    Windows kernel Code Integrity accepts
+                    dlpflt.sys with test mode OFF</div>
+
+<div class="note">
+<span class="lbl">Note on the on-prem rule</span>
+<p><code>CLAUDE.md</code> says everything stays on the customer's premises. That still holds. This entire process happens <strong>at the vendor, on your build machine, before shipping</strong>. No customer data touches Microsoft — only your own driver binary. The customer's endpoint needs no internet to <em>verify</em> a Microsoft signature; the root is already in every Windows install. Air-gapped sites are unaffected.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s3"><span class="num">03</span>Phase A — Pre-flight on the signing PC</h2>
+
+<p>Do this before touching Partner Center. It takes five minutes and catches the failures that otherwise surface halfway through a submission.</p>
+
+<h3>A1 · Set up a shell with the tools on PATH</h3>
+<p>Run PowerShell <strong>as Administrator</strong> and paste this. Every later command assumes these variables exist, so keep this window open (variables do not survive a new shell).</p>
+
+<div class="codeblock"><span class="cap">PowerShell (admin) — session setup</span><button class="copy">copy</button><pre>$Kit      = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0"
+$SignTool = "$Kit\x64\signtool.exe"
+$Inf2Cat  = "$Kit\x86\Inf2Cat.exe"
+$StampInf = "$Kit\x64\stampinf.exe"
+
+<span class="c"># Your EV certificate, by thumbprint — never by /a (which picks arbitrarily</span>
+<span class="c"># when several code-signing certs are in the store, and you have four).</span>
+$EVThumb  = "2CE7FCBEF04C279943F175A936E7588D298D254A"
+
+<span class="c"># GlobalSign RFC3161 timestamp authority. DigiCert's works too and is a</span>
+<span class="c"># useful fallback:  http://timestamp.digicert.com</span>
+$TSA      = "http://rfc3161timestamp.globalsign.com/advanced"
+
+$Repo     = "D:\DLP_GUIDE"
+$Mf       = "$Repo\dlp-minifilter"
+$Stage    = "$Repo\dlp-minifilter\build\submission"
+
+Write-Host "signtool : $SignTool"
+Write-Host "inf2cat  : $Inf2Cat"</pre></div>
+
+<h3>A2 · Confirm the token is plugged in and the key is reachable</h3>
+
+<div class="codeblock"><span class="cap">PowerShell — token check</span><button class="copy">copy</button><pre>$cert = Get-Item "Cert:\CurrentUser\My\$EVThumb"
+$cert | Format-List Subject, Issuer, NotAfter, HasPrivateKey
+
+<span class="c"># Expect:  Provider = eToken Base Cryptographic Provider</span>
+<span class="c">#          Private key is NOT exportable</span>
+certutil -user -store My $EVThumb | Select-String "Provider|Key Container|NotAfter"</pre></div>
+
+<p><strong>Expected:</strong> <code>HasPrivateKey : True</code> and the eToken provider line. If <code>HasPrivateKey</code> is <code>False</code> or the cert is missing entirely, the token is unplugged or SafeNet Authentication Client is not running — open the SAC tray app and confirm the token shows as connected.</p>
+
+<h3>A3 · Prove you can actually sign with it</h3>
+<p>Sign a throwaway file. This is the moment you find out whether the PIN works, <em>before</em> you are mid-release.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — signing smoke test</span><button class="copy">copy</button><pre>$tmp = "$env:TEMP\ev-smoke-test.ps1"
+"Write-Host 'hello'" | Set-Content $tmp -Encoding utf8
+
+& $SignTool sign /fd SHA256 /sha1 $EVThumb /tr $TSA /td SHA256 /v $tmp
+& $SignTool verify /pa /v $tmp</pre></div>
+
+<p>A SafeNet dialog will pop up asking for the <strong>token password</strong> (the PIN). Type it there. Verification should report your GlobalSign chain and a timestamp.</p>
+
+<div class="note bad">
+<span class="lbl">Token lockout — the one irreversible mistake in this document</span>
+<p>The SafeNet eToken locks permanently after a fixed number of wrong PIN entries (typically 15, and the counter does <em>not</em> reset on success in some configurations). A locked EV token means <strong>re-purchasing the certificate</strong> and repeating GlobalSign's organisation vetting — weeks, not days.</p>
+<p>So: type the PIN by hand, do not loop a script that retries, and do not let CI guess. And per <code>CLAUDE.md</code> — <em>secrets are never hard-coded or logged</em> — never put the PIN on a command line. The single-logon / <code>/csp</code>+<code>/kc</code> unattended trick that circulates on Stack Overflow embeds the PIN in the process arguments, where it lands in command-line auditing, Sysmon, and shell history. Do not use it in this repo.</p>
+</div>
+
+<h3>A4 · Confirm the INF is still submission-clean</h3>
+<p>Already passing as of today, but re-run it after any INF edit (especially the altitude change in Phase C):</p>
+
+<div class="codeblock"><span class="cap">PowerShell — signability test</span><button class="copy">copy</button><pre>$probe = "$env:TEMP\inf2cat-probe"
+Remove-Item $probe -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $probe | Out-Null
+Copy-Item "$Mf\dlpflt.inf"           $probe -Force
+Copy-Item "$Mf\build\out\dlpflt.sys" $probe -Force
+
+& $Inf2Cat /driver:$probe /os:10_X64 /verbose</pre></div>
+
+<p><strong>Expected tail:</strong> <code>Signability test complete.</code> / <code>Errors: None</code> / <code>Warnings: None</code>.</p>
+
+<!-- ============================================================ -->
+<h2 id="s4"><span class="num">04</span>Phase B — Partner Center enrolment and EV validation</h2>
+
+<p>This is the step you were calling "getting the attestation certificate." It is a one-time account unlock, not a certificate issuance. Budget <strong>1–3 business days</strong> — Microsoft's verification is not instant.</p>
+
+<h3>B1 · Prerequisites before you start the form</h3>
+<ul>
+  <li>A <strong>Microsoft Entra ID (Azure AD) tenant</strong> for the company. If Resec has Microsoft 365, you already have one — enrol with that, not a personal account.</li>
+  <li>The legal company name in Partner Center must <strong>match the EV certificate subject exactly</strong>. Yours reads <code>RESEC SYSTEMS PRIVATE LIMITED</code>. A mismatch here is the single most common enrolment rejection.</li>
+  <li>Someone with authority to accept the Microsoft Hardware Program agreement.</li>
+  <li>The EV token physically present on the machine doing the signing.</li>
+</ul>
+
+<h3>B2 · Enrol in the Windows Hardware program</h3>
+<ol>
+  <li>Go to <a href="https://partner.microsoft.com/dashboard/hardware">partner.microsoft.com/dashboard/hardware</a> and sign in with the company Entra ID account.</li>
+  <li>Choose to enrol in the <strong>Hardware</strong> (Windows Hardware Developer) program.</li>
+  <li>Enter the legal business details. Use the identical spelling from the certificate subject.</li>
+  <li>Accept the program agreement.</li>
+</ol>
+
+<h3>B3 · The EV validation file — the actual "attestation" step</h3>
+<p>The dashboard gives you a small binary file to download (historically named something like <code>*.bin</code>; the dashboard labels it as the code-signing verification file). You sign it with the EV certificate and upload it back. That signature is how Microsoft binds your certificate to your Partner Center account.</p>
+
+<div class="codeblock"><span class="cap">PowerShell (admin) — sign the Partner Center validation file</span><button class="copy">copy</button><pre><span class="c"># Adjust the path to wherever you saved the download.</span>
+$Blob = "$env:USERPROFILE\Downloads\MicrosoftHardwareValidation.bin"
+
+& $SignTool sign /fd SHA256 /sha1 $EVThumb /tr $TSA /td SHA256 /v $Blob
+
+<span class="c"># Confirm before uploading — this must show RESEC SYSTEMS PRIVATE LIMITED.</span>
+& $SignTool verify /pa /v $Blob</pre></div>
+
+<p>Upload the signed file back into the dashboard. Wait for the account to show as verified.</p>
+
+<div class="note">
+<span class="lbl">Record this</span>
+<p>When enrolment completes, Partner Center assigns your company a <strong>Seller ID</strong> and a <strong>publisher name</strong>. Write both into the release documentation — you will need them for every future submission and for any support conversation with Microsoft.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5"><span class="num">05</span>Phase C — Request a Microsoft-assigned filter altitude</h2>
+
+<p>Start this the same day as Phase B, because it also takes days and it changes the INF you are about to sign.</p>
+
+<p>A minifilter's <strong>altitude</strong> decides where it sits in the filter stack relative to antivirus, encryption, and replication filters. Yours is <code>265000</code>, sitting in the <em>FSFilter Content Screener</em> band (260000–269998) — the right band for a DLP content screener, but self-assigned. Two filters that squat the same altitude on one machine is a support incident you cannot fix remotely.</p>
+
+<h3>C1 · Request it</h3>
+<ol>
+  <li>Email <strong>fsfcomm@microsoft.com</strong> — the Microsoft file system filter altitude allocation address.</li>
+  <li>State: company name, filter name (<code>dlpflt</code>), the load-order group (<code>FSFilter Content Screener</code>), and a description of what the filter does (screens content written to removable media for data leak prevention).</li>
+  <li>They reply with an assigned altitude in that band.</li>
+</ol>
+
+<h3>C2 · Apply it</h3>
+<p>Exactly one line changes in <code>dlp-minifilter/dlpflt.inf</code>:</p>
+
+<div class="codeblock"><span class="cap">dlp-minifilter/dlpflt.inf — [Strings] section</span><button class="copy">copy</button><pre><span class="c">; before (development placeholder)</span>
+Altitude        = "265000"
+
+<span class="c">; after (Microsoft-assigned — substitute your real value)</span>
+Altitude        = "26xxxx"</pre></div>
+
+<p>Then re-run the Phase A4 signability test, and grep the repo for the old value — the number is hard-coded in test scripts and runbooks that will otherwise silently check for the wrong filter:</p>
+
+<div class="codeblock"><span class="cap">PowerShell — find every hard-coded 265000</span><button class="copy">copy</button><pre>Select-String -Path "$Repo\*.md","$Repo\dlp-minifilter\*","$Repo\dlp-agent\*","$Repo\demo-vm\*" `
+  -Pattern "265000" -Recurse -ErrorAction SilentlyContinue |
+  Select-Object Path, LineNumber, Line</pre></div>
+
+<!-- ============================================================ -->
+<h2 id="s6"><span class="num">06</span>Phase D — Build the release driver</h2>
+
+<p>Build from a clean tree so the binary you submit is the binary you can reproduce.</p>
+
+<div class="codeblock"><span class="cap">PowerShell (admin) — clean release build</span><button class="copy">copy</button><pre>Remove-Item "$Mf\build\out\*.obj","$Mf\build\out\*.sys","$Mf\build\out\*.cat" `
+            -Force -ErrorAction SilentlyContinue
+
+cmd /c "$Mf\build\build-driver.bat"
+
+<span class="c"># Sanity: the binary exists and carries the right image characteristics.</span>
+Get-Item "$Mf\build\out\dlpflt.sys" | Select-Object Name, Length, LastWriteTime</pre></div>
+
+<div class="note warn">
+<span class="lbl">Decide before you submit: /Od vs /O2</span>
+<p><code>build-driver.bat</code> compiles with <code>/Od</code> (optimisations disabled). That is a debug setting. Once Microsoft signs a binary, changing a compiler flag means a <strong>new submission</strong> — you cannot patch it. Either switch both <code>cl.exe</code> lines to <code>/O2</code> now, or make an explicit, documented decision to ship unoptimised. A minifilter sits on every file I/O path on the endpoint; <code>/Od</code> on that path is a measurable cost.</p>
+<p>The security-relevant flags are already correct and must stay: <code>/GS /guard:cf /sdl /kernel</code> on compile, <code>/INTEGRITYCHECK /GUARD:CF /RELEASE</code> on link.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7"><span class="num">07</span>Phase E — Embed-sign the driver, stamp the INF, build the catalog</h2>
+
+<div class="note bad">
+<span class="lbl">Order matters — get this wrong and the submission fails validation</span>
+<p><code>Inf2Cat</code> writes the <strong>hash of every file</strong> into the catalog. If you sign <code>dlpflt.sys</code> <em>after</em> running Inf2Cat, you change the file, the recorded hash no longer matches, and the package is broken. The order is always:</p>
+<p style="font-family:var(--mono); font-size:13px; margin-top:8px"><strong>build → embed-sign the .sys → stampinf → Inf2Cat → makecab → sign the .cab</strong></p>
+</div>
+
+<h3>E1 · Stage a clean submission folder</h3>
+<p>Never build the CAB in the repo root — that is what left <code>setup.inf</code>/<code>setup.rpt</code> lying around in August.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — stage</span><button class="copy">copy</button><pre>Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path "$Stage\dlpflt" | Out-Null
+
+Copy-Item "$Mf\build\out\dlpflt.sys" "$Stage\dlpflt\" -Force
+Copy-Item "$Mf\dlpflt.inf"           "$Stage\dlpflt\" -Force
+
+Get-ChildItem "$Stage\dlpflt"</pre></div>
+
+<h3>E2 · Embed your EV signature in the .sys</h3>
+<p>Optional in the strict sense — Microsoft signs the catalog, not the binary — but do it anyway. The binary is linked with <code>/INTEGRITYCHECK</code>, and an embedded signature gives you a second, independently verifiable provenance claim on the file itself. It also survives if the catalog is ever separated from the driver.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — embed-sign (token PIN prompt appears)</span><button class="copy">copy</button><pre>& $SignTool sign /fd SHA256 /sha1 $EVThumb /tr $TSA /td SHA256 /v `
+    "$Stage\dlpflt\dlpflt.sys"
+
+& $SignTool verify /pa /v "$Stage\dlpflt\dlpflt.sys"</pre></div>
+
+<p><strong>Expected:</strong> chain <code>RESEC SYSTEMS PRIVATE LIMITED → GlobalSign GCC R45 EV CodeSigning CA 2020 → GlobalSign Code Signing Root R45</code>, plus a timestamp block. <em>Not</em> the "root not trusted" error from section 00 — that would mean you signed with the wrong certificate.</p>
+
+<h3>E3 · Stamp the DriverVer</h3>
+<p>Your INF currently has a hand-written <code>DriverVer = 08/25/2026,1.0.0.0</code>. Stamp it so the date reflects the actual build — Windows uses this to decide which driver package wins when two are present.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — stampinf</span><button class="copy">copy</button><pre>& $StampInf -f "$Stage\dlpflt\dlpflt.inf" -d "*" -v "1.0.0.0" -a "amd64"
+
+Select-String -Path "$Stage\dlpflt\dlpflt.inf" -Pattern "DriverVer"</pre></div>
+
+<p><code>-d "*"</code> means "today". Bump <code>-v</code> for every release you submit; two submissions with the same version are a support headache later.</p>
+
+<h3>E4 · Generate the unsigned catalog</h3>
+
+<div class="codeblock"><span class="cap">PowerShell — Inf2Cat</span><button class="copy">copy</button><pre>& $Inf2Cat /driver:"$Stage\dlpflt" /os:10_X64 /verbose
+
+<span class="c"># Expect: "Signability test complete." with Errors: None / Warnings: None</span>
+Get-ChildItem "$Stage\dlpflt"</pre></div>
+
+<p>You now have three files in <code>submission\dlpflt\</code>: <code>dlpflt.sys</code> (EV-signed), <code>dlpflt.inf</code> (stamped), <code>dlpflt.cat</code> (unsigned). <strong>Do not sign the .cat yourself</strong> — Microsoft signs it, and your signature on it would simply be replaced.</p>
+
+<p><code>/os:10_X64</code> is the right and only target here. Your INF has a single <code>[DefaultInstall.NTamd64]</code> section: x64 Windows 10/11 only. If you ever need ARM64, that is a separate INF section, a separate build, and a separate submission.</p>
+
+<!-- ============================================================ -->
+<h2 id="s8"><span class="num">08</span>Phase F — Build the CAB</h2>
+
+<p>Partner Center takes a <strong>CAB</strong> (for attestation) or an HLKX (for full WHQL). The CAB must contain the driver files inside a folder — not loose at the root — and it must include the catalog. That is exactly what the August attempt got wrong.</p>
+
+<h3>F1 · Write the DDF</h3>
+
+<div class="codeblock"><span class="cap">PowerShell — write dlpflt.ddf into the staging folder</span><button class="copy">copy</button><pre>@'
+.OPTION EXPLICIT
+.Set CabinetFileCountThreshold=0
+.Set FolderFileCountThreshold=0
+.Set FolderSizeThreshold=0
+.Set MaxCabinetSize=0
+.Set MaxDiskFileCount=0
+.Set MaxDiskSize=0
+.Set CompressionType=MSZIP
+.Set Cabinet=on
+.Set Compress=on
+.Set CabinetNameTemplate=dlpflt.cab
+.Set DiskDirectoryTemplate=.
+.Set DestinationDir=dlpflt
+.\dlpflt\dlpflt.inf
+.\dlpflt\dlpflt.cat
+.\dlpflt\dlpflt.sys
+'@ | Set-Content -Path "$Stage\dlpflt.ddf" -Encoding ascii
+
+Get-Content "$Stage\dlpflt.ddf"</pre></div>
+
+<p><code>DestinationDir=dlpflt</code> is what places the files in a <code>dlpflt\</code> folder inside the CAB. <code>DiskDirectoryTemplate=.</code> drops the finished CAB in the staging folder instead of creating a <code>disk1\</code> subdirectory.</p>
+
+<h3>F2 · Run makecab</h3>
+
+<div class="codeblock"><span class="cap">PowerShell — build the CAB from the staging folder</span><button class="copy">copy</button><pre>Push-Location $Stage
+makecab /f dlpflt.ddf
+Pop-Location
+
+Get-Item "$Stage\dlpflt.cab" | Select-Object Name, Length</pre></div>
+
+<h3>F3 · Verify the CAB contents before you sign it</h3>
+<p>Thirty seconds here saves a rejected submission. All three files must be listed, each under <code>dlpflt\</code>:</p>
+
+<div class="codeblock"><span class="cap">PowerShell — list what is actually in the CAB</span><button class="copy">copy</button><pre>expand -D "$Stage\dlpflt.cab"</pre></div>
+
+<div class="note ok">
+<span class="lbl">Expected — all three, folder-prefixed</span>
+<pre style="background:var(--code-bg); color:var(--code-fg); border-radius:6px; padding:10px 12px; margin:8px 0; font-size:12.5px">dlpflt\dlpflt.inf
+dlpflt\dlpflt.cat
+dlpflt\dlpflt.sys</pre>
+<p>If <code>dlpflt.cat</code> is absent, stop — you have reproduced the August failure. Go back to E4.</p>
+</div>
+
+<p>Also check <code>$Stage\setup.rpt</code>, which makecab writes next to the CAB: it lists the file count and sizes. <strong>Total files: 3.</strong></p>
+
+<!-- ============================================================ -->
+<h2 id="s9"><span class="num">09</span>Phase G — EV-sign the CAB</h2>
+
+<p>This is the signature Microsoft checks to confirm the submission came from the company that owns the Partner Center account. Same certificate, same token, same PIN prompt.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — sign the submission CAB</span><button class="copy">copy</button><pre>& $SignTool sign /fd SHA256 /sha1 $EVThumb /tr $TSA /td SHA256 /v `
+    "$Stage\dlpflt.cab"
+
+& $SignTool verify /pa /v "$Stage\dlpflt.cab"</pre></div>
+
+<h4>What each flag is doing, since these matter</h4>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Flag</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>/fd SHA256</code></td><td>File digest algorithm. SHA-1 is rejected outright by Partner Center.</td></tr>
+<tr><td><code>/sha1 $EVThumb</code></td><td>Selects the certificate <em>by thumbprint</em>. You have four code-signing certs in this store, three of them test certs — <code>/a</code> would be a coin flip. This flag is about the SHA-1 <em>identifier</em> of the cert, not the signature algorithm.</td></tr>
+<tr><td><code>/tr $TSA</code></td><td>RFC 3161 timestamp. <strong>Not optional.</strong> Without it, everything you signed stops validating the day the certificate expires — 18 Aug 2027. With it, the signature stays valid indefinitely.</td></tr>
+<tr><td><code>/td SHA256</code></td><td>Digest algorithm for the timestamp itself.</td></tr>
+<tr><td><code>/v</code></td><td>Verbose — you want to see which certificate was actually used.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+<span class="lbl">Timestamping needs internet</span>
+<p>The <em>signing machine</em> needs outbound access to the TSA at signing time. This does not affect the air-gapped customer site at all — verification of an existing timestamp is offline. If the build machine is itself isolated, sign on a connected release box instead of dropping <code>/tr</code>.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s10"><span class="num">10</span>Phase H — Submit to Partner Center</h2>
+
+<ol>
+  <li>Sign in at <a href="https://partner.microsoft.com/dashboard/hardware">partner.microsoft.com/dashboard/hardware</a>.</li>
+  <li><strong>Drivers → Submit new hardware.</strong></li>
+  <li>Give the submission a name you will recognise in six months — e.g. <code>dlpflt 1.0.0.0 amd64 attestation</code>.</li>
+  <li>Upload <code>$Stage\dlpflt.cab</code> (the <em>signed</em> one).</li>
+  <li>Partner Center detects it is a CAB rather than an HLKX and routes it to <strong>attestation signing</strong> automatically. There is no separate "choose attestation" toggle to hunt for.</li>
+  <li>Fill in the <strong>Requested Signatures</strong> checkboxes. See the box below — this is the step that trips people up.</li>
+  <li>Submit, and wait. Attestation signing is usually minutes to a few hours — no hardware lab, no HLK test run.</li>
+</ol>
+
+<div class="note bad">
+<span class="lbl">The checkboxes — the page contradicts itself, and the form wins</span>
+<p>The submission page prints <em>"Leave all checkboxes blank for Attestation Signing"</em> above a long <strong>Requested Signatures</strong> list — but on upload it then <strong>refuses to proceed until you select at least one OS</strong>. Observed directly on 2026-09-23. Treat the printed note as applying to the <em>Certification</em> section only, and select OSes as below.</p>
+<div class="tablewrap" style="margin:10px 0">
+<table>
+<thead><tr><th>Field</th><th>Setting</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><strong>Requested Signatures</strong></td><td><strong>x64 entries, 1607 and later</strong></td><td>1607 x64 (RS1) · 1703 x64 · 1709 x64 · 1803 x64 · 1809 x64 · 19H1 x64 · 2004 x64 · 21H2 x64 (Co) · Win11 22H2 / 24H2 / 25H2 / 26H1 x64</td></tr>
+<tr><td>ARM64 entries</td><td>unchecked</td><td>The package has no ARM64 binary — the INF is <code>[DefaultInstall.NTamd64]</code> only. Requesting a signature for an architecture you did not ship fails validation.</td></tr>
+<tr><td>1506 / 1511 (TH2)</td><td>unchecked</td><td>Attestation does not cover anything before 1607; ticking these can divert the submission to the certification path.</td></tr>
+<tr><td>Entries without "x64"</td><td>unchecked</td><td>Those are the 32-bit x86 variants — note <code>…1607 (RS1)</code> vs <code>…1607 x64 (RS1)</code>. No x86 build exists. Easy to mis-click on an adjacent row.</td></tr>
+<tr><td><strong>Perform test-signing</strong></td><td>unchecked</td><td>Returns a package signed by a Microsoft <em>test</em> root, which loads only with <code>testsigning on</code> — the exact thing this whole process exists to avoid.</td></tr>
+<tr><td><strong>Certification</strong></td><td>blank</td><td>That is the HLK path, and it needs test logs you do not have.</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Check your test VM's build is in the selected set</strong> — a signature that omits the VM's Windows version gives you a driver that will not validate on the one machine you are testing on. If the submission is rejected, narrow to just the VM's version plus the newest Windows 11 x64 entry and retry; more OSes cost nothing when it works but are harder to debug when it does not.</p>
+</div>
+
+<div class="note bad">
+<span class="lbl">Scope limit you must confirm against your customer contracts</span>
+<p>Attestation signing covers <strong>Windows 10 (1607+) and Windows 11 client SKUs only</strong>. It does <em>not</em> cover Windows Server, and it does not grant the "Certified for Windows" logo.</p>
+<p>This repo sells to defence, government and critical-infrastructure customers. If any deployment puts the agent on <strong>Windows Server</strong> — jump boxes, terminal servers, RDS session hosts are all realistic in those environments — attestation is not enough and you need full <strong>WHQL / HLK certification</strong>, which is a materially larger project (hardware lab, HLK controller, test passes, weeks of lead time). Find out now, not after the first Server deployment fails to load the driver.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s11"><span class="num">11</span>Phase I — Verify what comes back</h2>
+
+<p>Download the signed package from the submission page. It is a ZIP with the same folder layout you uploaded, under <code>drivers\dlpflt\</code>.</p>
+
+<div class="note ok">
+<span class="lbl">What actually comes back — measured 2026-09-23</span>
+<p>Microsoft signs <strong>both</strong> the catalog <em>and</em> the driver binary. Observed on the real submission:</p>
+<div class="tablewrap" style="margin:10px 0">
+<table>
+<thead><tr><th>File</th><th>Submitted</th><th>Returned</th><th></th></tr></thead>
+<tbody>
+<tr><td><code>dlpflt.sys</code></td><td>39,424 B</td><td><strong>49,888 B</strong></td><td>Microsoft <strong>embedded</strong> a signature — the file changes</td></tr>
+<tr><td><code>dlpflt.cat</code></td><td>1,015 B</td><td>12,076 B</td><td>replaced with the Microsoft-signed catalog</td></tr>
+<tr><td><code>dlpflt.inf</code></td><td>3,052 B</td><td>3,052 B</td><td>byte-identical, hash unchanged</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both signatures chain to <strong>Microsoft Windows Hardware Compatibility Publisher</strong> → Microsoft Windows Third Party Component CA 2014 → Microsoft Root Certificate Authority 2010, each Microsoft-timestamped, and the <code>.sys</code> carries a cross-certificate chain.</p>
+<p>The embedded signature is good news for <a href="#s12">Phase J</a>: it means kernel Code Integrity can validate <code>dlpflt.sys</code> on its own, without needing the catalog registered first — so the <code>pnputil</code> catalog-registration worry is much less likely to bite.</p>
+</div>
+
+<div class="codeblock"><span class="cap">PowerShell — unpack and verify the Microsoft signature</span><button class="copy">copy</button><pre>$Signed = "$Mf\build\signed"
+Remove-Item $Signed -Recurse -Force -ErrorAction SilentlyContinue
+Expand-Archive "$env:USERPROFILE\Downloads\<span class="c">&lt;downloaded&gt;</span>.zip" -DestinationPath $Signed
+
+<span class="c"># Locate the returned files (folder depth varies by submission).</span>
+$cat = (Get-ChildItem $Signed -Recurse -Filter dlpflt.cat | Select-Object -First 1).FullName
+$sys = (Get-ChildItem $Signed -Recurse -Filter dlpflt.sys | Select-Object -First 1).FullName
+"cat: $cat"; "sys: $sys"
+
+<span class="c"># THE test: does the catalog vouch for the driver, under kernel policy?</span>
+& $SignTool verify /v /kp /c $cat $sys</pre></div>
+
+<div class="note ok">
+<span class="lbl">This is what success looks like</span>
+<p>The output must name <strong><code>Microsoft Windows Hardware Compatibility Publisher</code></strong> in the signing chain. That string is the entire point of the exercise. If you see GlobalSign or Resec instead, you are looking at your own catalog, not the returned one.</p>
+<p><code>/kp</code> means "verify against <em>kernel</em> policy" rather than the default Authenticode policy — it is the check that actually predicts whether the driver will load.</p>
+</div>
+
+<h3>Also verify the embedded signature on the binary itself</h3>
+<div class="codeblock"><span class="cap">PowerShell — embedded signature, kernel policy</span><button class="copy">copy</button><pre>& $SignTool verify /v /kp $sys</pre></div>
+
+<p>Expect the same <code>Microsoft Windows Hardware Compatibility Publisher</code> chain. Do <strong>not</strong> expect the returned <code>.sys</code> to hash-match what you submitted — it will not, because the signature was inserted into it. The INF is the file that should come back byte-identical; check that one instead:</p>
+
+<div class="codeblock"><span class="cap">PowerShell — the INF must be unchanged</span><button class="copy">copy</button><pre>(Get-FileHash "$Stage\dlpflt\dlpflt.inf").Hash
+(Get-FileHash (Get-ChildItem $Signed -Recurse -Filter dlpflt.inf | Select -First 1).FullName).Hash
+<span class="c"># These two must be identical.</span></pre></div>
+
+<!-- ============================================================ -->
+<h2 id="s12"><span class="num">12</span>Phase J — Prove it on a clean machine with test mode OFF</h2>
+
+<p>This is the acceptance test. Do it on the VMware VM, but <strong>first take a snapshot</strong> — your memory notes record that a wedged agent silently blocks all USB and the service will not stop cleanly.</p>
+
+<h3>J1 · Turn test signing OFF and reboot</h3>
+<p>Every prior runbook in this repo turned it on. Turn it off, or you are not testing anything.</p>
+
+<div class="codeblock"><span class="cap">On the test VM, elevated — then REBOOT</span><button class="copy">copy</button><pre>bcdedit /set testsigning off
+bcdedit /enum "{current}" | findstr /i testsigning
+<span class="c"># Reboot now. The setting does not take effect until you do.</span>
+shutdown /r /t 0</pre></div>
+
+<p>After the reboot, the "Test Mode" watermark in the bottom-right corner of the desktop must be <strong>gone</strong>. If it is still there, the setting did not apply and the test is invalid.</p>
+
+<h3>J2 · Remove the old test-signed driver and its test certificates</h3>
+<p>Otherwise you cannot tell whether the driver loaded because of Microsoft's signature or because a test root is still trusted in the VM's store.</p>
+
+<div class="codeblock"><span class="cap">On the test VM, elevated — clean slate</span><button class="copy">copy</button><pre>fltmc unload dlpflt 2>$null
+sc.exe stop dlpflt   2>$null
+sc.exe delete dlpflt 2>$null
+
+<span class="c"># Remove the self-signed test roots that made the old driver loadable.</span>
+Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher |
+  Where-Object { $_.Subject -match "DLP Mflt Test|DLP Minifilter Test|WDKTestCert" } |
+  ForEach-Object { "Removing: $($_.Subject)"; Remove-Item $_.PSPath -Force }</pre></div>
+
+<h3>J3 · Install the Microsoft-signed package</h3>
+<p>Copy the three returned files (<code>.sys</code>, <code>.inf</code>, <code>.cat</code>) into one folder on the VM, then:</p>
+
+<div class="codeblock"><span class="cap">On the test VM, elevated — install via the driver store</span><button class="copy">copy</button><pre><span class="c"># Adds the package AND registers the catalog with Code Integrity.</span>
+pnputil /add-driver dlpflt.inf /install
+
+<span class="c"># Then the DefaultInstall section, which creates the dlpflt service.</span>
+RUNDLL32.EXE SETUPAPI.DLL,InstallHinfSection DefaultInstall 132 .\dlpflt.inf
+
+fltmc load dlpflt
+fltmc filters</pre></div>
+
+<div class="note warn">
+<span class="lbl">Expect to iterate on exactly this step — here is why</span>
+<p>Attestation signing signs the <strong>catalog</strong>, not the binary. For the kernel to accept a catalog signature, that catalog has to be registered in the system catalog database (<code>%SystemRoot%\System32\CatRoot</code>). <code>pnputil /add-driver</code> does that registration; <code>InstallHinfSection</code> on its own historically does <strong>not</strong>, and your <code>tools\install.ps1</code> uses <code>InstallHinfSection</code> alone.</p>
+<p>So the sequence above deliberately runs <code>pnputil</code> <em>first</em> to register the catalog, then <code>InstallHinfSection</code> to create the service from the <code>DefaultInstall</code> section (<code>pnputil /install</code> will not create a service for a non-PnP INF like this one).</p>
+<p>If <code>fltmc load</code> still fails with a signature error, the catalog is not being seen. Fallback: register it explicitly with <code>signtool catdb -v dlpflt.cat</code>, or confirm the file landed under <code>C:\Windows\System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\</code>. This is the single step in the whole document most likely to need a round of trial and error — plan for it rather than treating it as a failure of the signing.</p>
+</div>
+
+<h3>J4 · The acceptance criteria</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Check</th><th>Command</th><th>Pass condition</th></tr></thead>
+<tbody>
+<tr><td>Test mode off</td><td><code>bcdedit /enum "{current}"</code></td><td>no <code>testsigning Yes</code>; no desktop watermark</td></tr>
+<tr><td>Filter loaded</td><td><code>fltmc filters</code></td><td><code>dlpflt</code> listed at your assigned altitude</td></tr>
+<tr><td>Attached to a volume</td><td><code>fltmc instances</code></td><td>an instance on the removable volume</td></tr>
+<tr><td>No CI complaints</td><td><code>Get-WinEvent -LogName "Microsoft-Windows-CodeIntegrity/Operational" -Max 20</code></td><td>no errors naming <code>dlpflt.sys</code></td></tr>
+<tr><td>Survives reboot</td><td>reboot, then <code>fltmc filters</code></td><td>loads again with no manual step</td></tr>
+<tr><td>Functional</td><td>your existing USB / read-deny test matrix</td><td>unchanged behaviour vs the test-signed build</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The last row matters more than it looks. The only difference between this binary and the one you functionally tested is an appended signature block, so behaviour must be identical. Any difference means you tested a different build, not a different signature.</p>
+
+<h3>Showing it in the UI — for demos and customer evidence</h3>
+
+<p>The strongest proof is logical rather than visual: <strong>test mode off + driver loaded</strong> is only possible on Windows 10 1607+ if Microsoft signed it. But for a screenshot or a customer walkthrough:</p>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Route</th><th>How</th><th>Shows</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>File properties</strong><br><span style="color:var(--muted); font-size:12px">the main one</span></td>
+  <td><code>C:\Windows\System32\drivers\dlpflt.sys</code> → right-click → Properties → <strong>Digital Signatures</strong> → Details → View Certificate → Certification Path</td>
+  <td>Signer <code>Microsoft Windows Hardware Compatibility Publisher</code>, "This digital signature is OK", full chain to <code>Microsoft Root Certificate Authority 2010</code>, plus a <code>Microsoft Time-Stamp Service</code> countersignature under Details → Advanced</td>
+</tr>
+<tr>
+  <td><strong>Catalog viewer</strong></td>
+  <td>Double-click <code>dlpflt.cat</code> (or the copy under <code>C:\Windows\System32\CatRoot\{F750E6C3-38EE-11D1-85E5-00C04FC295EE}\</code>)</td>
+  <td>Built-in Security Catalog UI. <em>General</em> → <strong>View Signature</strong> for the Microsoft publisher; <em>Security Catalog</em> tab lists the vouched-for file hashes</td>
+</tr>
+<tr>
+  <td><strong>sigverif</strong></td>
+  <td><kbd>Win</kbd>+<kbd>R</kbd> → <code>sigverif</code> → Start</td>
+  <td>Microsoft's own GUI signature scanner. <code>dlpflt.sys</code> must not appear in the unsigned list. Slow, and may flag unrelated third-party files</td>
+</tr>
+<tr>
+  <td><strong>Process Explorer</strong><br><span style="color:var(--muted); font-size:12px">proves the loaded module</span></td>
+  <td>Options → <strong>Verify Image Signatures</strong>, select <strong>System</strong>, lower pane → <code>dlpflt.sys</code></td>
+  <td><em>Verified Signer</em> column. The only route that inspects the module resident in the kernel rather than the file on disk — but it needs a Sysinternals download, awkward on an air-gapped box</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<span class="lbl">Two things that will not work</span>
+<p><strong>Device Manager</strong> shows nothing — this is a non-PnP filesystem minifilter with no device node. <code>fltmc filters</code> is its equivalent. And the <strong>Digital Signatures tab</strong> only exists because Microsoft embeds a signature into the binary as well as signing the catalog; a catalog-only package would have no such tab, and you would have to use the catalog viewer instead.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s13"><span class="num">13</span>Phase K — Wire the signed driver into the release package</h2>
+
+<p><code>dlp-agent\packaging\build-package.ps1</code> already picks the driver up. Reading it: it copies <code>dlp-minifilter\build\out\dlpflt.sys</code>, <code>dlp-minifilter\dlpflt.inf</code>, and <code>dlp-minifilter\build\out\dlpflt.cat</code> <em>if present</em> — so the catalog is treated as optional today. For production it is mandatory.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — drop the Microsoft-signed files where the packager expects them</span><button class="copy">copy</button><pre>Copy-Item $sys "$Mf\build\out\dlpflt.sys" -Force
+Copy-Item $cat "$Mf\build\out\dlpflt.cat" -Force
+Copy-Item (Get-ChildItem $Signed -Recurse -Filter dlpflt.inf | Select -First 1).FullName `
+          "$Mf\dlpflt.inf" -Force
+
+powershell -ExecutionPolicy Bypass -File "$Repo\dlp-agent\packaging\build-package.ps1"</pre></div>
+
+<h3>Follow-up edits this unlocks</h3>
+<ul>
+  <li><strong><code>build-package.ps1</code></strong> — make a missing <code>dlpflt.cat</code> a hard failure for release builds, not a silent skip. Shipping a package with no catalog produces a driver that will not load, with no build-time warning.</li>
+  <li><strong><code>tools\install.ps1</code></strong> — it warns loudly when test signing is off. For a production-signed driver that warning is now backwards and will confuse operators. Add the <code>pnputil /add-driver</code> step from J3.</li>
+  <li><strong><code>tools\uninstall.ps1</code>, <code>packaging\install-endpoint.ps1</code></strong> — same review for test-signing assumptions.</li>
+  <li><strong>Operator docs</strong> — <code>DEPLOY-AND-TEST-GUIDE.md</code>, <code>ON-PREM-DEPLOYMENT-GUIDE.md</code>, <code>USB-DEMO-RUNBOOK.md</code> and the VM runbooks all instruct a <code>bcdedit</code> step that a defence customer's policy may outright forbid. Split them into "lab (test-signed)" and "production (Microsoft-signed)" paths.</li>
+  <li><strong><code>.gitignore</code></strong> — it currently ignores <code>/dlp-minifilter/build/out/*.cat</code>. The Microsoft-signed catalog is a release artefact you may want retained. Decide deliberately, and add <code>setup.inf</code>, <code>setup.rpt</code>, <code>*.cab</code> and <code>build/submission/</code> while you are there.</li>
+  <li><strong>Delete the stale byproducts</strong> — <code>D:\DLP_GUIDE\setup.inf</code> and <code>setup.rpt</code> from the August attempt.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s14"><span class="num">14</span>Also sign the user-mode agent</h2>
+
+<p>While the token is plugged in. <code>dlp-agent.exe</code> is user-mode, so it needs <strong>no</strong> Microsoft involvement — your EV signature alone is enough, and it is what stops SmartScreen warnings and gives the customer's own application-control policy something to trust.</p>
+
+<div class="codeblock"><span class="cap">PowerShell — EV-sign the agent binary</span><button class="copy">copy</button><pre>& $SignTool sign /fd SHA256 /sha1 $EVThumb /tr $TSA /td SHA256 /v `
+    "$Repo\dlp-agent\target\release\dlp-agent.exe"
+
+& $SignTool verify /pa /v "$Repo\dlp-agent\target\release\dlp-agent.exe"</pre></div>
+
+<p>Sign the release binary <strong>before</strong> running <code>build-package.ps1</code>, since that script copies it into <code>packaging\out\</code>. Same applies to any future MSI — sign the MSI too.</p>
+
+<!-- ============================================================ -->
+<h2 id="s15"><span class="num">15</span>Troubleshooting</h2>
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>SignTool Error: No certificates were found that met all the given criteria</code></td>
+  <td>Token unplugged, SAC not running, or wrong thumbprint</td>
+  <td>Re-run the Phase A2 check; confirm <code>HasPrivateKey : True</code></td>
+</tr>
+<tr>
+  <td><code>root certificate which is not trusted</code></td>
+  <td>You signed with one of the three test certs, not the EV cert</td>
+  <td>Always pass <code>/sha1 $EVThumb</code>; never <code>/a</code></td>
+</tr>
+<tr>
+  <td>PIN dialog never appears, signing hangs</td>
+  <td>SAC single-logon state, or the dialog opened on another session/desktop</td>
+  <td>Open the SafeNet tray client, disconnect and reconnect the token</td>
+</tr>
+<tr>
+  <td>Partner Center rejects the CAB</td>
+  <td>Missing <code>.cat</code>; files at CAB root instead of a folder; CAB unsigned; SHA-1 digest</td>
+  <td><code>expand -D</code> the CAB (Phase F3) — all three files, <code>dlpflt\</code>-prefixed, <code>/fd SHA256</code></td>
+</tr>
+<tr>
+  <td>Rejected: certificate does not match account</td>
+  <td>EV subject ≠ the company registered in Partner Center</td>
+  <td>Subject must read <code>RESEC SYSTEMS PRIVATE LIMITED</code> exactly; fix the Partner Center profile</td>
+</tr>
+<tr>
+  <td><code>fltmc load</code> → <code>Access is denied</code> / signature error, test mode off</td>
+  <td>Catalog not registered with Code Integrity</td>
+  <td>Run <code>pnputil /add-driver</code> first (J3); check the CodeIntegrity operational log</td>
+</tr>
+<tr>
+  <td><code>fltmc load</code> → <code>The system cannot find the file specified</code></td>
+  <td>Service exists but <code>dlpflt.sys</code> is not in <code>System32\drivers</code></td>
+  <td>The INF <code>CopyFiles</code> did not run — re-run <code>InstallHinfSection</code> from the folder holding the <code>.sys</code></td>
+</tr>
+<tr>
+  <td><code>fltmc load</code> → altitude collision</td>
+  <td>Another filter already at <code>265000</code></td>
+  <td>Phase C — get the assigned altitude</td>
+</tr>
+<tr>
+  <td>Signature valid today, invalid after Aug 2027</td>
+  <td>You dropped <code>/tr</code></td>
+  <td>Re-sign and re-submit with a timestamp. Non-negotiable.</td>
+</tr>
+<tr>
+  <td>Driver loads in the lab, not at the customer</td>
+  <td>Customer enforces HVCI / Memory Integrity, or WDAC policy</td>
+  <td>Separate compatibility question — test under HVCI before the first defence deployment</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16"><span class="num">16</span>Hard rules</h2>
+
+<div class="note bad">
+<span class="lbl">Never</span>
+<ul style="margin:6px 0">
+  <li><strong>Never re-sign <code>dlpflt.sys</code> after Microsoft returns it.</strong> The returned catalog records that exact binary's hash. Touching the file invalidates the attestation and you will not understand why it stopped loading.</li>
+  <li><strong>Never put the token PIN on a command line or in a script.</strong> <code>CLAUDE.md</code>: secrets are never hard-coded or logged. Command lines are logged by more things than you think.</li>
+  <li><strong>Never retry a wrong PIN in a loop.</strong> A locked EV token costs weeks and a re-purchase.</li>
+  <li><strong>Never ship the test certificates.</strong> <code>tools\dlpflt-test.pfx</code>, <code>build\out\dlpflt-test.cer</code>, <code>dlpflt-signer.cer</code> stay in the lab. A customer machine trusting your test root is a genuine vulnerability — anyone with that PFX can sign a kernel driver that machine will load.</li>
+  <li><strong>Never rely on <code>bcdedit /set testsigning on</code> in production.</strong> It weakens the boot trust chain and defence customers commonly forbid it by policy.</li>
+  <li><strong>Never sign a build you have not functionally tested.</strong> Re-submission is cheap but not instant, and each one is a new version number.</li>
+</ul>
+</div>
+
+<div class="note ok">
+<span class="lbl">Always</span>
+<ul style="margin:6px 0">
+  <li>Timestamp every signature (<code>/tr</code> + <code>/td SHA256</code>).</li>
+  <li>Select the certificate by thumbprint (<code>/sha1</code>), never <code>/a</code> — four code-signing certs live in this store.</li>
+  <li>Keep the exact build that was submitted, plus the returned package, archived per release. If Microsoft ever revokes or you need to reproduce, you cannot rebuild bit-identically from source alone.</li>
+  <li>Build → embed-sign .sys → stampinf → Inf2Cat → makecab → sign .cab. In that order, every time.</li>
+  <li>Bump <code>DriverVer</code> for every submission.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s17"><span class="num">17</span>Open decisions — answer these before submitting</h2>
+
+<p>None of these block you from starting Phase A or B today, but each one, answered late, means re-signing.</p>
+
+<ol>
+  <li><strong>Windows Server?</strong> If any customer runs the agent on Server, attestation is insufficient and you need WHQL/HLK. This is the biggest scope risk in the document.</li>
+  <li><strong>Altitude before or after first submission?</strong> Requesting it first (Phase C) means one submission instead of two. Recommended: request now, submit once.</li>
+  <li><strong><code>/Od</code> or <code>/O2</code> for the release driver?</strong> Decide before Phase D.</li>
+  <li><strong>ARM64?</strong> Currently amd64-only. If a customer has ARM64 endpoints, that is a separate INF section, build and submission.</li>
+  <li><strong>HVCI / Memory Integrity compatibility.</strong> Untested so far and increasingly on by default in hardened environments.</li>
+  <li><strong>Certificate expiry: 18 Aug 2027.</strong> Renewal means a new token and re-validating the Partner Center account. Put it in the calendar now, with three months of lead time.</li>
+  <li><strong>Where does the token live?</strong> A single EV token that can sign kernel drivers for defence customers is one of the most sensitive objects the company owns. Decide custody, storage and the procedure if it is lost — before it is routine.</li>
+</ol>
+
+<h3>Suggested order of work</h3>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Day</th><th>Do</th><th>Blocks on</th></tr></thead>
+<tbody>
+<tr><td>Today</td><td>Phase A (pre-flight), start Phase B (enrolment), send the Phase C altitude email</td><td>—</td></tr>
+<tr><td>Today</td><td>Answer decisions 1–3 with the product owner</td><td>—</td></tr>
+<tr><td>+1–3 days</td><td>Partner Center verified; altitude assigned; apply it to the INF</td><td>Microsoft</td></tr>
+<tr><td>+3 days</td><td>Phases D–G: build, sign, catalog, CAB, sign CAB</td><td>altitude</td></tr>
+<tr><td>+3 days</td><td>Phase H: submit</td><td>Partner Center</td></tr>
+<tr><td>+3–4 days</td><td>Phases I–J: verify, clean-VM acceptance test</td><td>Microsoft signing</td></tr>
+<tr><td>+4–5 days</td><td>Phase K: packaging and docs cleanup</td><td>a passing J4</td></tr>
+</tbody>
+</table>
+</div>
+
+<footer>
+  <p><strong>Sources.</strong> Everything in section 01 was measured on this machine on 2026-09-23 — certificate store, chain build, token provider, tool paths, a live <code>Inf2Cat</code> run against <code>dlpflt.inf</code>, and the <code>setup.rpt</code> manifest from the August CAB attempt. The Partner Center dashboard navigation and the attestation OS-coverage limits are from Microsoft's published hardware-program documentation and may shift; confirm against the dashboard as you go.</p>
+  <p>Companion documents in this repo: <code>dlp-minifilter/docs/PRODUCTION-SIGNING.md</code> (the policy version of this), <code>dlp-minifilter/SPEC.md</code> §7–8 (build and test-signing), <code>EV_Code_Signing_Guide.pdf</code> (vendor guide).</p>
+</footer>
+
+</div>
+
+<script>
+document.querySelectorAll('.copy').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    var pre = btn.parentElement.querySelector('pre');
+    if(!pre) return;
+    var text = pre.innerText;
+    var done = function(){ btn.textContent='copied'; setTimeout(function(){btn.textContent='copy';},1400); };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done, function(){});
+    } else {
+      var ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta);
+      ta.select(); try{document.execCommand('copy'); done();}catch(e){} document.body.removeChild(ta);
+    }
+  });
+});
+</script>
+</body>
+</html>

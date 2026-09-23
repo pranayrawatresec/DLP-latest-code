@@ -15,6 +15,20 @@
 /dlp-minifilter/build/out/*.pdb
 /dlp-minifilter/build/out/*.cat
 /dlp-minifilter/build/out/*.nativecodeanalysis.xml
+/dlp-minifilter/build/out/*.res
+# Microsoft-signed packages downloaded from Partner Center. Release artefacts,
+# archived per release outside the repo; build/submissions/*.txt records their
+# hashes so provenance stays in git without the binaries.
+/signed_from_microsoft/
+# Attestation submission staging (tools/make-submission.ps1). The CAB and its
+# makecab byproducts are per-release artefacts, not source. The Microsoft-signed
+# package that comes back should be archived outside the repo, per release.
+/dlp-minifilter/build/submission/
+# makecab drops these beside wherever it is run; two stale copies from an Aug
+# 2026 attempt ended up in the repo root.
+/setup.inf
+/setup.rpt
+*.cab
 # ML model artefacts — hundreds of MB each (final.pt ~800 MB, model/encoder.onnx
 # ~270 MB), over GitHub's 100 MB limit and never source. Staged onto endpoints by
 # scripts/stage-ml-model.ps1 from the release package.

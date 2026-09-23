@@ -37,21 +37,36 @@ that lets you *submit* the driver to Microsoft for signing. Two routes:
 
 ## Per-release signing (attestation)
 
+Steps 1–2 are automated by **`tools\make-submission.ps1`**, which enforces the
+load-bearing order (build → embed-sign → stampinf → Inf2Cat → makecab) and
+refuses to finish if the catalog is missing from the CAB.
+
 1. Build the release driver: `build\build-driver.bat` → `build\out\dlpflt.sys`.
-2. Create the CAB containing `dlpflt.sys` + `dlpflt.inf` (and a generated
-   `dlpflt.cat` placeholder) per the Partner Center attestation layout.
-3. **EV-sign the CAB** with the code-signing cert
-   (`signtool sign /fd sha256 /a /n "<Company>" /tr <RFC3161-TSA> /td sha256 dlpflt.cab`).
-   Modern alternative: **Azure Trusted Signing** (`Trusted Signing` account +
-   `signtool` with the dlib), which avoids holding an HSM token.
-4. Upload the signed CAB to Partner Center → **Hardware → Submit new driver**,
-   target the Windows versions you support, choose **attestation**.
-5. Download the **Microsoft-signed** package. The returned `dlpflt.cat` is the
-   Microsoft-signed catalog; ship it alongside the (unchanged) `dlpflt.sys` and
-   `dlpflt.inf`.
+2. `powershell -File tools\make-submission.ps1 -Version <x.y.z.w> -EmbedSign`
+   → `build\submission\dlpflt.cab`. `-EmbedSign` adds the EV signature to
+   `dlpflt.sys` itself (prompts for the token PIN once); omit it for throwaway
+   trial submissions.
+3. **EV-sign the CAB** with the code-signing cert. The script prints the exact
+   command. Type the PIN by hand — never script it (the eToken locks
+   permanently after repeated wrong PINs) and never put it on a command line.
+4. Upload the signed CAB to Partner Center → **Hardware → Submit new hardware**.
+   Uploading a CAB (rather than an HLKX) routes it to attestation automatically.
+   The page prints *"Leave all checkboxes blank for Attestation Signing"* but
+   then **requires at least one OS on upload** — select the **x64 client entries
+   from 1607 onward** only. Not ARM64 (no binary), not x86, not 1506/1511 (TH2),
+   and leave "Perform test-signing" unchecked.
+5. Download the **Microsoft-signed** package. Microsoft signs **both** the
+   catalog and the binary: `dlpflt.cat` is replaced, and `dlpflt.sys` comes back
+   **larger** with an embedded signature (measured 2026-09-23: 39,424 → 49,888
+   bytes). Only `dlpflt.inf` returns byte-identical — that is the one to
+   hash-check against what you submitted.
 6. **Verify** on a clean, test-signing-OFF machine:
-   `signtool verify /v /kp /c dlpflt.cat dlpflt.sys` should show the Microsoft
-   signature, and `fltmc load dlpflt` should succeed **without** `bcdedit`.
+   `signtool verify /v /kp dlpflt.sys` and
+   `signtool verify /v /kp /c dlpflt.cat dlpflt.sys` must both name
+   *Microsoft Windows Hardware Compatibility Publisher*, and `fltmc load dlpflt`
+   must succeed **without** `bcdedit`.
+7. Record the submission in `build\submissions\dlpflt-<version>.txt` (cert used,
+   file hashes submitted and returned, deviations from production).
 
 ## Packaging hand-off
 
@@ -72,7 +87,26 @@ and no reboot-to-enable).
 
 ## Status
 
-External (cert purchase + Partner Center). The test-signing pipeline
-(`make-testcert.ps1` / `sign-driver.ps1`) stays for lab/VM use; this runbook is
-the production path. Nothing in the codebase blocks it — it is a release/ops
-action, gated on the EV cert and Partner Center enrolment.
+**Proven end to end, 2026-09-23.** A GlobalSign EV certificate
+(`CN=RESEC SYSTEMS PRIVATE LIMITED`, SafeNet eToken) is in hand, Partner Center
+is enrolled, and submission `dlpflt 1.0.0.1` came back Microsoft-signed and was
+verified loading on the test VM with **test signing off** — driver attached,
+agent connected to `\DlpFltPort`, `kguard scan decide` and incident reporting
+live. Round trip is ~20 minutes. See `driver-ev-signing-guide.html` at the repo
+root for the full walkthrough and `build\submissions\` for per-release records.
+
+The test-signing pipeline (`make-testcert.ps1` / `sign-driver.ps1`) stays for
+lab/VM use.
+
+### Still open before shipping to a customer
+
+- **Microsoft-assigned altitude.** `[Strings] Altitude` is still the dev
+  placeholder `265000`. Request via `fsfcomm@microsoft.com`; this is the last
+  blocker and has days of lead time.
+- **Windows Server.** Attestation covers Windows 10 1607+ / Windows 11 **client**
+  only. Any Server deployment needs full WHQL/HLK — a much larger project.
+  Confirm against customer contracts.
+- **Embedded-signature survival.** Unknown whether Microsoft preserves a
+  pre-existing EV signature on `dlpflt.sys` as a secondary signature or replaces
+  it. Check `signtool verify /all /pa` on the next `-EmbedSign` submission.
+- **HVCI / Memory Integrity** compatibility is untested.

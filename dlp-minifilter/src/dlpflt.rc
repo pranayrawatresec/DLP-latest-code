@@ -1,0 +1,56 @@
+/* -------------------------------------------------------------------------- *
+ *  dlpflt.rc -- version resource for the DLP minifilter.
+ *
+ *  Without this, dlpflt.sys has no VERSIONINFO at all: Properties -> Details is
+ *  blank, and Process Explorer / EDR consoles show no company or product for a
+ *  driver sitting in the customer's kernel. For a product sold to defence and
+ *  critical-infrastructure customers, an unattributed kernel module is
+ *  something their own security team is right to flag.
+ *
+ *  Keep FILEVERSION in step with the DriverVer stamped by
+ *  tools\make-submission.ps1 -Version, and with [Version] DriverVer in
+ *  dlpflt.inf. Three places, one number.
+ *
+ *  Compiled by build\build-driver.bat (rc.exe -> dlpflt.res -> linked in).
+ * -------------------------------------------------------------------------- */
+
+#include <winver.h>
+
+#define DLP_VER_MAJOR       1
+#define DLP_VER_MINOR       0
+#define DLP_VER_BUILD       1
+#define DLP_VER_REVISION    0
+#define DLP_VER_STR         "1.0.1.0"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    DLP_VER_MAJOR,DLP_VER_MINOR,DLP_VER_BUILD,DLP_VER_REVISION
+ PRODUCTVERSION DLP_VER_MAJOR,DLP_VER_MINOR,DLP_VER_BUILD,DLP_VER_REVISION
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DRV
+ FILESUBTYPE    VFT2_DRV_SYSTEM
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"                /* US English, Unicode */
+        BEGIN
+            VALUE "CompanyName",      "Resec Systems Private Limited"
+            VALUE "FileDescription",  "DLP Removable-Media Content Screener"
+            VALUE "FileVersion",      DLP_VER_STR
+            VALUE "InternalName",     "dlpflt.sys"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Resec Systems Private Limited"
+            VALUE "OriginalFilename", "dlpflt.sys"
+            VALUE "ProductName",      "Resec DLP Endpoint"
+            VALUE "ProductVersion",   DLP_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

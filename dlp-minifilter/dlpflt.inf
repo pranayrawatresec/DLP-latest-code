@@ -44,7 +44,20 @@ Description    = %ServiceDesc%
 ServiceBinary  = %12%\%DriverName%.sys        ; %windir%\System32\drivers\dlpflt.sys
 Dependencies   = "FltMgr"
 ServiceType    = 2                            ; SERVICE_FILE_SYSTEM_DRIVER
-StartType      = 3                            ; SERVICE_DEMAND_START (fltmc/manual)
+; SERVICE_SYSTEM_START -- load during kernel init, NOT on demand.
+;
+; This was SERVICE_DEMAND_START (3). Nothing ever loaded the filter at boot:
+; the agent never calls FilterLoad, and only packaging\install-endpoint.ps1 runs
+; `fltmc load`, once, at install time. Measured on the test VM 2026-09-23, that
+; left 7m45s between boot and a manual `fltmc load` with NO kernel enforcement,
+; the agent spinning on ~298 "guard ended (driver not loaded?)" retries. That
+; fails OPEN and contradicts the fail-secure rule in CLAUDE.md.
+;
+; Safe at system start: DlpInstanceSetup attaches to removable volumes only, and
+; refuses fixed/system volumes entirely unless ScanFixed + a non-empty watch-set
+; are configured -- so an early load cannot touch the boot volume. ErrorControl
+; stays NORMAL, so a load failure warns and boot continues.
+StartType      = 1                            ; SERVICE_SYSTEM_START
 ErrorControl   = 1                            ; SERVICE_ERROR_NORMAL
 LoadOrderGroup = "FSFilter Content Screener"
 AddReg         = DlpFlt.AddRegistry
@@ -92,7 +105,10 @@ DelService = %ServiceName%,0x200            ; SPSVCINST_STOPSERVICE
 ;;
 
 [Strings]
-ProviderName    = "On-Premise DLP"
+; Shown as the driver package Provider in the driver store, pnputil and setup
+; UI. Must be the company, not a product codename -- a customer auditing what is
+; in their kernel should see who publishes it.
+ProviderName    = "Resec Systems Private Limited"
 ServiceName     = "dlpflt"
 ServiceDesc     = "DLP Removable-Media Content Screener"
 DriverName      = "dlpflt"
