@@ -39,6 +39,8 @@ pub struct ReadDenyPolicy {
     /// default; an old/partial server response (field absent) is `false`.
     #[serde(default, rename = "denyRemoteSessions")]
     pub deny_remote_sessions: bool,
+    #[serde(default, rename = "bluetoothMode")]
+    pub bluetooth_mode: crate::bluetooth::Mode,
 }
 
 fn default_mode() -> String {
@@ -61,6 +63,7 @@ impl Default for ReadDenyPolicy {
             fail_block: false,
             readers_authority: "merge".into(),
             deny_remote_sessions: false,
+            bluetooth_mode: crate::bluetooth::Mode::Off,
         }
     }
 }
@@ -114,6 +117,7 @@ impl Config {
         // process in an RDP session into the untrusted set (strict / token model),
         // so their sensitive reads are denied and any copy-out fails at the source.
         merged.kguard.deny_remote_sessions = p.deny_remote_sessions;
+        merged.kguard.bluetooth_mode = p.bluetooth_mode;
         merged
     }
 }
@@ -130,7 +134,7 @@ impl Config {
 /// Best-effort: each step logs on failure and the guard still runs.
 #[cfg(windows)]
 pub fn apply_to_driver(p: &ReadDenyPolicy) {
-    write_driver_knobs(p.driver_mode(), p.fail_block);
+    write_driver_knobs(p.driver_mode(), p.fail_block, p.bluetooth_mode.wire());
     // Persist the fixed-volume scope so the driver can seed it at boot and attach
     // C: at mount time (before the agent is up) — otherwise a reboot leaves fixed
     // volumes unwatched until the guard reconnects (audit item #8). The runtime
@@ -144,7 +148,7 @@ pub fn apply_to_driver(_p: &ReadDenyPolicy) {}
 /// Write the driver's read-deny registry DWORDs (read at driver load; the running
 /// mode is also set live via the config message). Replaces the manual `reg add`.
 #[cfg(windows)]
-fn write_driver_knobs(mode: u32, fail_block: bool) {
+fn write_driver_knobs(mode: u32, fail_block: bool, bluetooth_mode: u32) {
     use windows::core::w;
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_DWORD};
@@ -165,6 +169,7 @@ fn write_driver_knobs(mode: u32, fail_block: bool) {
             tracing::warn!(rc = rc.0, "could not write a read-deny driver knob (needs SYSTEM/elevated)");
         }
     };
+    set(w!("BluetoothMode"), bluetooth_mode);
     set(w!("ExfilReadBlockEnabled"), mode);
     set(w!("ExfilReadFailBlock"), if fail_block { 1 } else { 0 });
     tracing::info!(mode, fail_block, "applied read-deny driver knobs from console policy");

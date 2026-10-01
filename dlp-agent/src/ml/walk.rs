@@ -87,6 +87,7 @@ use serde::{Deserialize, Serialize};
 
 use super::cache::{self, VerdictCache};
 use super::filter::{self, FilterConfig};
+use super::frontier::{self, Frontier, SpillState};
 use super::queue;
 use super::watch::{
     now_ms, post_read_outcome, pre_read_decision, ClassifyJob, ClassifySink, QueueSink, SweepFlags,
@@ -111,16 +112,23 @@ pub const DEFAULT_FILES_PER_MINUTE: u32 = 120;
 /// without stalling on the very next file, while still averaging the budget.
 pub const DEFAULT_BURST: u32 = 20;
 
-/// Persist the cursor every this many processed candidates. Small enough that a
-/// crash loses minutes of work, large enough that the checkpoint write is not
-/// itself a workload.
+/// Persist the cursor every this many units of work — a candidate file looked
+/// at OR a directory listed. Small enough that a crash loses minutes of work,
+/// large enough that the checkpoint write is not itself a workload. Directories
+/// count because on a wide, document-poor estate they are the only work there
+/// is, and a sweep that never checkpoints cannot be resumed.
 pub const DEFAULT_CHECKPOINT_EVERY: u64 = 200;
 
-/// Cap on the number of pending directories written into a checkpoint. Beyond
-/// this the checkpoint records "restart this scope" instead of a partial list —
-/// a truncated list would silently drop directories from the sweep, and a sweep
-/// that claims completion it did not achieve is the one failure mode this whole
-/// module exists to prevent. Re-walking a scope is cheap (a hash per known file).
+/// Cap on the number of pending directories held IN MEMORY. The rest of the
+/// queue goes to a sidecar file (see [`super::frontier`]) and is read back as
+/// the head drains, so this is a true memory bound — about 700 kB of paths —
+/// and not, as it once was, a cap on what the checkpoint was willing to
+/// persist. That older meaning made the number a trap: a breadth-first walk of
+/// `C:\Users` peaks at ~12 600 pending directories on a real profile, so the
+/// list never fit, every checkpoint recorded "restart this scope", and no
+/// restart ever resumed a sweep. Directories are never dropped either way — a
+/// sweep that claims completion it did not achieve is the one failure mode this
+/// whole module exists to prevent.
 pub const DEFAULT_MAX_PENDING_DIRS: usize = 4_096;
 
 /// Pause the sweep while the classifier queue is at least this deep.
@@ -354,6 +362,30 @@ pub struct WalkStats {
     pub checkpoints: AtomicU64,
     /// Cursors discarded as unreadable/stale — a sweep restarted from zero.
     pub checkpoints_discarded: AtomicU64,
+    /// Deepest the pending-directory queue reached, memory and sidecar
+    /// together. The number that says whether the memory cap is doing work.
+    pub dirs_pending_max: AtomicU64,
+    /// Pending directories written to the sidecar rather than held in memory.
+    pub dirs_spilled: AtomicU64,
+}
+
+/// The pending-directory queue at a moment in time — see
+/// [`Walker::pending_dirs`] and [`super::frontier`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PendingDirs {
+    /// Directories still to visit, in memory and sidecar together.
+    pub total: usize,
+    /// Of those, the ones held in memory (bounded by `max_pending_dirs`).
+    pub in_memory: usize,
+    /// Of those, the ones parked in the sidecar file.
+    pub on_disk: u64,
+    /// Deepest `total` has been during this sweep.
+    pub high_water: usize,
+    /// Entries written to the sidecar during this sweep.
+    pub spilled: u64,
+    /// The sidecar failed: the queue is memory-only and a restart will re-walk
+    /// the current scope.
+    pub degraded: bool,
 }
 
 /// Point-in-time copy of [`WalkStats`].
@@ -374,6 +406,8 @@ pub struct WalkStatsSnapshot {
     pub overflow_sweeps: u64,
     pub checkpoints: u64,
     pub checkpoints_discarded: u64,
+    pub dirs_pending_max: u64,
+    pub dirs_spilled: u64,
 }
 
 impl WalkStats {
@@ -395,6 +429,8 @@ impl WalkStats {
             overflow_sweeps: g(&self.overflow_sweeps),
             checkpoints: g(&self.checkpoints),
             checkpoints_discarded: g(&self.checkpoints_discarded),
+            dirs_pending_max: g(&self.dirs_pending_max),
+            dirs_spilled: g(&self.dirs_spilled),
         }
     }
 }
@@ -430,12 +466,17 @@ pub struct WalkCheckpoint {
     pub scopes_pending: Vec<PathBuf>,
     /// The scope being walked.
     pub current_scope: Option<PathBuf>,
-    /// Directories still to visit in the current scope. Empty together with
-    /// `pending_truncated` ⇒ restart the current scope.
+    /// The head of the pending-directory queue for the current scope. Empty
+    /// together with `pending_truncated` ⇒ restart the current scope.
     pub pending_dirs: Vec<PathBuf>,
-    /// The pending list exceeded [`WalkConfig::max_pending_dirs`] and was NOT
-    /// persisted; resume restarts the current scope instead of silently
-    /// dropping directories.
+    /// The rest of the queue, in the sweep's sidecar file. Read back on resume;
+    /// a sidecar shorter than `spill.len` means the tail was lost to a crash,
+    /// and the scope restarts rather than skipping those directories.
+    #[serde(default)]
+    pub spill: SpillState,
+    /// The pending list could not be persisted (the sidecar failed and the
+    /// in-memory queue outgrew [`WalkConfig::max_pending_dirs`]); resume
+    /// restarts the current scope instead of silently dropping directories.
     pub pending_truncated: bool,
     /// Last directory listed. Reporting/diagnostics.
     pub last_dir: Option<PathBuf>,
@@ -683,7 +724,9 @@ struct Cursor {
     scopes_all: Vec<PathBuf>,
     scopes_pending: VecDeque<PathBuf>,
     current_scope: Option<PathBuf>,
-    dirs: VecDeque<PathBuf>,
+    /// Directories still to visit. Breadth-first, bounded in memory, tail on
+    /// disk — see [`super::frontier`].
+    dirs: Frontier,
     files: VecDeque<PathBuf>,
     last_dir: Option<PathBuf>,
     counts: SweepCounts,
@@ -790,8 +833,40 @@ impl Walker {
         load_completion(&self.cfg.state_dir)
     }
 
+    /// The pending-directory queue RIGHT NOW. What the sweep still owes, and
+    /// what holding it is costing; the stats copy is only published when a
+    /// sweep ends, and a sweep that is misbehaving is one that has not ended.
+    pub fn pending_dirs(&self) -> PendingDirs {
+        let st = self.lock();
+        PendingDirs {
+            total: st.cursor.dirs.len(),
+            in_memory: st.cursor.dirs.memory_len(),
+            on_disk: st.cursor.dirs.spill_state().count,
+            high_water: st.cursor.dirs.high_water(),
+            spilled: st.cursor.dirs.spilled(),
+            degraded: st.cursor.dirs.is_degraded(),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, WalkState> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// An empty pending-directory queue for sweep `seq`, seeded with `seed`.
+    /// Removes any sidecar left behind by an abandoned sweep: one sweep's tail
+    /// is not evidence about another's.
+    fn fresh_frontier(
+        &self,
+        seq: u64,
+        seed: impl Iterator<Item = PathBuf>,
+    ) -> Frontier {
+        let path = frontier::spill_path(&self.cfg.state_dir, seq);
+        frontier::remove_other_spills(&self.cfg.state_dir, &path);
+        let mut f = Frontier::new(self.cfg.max_pending_dirs, path);
+        for dir in seed {
+            f.push_back(dir);
+        }
+        f
     }
 
     // -----------------------------------------------------------------------
@@ -824,12 +899,35 @@ impl Walker {
         let mut st = self.lock();
         match resumed {
             Some(cp) => {
-                let dirs: VecDeque<PathBuf> = if cp.pending_truncated {
-                    // The list was too long to persist: restart the current
+                let spill = frontier::spill_path(&self.cfg.state_dir, cp.sweep_seq);
+                // Sidecars from sweeps that never finished are not ours.
+                frontier::remove_other_spills(&self.cfg.state_dir, &spill);
+                let dirs = if cp.pending_truncated {
+                    // The queue could not be persisted: restart the current
                     // scope rather than silently dropping directories.
-                    cp.current_scope.clone().into_iter().collect()
+                    self.fresh_frontier(cp.sweep_seq, cp.current_scope.clone().into_iter())
                 } else {
-                    cp.pending_dirs.iter().cloned().collect()
+                    match Frontier::restore(
+                        self.cfg.max_pending_dirs,
+                        spill,
+                        cp.pending_dirs.clone(),
+                        cp.spill,
+                    ) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            // The tail is gone, so the queue is not the queue
+                            // the checkpoint described. Restarting the scope is
+                            // the only answer that cannot under-report coverage.
+                            tracing::warn!(
+                                error = %e,
+                                "ml walker: pending-directory sidecar unusable — restarting the current scope"
+                            );
+                            self.fresh_frontier(
+                                cp.sweep_seq,
+                                cp.current_scope.clone().into_iter(),
+                            )
+                        }
+                    }
                 };
                 st.cursor = Cursor {
                     active: true,
@@ -866,6 +964,7 @@ impl Walker {
                     started_at: unix_now(),
                     scopes_all: self.cfg.scopes.clone(),
                     scopes_pending: self.cfg.scopes.iter().cloned().collect(),
+                    dirs: self.fresh_frontier(seq, std::iter::empty()),
                     ..Cursor::default()
                 };
                 tracing::info!(
@@ -895,6 +994,7 @@ impl Walker {
             started_at: unix_now(),
             scopes_all: self.cfg.scopes.clone(),
             scopes_pending: scopes.iter().cloned().collect(),
+            dirs: self.fresh_frontier(seq, std::iter::empty()),
             ..Cursor::default()
         };
         self.stats.overflow_sweeps.fetch_add(1, Ordering::Relaxed);
@@ -955,6 +1055,12 @@ impl Walker {
                 for f in listing.files {
                     st.cursor.files.push_back(f);
                 }
+                // Listing a directory is work, and on a wide, document-poor
+                // estate it can be ALL the work for a long stretch: a probe of
+                // `C:\Users` walked 22 471 directories and, when the counter
+                // only advanced on files, wrote not one checkpoint in the whole
+                // sweep. A restart in that window lost every bit of the descent.
+                st.cursor.since_checkpoint += 1;
                 drop(st);
                 self.stats.dirs.fetch_add(1, Ordering::Relaxed);
                 self.stats.skipped.fetch_add(listing.skipped, Ordering::Relaxed);
@@ -1238,7 +1344,7 @@ impl Walker {
                 return;
             }
             st.cursor.since_checkpoint = 0;
-            self.checkpoint_of(&st.cursor)
+            self.checkpoint_of(&mut st.cursor)
         };
         self.write_checkpoint(&cp);
     }
@@ -1251,7 +1357,7 @@ impl Walker {
                 return false;
             }
             st.cursor.since_checkpoint = 0;
-            self.checkpoint_of(&st.cursor)
+            self.checkpoint_of(&mut st.cursor)
         };
         self.write_checkpoint(&cp)
     }
@@ -1270,20 +1376,38 @@ impl Walker {
         }
     }
 
-    fn checkpoint_of(&self, c: &Cursor) -> WalkCheckpoint {
+    fn checkpoint_of(&self, c: &mut Cursor) -> WalkCheckpoint {
+        // The tail on disk has to be durable BEFORE the checkpoint that points
+        // at it, or a power cut leaves a bookmark past the end of the file. One
+        // small `sync_data` per checkpoint (~100 s apart), and the only I/O this
+        // module does under the lock.
+        let spill = match c.dirs.flush() {
+            Ok(()) => c.dirs.spill_state(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ml walker: could not flush the pending-directory sidecar"
+                );
+                SpillState::default()
+            }
+        };
+
         // Files still pending in the directory we are inside are NOT persisted;
         // instead that directory goes back on the front of the queue, so a resume
         // re-lists it. The files already done cost one hash each the second time
         // (they are cached), which is the cheap direction.
-        let mut dirs: Vec<PathBuf> = Vec::with_capacity(c.dirs.len() + 1);
+        let mut dirs: Vec<PathBuf> = Vec::with_capacity(c.dirs.memory_len() + 1);
         if !c.files.is_empty() {
             if let Some(d) = c.last_dir.clone() {
                 dirs.push(d);
             }
         }
-        dirs.extend(c.dirs.iter().cloned());
+        dirs.extend(c.dirs.memory().cloned());
 
-        let truncated = dirs.len() > self.cfg.max_pending_dirs;
+        // Only reachable in degraded mode: with a working sidecar the in-memory
+        // head is capped, so the list always fits.
+        let truncated = (spill.is_empty() && c.dirs.len() > dirs.len())
+            || dirs.len() > self.cfg.max_pending_dirs + 1;
         WalkCheckpoint {
             version: CHECKPOINT_VERSION,
             sweep_seq: c.sweep_seq,
@@ -1294,6 +1418,7 @@ impl Walker {
             scopes_pending: c.scopes_pending.iter().cloned().collect(),
             current_scope: c.current_scope.clone(),
             pending_dirs: if truncated { Vec::new() } else { dirs },
+            spill: if truncated { SpillState::default() } else { spill },
             pending_truncated: truncated,
             last_dir: c.last_dir.clone(),
             counts: c.counts,
@@ -1305,6 +1430,14 @@ impl Walker {
         let (full, completion) = {
             let mut st = self.lock();
             st.cursor.active = false;
+            // Record what the queue cost before dropping it and its sidecar.
+            self.stats
+                .dirs_pending_max
+                .fetch_max(st.cursor.dirs.high_water() as u64, Ordering::Relaxed);
+            self.stats
+                .dirs_spilled
+                .fetch_add(st.cursor.dirs.spilled(), Ordering::Relaxed);
+            st.cursor.dirs.clear();
             let c = &st.cursor;
             let completed_at = unix_now();
             let completion = SweepCompletion {

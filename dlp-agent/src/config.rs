@@ -345,6 +345,9 @@ pub struct KguardConfig {
     /// [`Config::with_read_deny_policy`]; `agent.toml` cannot set it.
     #[serde(skip)]
     pub deny_remote_sessions: bool,
+    /// Independent Windows Bluetooth transfer enforcement.
+    #[serde(default)]
+    pub bluetooth_mode: crate::bluetooth::Mode,
 }
 
 impl Default for KguardConfig {
@@ -363,6 +366,7 @@ impl Default for KguardConfig {
             exfil_posture: ExfilPosture::Blocklist,
             readers_central: false,
             deny_remote_sessions: false,
+            bluetooth_mode: crate::bluetooth::Mode::Off,
         }
     }
 }

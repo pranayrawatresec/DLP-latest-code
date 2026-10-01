@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod decrypt;
 pub mod detect;
 pub mod exfil;
+pub mod bluetooth;
 pub mod livebundle;
 pub mod netfilter;
 pub mod notify;

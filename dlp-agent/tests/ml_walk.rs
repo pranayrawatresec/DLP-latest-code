@@ -422,6 +422,7 @@ fn sample_checkpoint(root: &Path) -> WalkCheckpoint {
         scopes_pending: vec![],
         current_scope: Some(root.to_path_buf()),
         pending_dirs: vec![root.join("docs"), root.join("docs/deep")],
+        spill: Default::default(),
         pending_truncated: false,
         last_dir: Some(root.join("docs")),
         counts: Default::default(),
@@ -897,4 +898,137 @@ fn outcomes_are_the_watchers_vocabulary() {
     let inert: WatchOutcome = WatchOutcome::Inert;
     assert_eq!(inert, WatchOutcome::Inert);
     assert_ne!(WatchOutcome::Enqueued, WatchOutcome::Refused);
+}
+
+// ===========================================================================
+// A queue wider than memory
+// ===========================================================================
+
+/// `n` sibling directories, each holding one document. Breadth-first, the whole
+/// level sits in the pending queue at once — which is the shape that used to
+/// overflow the checkpoint on a real profile (`C:\Users` peaks at ~12 600
+/// pending directories against a cap of 4 096).
+fn build_wide_tree(root: &Path, state: &Path, n: usize) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for i in 0..n {
+        let name = format!("doc{i:04}.txt");
+        write(
+            root,
+            &format!("wide/dir{i:04}/{name}"),
+            format!("quarterly finance report number {i}").as_bytes(),
+        );
+        names.insert(name);
+    }
+    std::fs::create_dir_all(state).unwrap();
+    names
+}
+
+#[test]
+fn a_queue_wider_than_the_memory_cap_still_covers_every_file() {
+    let _g = policy_guard();
+    live_policy();
+    let root = temp_root("widecover");
+    let state = root.join("agent-state");
+    let expected = build_wide_tree(&root, &state, 120);
+
+    let cache = Arc::new(VerdictCache::open(&state, 4096).unwrap());
+    let sink = RecordingSink::new(Arc::clone(&cache), false);
+    let mut c = cfg(&root, &state);
+    c.max_pending_dirs = 4; // force the queue onto disk almost immediately
+    let w = Walker::new(c, cache, sink.clone());
+
+    w.begin_full_sweep();
+    assert_eq!(drive(&w), StepStatus::Completed, "the sweep must finish");
+
+    assert_eq!(
+        sink.names(),
+        expected,
+        "spilling the queue to disk must not lose a single directory"
+    );
+    let stats = w.stats().snapshot();
+    assert!(
+        stats.dirs_spilled > 0,
+        "a 120-wide level against a cap of 4 must have spilled"
+    );
+    assert!(
+        stats.dirs_pending_max > 4,
+        "the queue really did grow past the memory cap (max was {})",
+        stats.dirs_pending_max
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_restart_resumes_a_wide_sweep_instead_of_starting_it_over() {
+    let _g = policy_guard();
+    live_policy();
+    let root = temp_root("wideresume");
+    let state = root.join("agent-state");
+    let expected = build_wide_tree(&root, &state, 120);
+
+    // Depositing the verdict is what the background worker does; it makes a
+    // re-listed file a cache hit, so "enqueued twice" is observable.
+    let cache = Arc::new(VerdictCache::open(&state, 4096).unwrap());
+    let sink_a = RecordingSink::new(Arc::clone(&cache), true);
+    let mut c = cfg(&root, &state);
+    c.max_pending_dirs = 4;
+    let w1 = Walker::new(c.clone(), Arc::clone(&cache), sink_a.clone());
+
+    // Interrupt part-way: enough steps to be deep into the wide level.
+    w1.begin_full_sweep();
+    let mut t = 0u64;
+    for _ in 0..80 {
+        t += 10;
+        if w1.step(t) == StepStatus::Completed {
+            panic!("the tree must be big enough to interrupt");
+        }
+    }
+    assert!(w1.checkpoint_now(), "a running sweep must checkpoint");
+    let dirs_before = w1.counts().dirs;
+    drop(w1);
+
+    // THE REGRESSION: the pending queue has to survive the restart. Before the
+    // sidecar, a queue this wide was written away empty with `truncated`, and
+    // the resume below would re-walk the scope from zero.
+    let cp = load_checkpoint(&state).expect("a checkpoint must be on disk");
+    assert!(
+        !cp.pending_truncated,
+        "the pending queue must be persisted, not discarded"
+    );
+    assert!(
+        cp.spill.count > 0,
+        "the part of the queue that did not fit in memory must be on disk"
+    );
+    assert!(
+        cp.pending_dirs.len() <= 5,
+        "only the in-memory head belongs in the checkpoint file, got {}",
+        cp.pending_dirs.len()
+    );
+
+    // Restart the agent over the same state directory.
+    let sink_b = RecordingSink::new(Arc::clone(&cache), true);
+    let w2 = Walker::new(c, cache, sink_b.clone());
+    w2.begin_full_sweep();
+    assert!(
+        w2.counts().dirs >= dirs_before,
+        "the resumed sweep must carry the earlier sweep's progress, not reset it"
+    );
+    assert_eq!(drive(&w2), StepStatus::Completed, "the sweep must finish");
+
+    let mut covered = sink_a.names();
+    covered.extend(sink_b.names());
+    assert_eq!(covered, expected, "every document must be classified once");
+    assert_eq!(
+        sink_a.len() + sink_b.len(),
+        expected.len(),
+        "a resumed sweep must not re-offer work the interrupted one finished"
+    );
+    assert!(
+        w2.stats().snapshot().dirs < 120,
+        "the resume re-listed the whole tree: {} directories",
+        w2.stats().snapshot().dirs
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

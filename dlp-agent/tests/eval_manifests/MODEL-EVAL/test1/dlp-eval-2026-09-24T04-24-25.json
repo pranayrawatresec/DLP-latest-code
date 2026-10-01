@@ -1,0 +1,836 @@
+{
+  "ok": true,
+  "total_cases": 46,
+  "passed": 26,
+  "accuracy": 0.5652173913043478,
+  "macro_f1": 0.5080459770114942,
+  "total_latency_ms": 12703.1289,
+  "throughput_docs_per_sec": 3.6211550998274133,
+  "latency": {
+    "p50": 263.56669999999997,
+    "p95": 342.05404999999996,
+    "p99": 391.5488049999999,
+    "min": 196.06580000000002,
+    "max": 403.4581,
+    "mean": 276.14524347826085
+  },
+  "label_metrics": [
+    {
+      "id": "SPC",
+      "name": "Space & Satellite Systems",
+      "domain": "defence",
+      "support": 4,
+      "tp": 1,
+      "fp": 1,
+      "fn_count": 3,
+      "precision": 0.5,
+      "recall": 0.25,
+      "f1": 0.3333333333333333
+    },
+    {
+      "id": "INT",
+      "name": "Intelligence & Threat Assessment",
+      "domain": "defence",
+      "support": 3,
+      "tp": 3,
+      "fp": 3,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "NUC",
+      "name": "Nuclear & Strategic Systems",
+      "domain": "defence",
+      "support": 3,
+      "tp": 2,
+      "fp": 1,
+      "fn_count": 1,
+      "precision": 0.6666666666666666,
+      "recall": 0.6666666666666666,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "WPN",
+      "name": "Weapons & Armament",
+      "domain": "defence",
+      "support": 3,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 2,
+      "precision": 1,
+      "recall": 0.3333333333333333,
+      "f1": 0.5
+    },
+    {
+      "id": "SIG",
+      "name": "Signals & Communications",
+      "domain": "defence",
+      "support": 2,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 2,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "DIP",
+      "name": "Defence Diplomacy & Border Affairs",
+      "domain": "defence",
+      "support": 2,
+      "tp": 2,
+      "fp": 2,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "NAV",
+      "name": "Naval & Maritime Systems",
+      "domain": "defence",
+      "support": 2,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 1,
+      "recall": 0.5,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "PUB",
+      "name": "Public Information",
+      "domain": "general",
+      "support": 2,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 1,
+      "recall": 0.5,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "AVI",
+      "name": "Aviation & Air Systems",
+      "domain": "defence",
+      "support": 2,
+      "tp": 2,
+      "fp": 2,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "POL",
+      "name": "Policies",
+      "domain": "general",
+      "support": 2,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 1,
+      "recall": 0.5,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "OOD",
+      "name": "Other / Unknown",
+      "domain": "general",
+      "support": 2,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 1,
+      "recall": 0.5,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "CYB",
+      "name": "Cyber Defence",
+      "domain": "defence",
+      "support": 2,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 2,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "ACQ",
+      "name": "Defence Acquisition & Procurement",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "OPS",
+      "name": "Planning & Operations",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 1,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "MNT",
+      "name": "Maintenance & Engineering",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 3,
+      "fn_count": 0,
+      "precision": 0.25,
+      "recall": 1,
+      "f1": 0.4
+    },
+    {
+      "id": "INS",
+      "name": "Inspection",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 2,
+      "fn_count": 0,
+      "precision": 0.3333333333333333,
+      "recall": 1,
+      "f1": 0.5
+    },
+    {
+      "id": "GOV",
+      "name": "Government Reporting",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 1,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "STU",
+      "name": "Student Records",
+      "domain": "education",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "EXM",
+      "name": "Examination",
+      "domain": "education",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "MED",
+      "name": "Medical",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "TCH",
+      "name": "Teacher Records",
+      "domain": "education",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "LEG",
+      "name": "Legal",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "ADM",
+      "name": "Administration",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 1,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "FIN",
+      "name": "Finance",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "COM",
+      "name": "Communication",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 1,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "PER",
+      "name": "Personnel & Service Records",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 1,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "LOG",
+      "name": "Defence Logistics & Supply",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 1,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "TRN",
+      "name": "Military Training & Doctrine",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "ANA",
+      "name": "Analytics",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    }
+  ],
+  "top_errors": [
+    {
+      "expected": "SPC",
+      "predicted": "NUC",
+      "count": 1
+    },
+    {
+      "expected": "STU",
+      "predicted": "PER",
+      "count": 1
+    },
+    {
+      "expected": "NUC",
+      "predicted": "LOG",
+      "count": 1
+    },
+    {
+      "expected": "FIN",
+      "predicted": "GOV",
+      "count": 1
+    },
+    {
+      "expected": "COM",
+      "predicted": "DIP",
+      "count": 1
+    },
+    {
+      "expected": "POL",
+      "predicted": "DIP",
+      "count": 1
+    },
+    {
+      "expected": "SPC",
+      "predicted": "INT",
+      "count": 1
+    },
+    {
+      "expected": "SIG",
+      "predicted": "INT",
+      "count": 1
+    },
+    {
+      "expected": "ADM",
+      "predicted": "OPS",
+      "count": 1
+    },
+    {
+      "expected": "OOD",
+      "predicted": "COM",
+      "count": 1
+    }
+  ],
+  "cases": [
+    {
+      "name": "army-INT-xborder-brief",
+      "expected": "INT",
+      "predicted": "INT",
+      "confidence": 0.9956095194800921,
+      "latency_ms": 264.6706,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "raw-INT-techint-hypersonic",
+      "expected": "INT",
+      "predicted": "INT",
+      "confidence": 0.994737270173408,
+      "latency_ms": 261.0233,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "ib-INT-hawala-network",
+      "expected": "INT",
+      "predicted": "INT",
+      "confidence": 0.97994929529468,
+      "latency_ms": 196.06580000000002,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "drdo-WPN-prithvi-propellant",
+      "expected": "WPN",
+      "predicted": "MNT",
+      "confidence": 0.6253613192663554,
+      "latency_ms": 253.88529999999997,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "drdo-WPN-akash-ng-test",
+      "expected": "WPN",
+      "predicted": "AVI",
+      "confidence": 0.3957863014195635,
+      "latency_ms": 258.647,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "army-WPN-ammo-state",
+      "expected": "WPN",
+      "predicted": "WPN",
+      "confidence": 0.5691649470071553,
+      "latency_ms": 229.14419999999998,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "dae-NUC-reactor-startup",
+      "expected": "NUC",
+      "predicted": "NUC",
+      "confidence": 0.9931152227874879,
+      "latency_ms": 283.2945,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "barc-NUC-enrichment-cascade",
+      "expected": "NUC",
+      "predicted": "NUC",
+      "confidence": 0.9962337812359532,
+      "latency_ms": 266.8457,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "dae-NUC-strategic-stockpile",
+      "expected": "NUC",
+      "predicted": "LOG",
+      "confidence": 0.6734089272480256,
+      "latency_ms": 259.47209999999995,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "isro-SPC-gsat20-payload",
+      "expected": "SPC",
+      "predicted": "SPC",
+      "confidence": 0.9907941250186422,
+      "latency_ms": 264.7933,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "nrsc-SPC-cartosat-recon",
+      "expected": "SPC",
+      "predicted": "NUC",
+      "confidence": 0.5516636674934415,
+      "latency_ms": 296.0804,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "isro-SPC-cryo-engine-test",
+      "expected": "SPC",
+      "predicted": "AVI",
+      "confidence": 0.45751394520678756,
+      "latency_ms": 247.1733,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "hal-AVI-tejas-mk2-ifcs",
+      "expected": "AVI",
+      "predicted": "AVI",
+      "confidence": 0.9316240205631096,
+      "latency_ms": 242.8494,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "iaf-AVI-rafale-strike",
+      "expected": "AVI",
+      "predicted": "AVI",
+      "confidence": 0.841294530488297,
+      "latency_ms": 237.3022,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "navy-NAV-arihant-patrol",
+      "expected": "NAV",
+      "predicted": "NAV",
+      "confidence": 0.9924740156371213,
+      "latency_ms": 248.5004,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "drdo-NAV-torpedo-test",
+      "expected": "NAV",
+      "predicted": "MNT",
+      "confidence": 0.31230264708918615,
+      "latency_ms": 234.9343,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "army-SIG-sigint-weekly",
+      "expected": "SIG",
+      "predicted": "INT",
+      "confidence": 0.8596823215851174,
+      "latency_ms": 245.6996,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "drdo-SIG-ew-system-spec",
+      "expected": "SIG",
+      "predicted": "MNT",
+      "confidence": 0.8482270635475311,
+      "latency_ms": 291.6304,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "nciipc-CYB-powergrid-intrusion",
+      "expected": "CYB",
+      "predicted": "INT",
+      "confidence": 0.7709011265613105,
+      "latency_ms": 304.74780000000004,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "drdo-CYB-milnet-audit",
+      "expected": "CYB",
+      "predicted": "INS",
+      "confidence": 0.47065136173159383,
+      "latency_ms": 293.51919999999996,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "mea-DIP-india-us-dtti",
+      "expected": "DIP",
+      "predicted": "DIP",
+      "confidence": 0.9651628610236305,
+      "latency_ms": 279.3376,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mea-DIP-india-russia-s400",
+      "expected": "DIP",
+      "predicted": "DIP",
+      "confidence": 0.9934100294830642,
+      "latency_ms": 262.3255,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "army-TRN-urban-warfare-doctrine",
+      "expected": "TRN",
+      "predicted": "TRN",
+      "confidence": 0.9900913156860148,
+      "latency_ms": 256.7008,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mod-ACQ-mrfa-rfp",
+      "expected": "ACQ",
+      "predicted": "ACQ",
+      "confidence": 0.9963724281381625,
+      "latency_ms": 262.12489999999997,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "army-LOG-preposition-plan",
+      "expected": "LOG",
+      "predicted": "LOG",
+      "confidence": 0.984221100360506,
+      "latency_ms": 289.5609,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "hal-MNT-mig29-servicing",
+      "expected": "MNT",
+      "predicted": "MNT",
+      "confidence": 0.9909338100385554,
+      "latency_ms": 322.3064,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "army-OPS-corps-order",
+      "expected": "OPS",
+      "predicted": "OPS",
+      "confidence": 0.6720782305969494,
+      "latency_ms": 303.2271,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mod-GOV-annual-report",
+      "expected": "GOV",
+      "predicted": "GOV",
+      "confidence": 0.8201043894528908,
+      "latency_ms": 248.44930000000002,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mod-FIN-capital-budget",
+      "expected": "FIN",
+      "predicted": "GOV",
+      "confidence": 0.5570632013709222,
+      "latency_ms": 341.6408,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "nsa-POL-offensive-cyber",
+      "expected": "POL",
+      "predicted": "POL",
+      "confidence": 0.9958591413920549,
+      "latency_ms": 282.1162,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mod-LEG-force-majeure",
+      "expected": "LEG",
+      "predicted": "LEG",
+      "confidence": 0.9984391602204264,
+      "latency_ms": 333.5433,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "army-PER-promotion-board",
+      "expected": "PER",
+      "predicted": "PER",
+      "confidence": 0.9927782615594657,
+      "latency_ms": 248.30849999999998,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "barc-MED-radiation-dose",
+      "expected": "MED",
+      "predicted": "INS",
+      "confidence": 0.4276417836283984,
+      "latency_ms": 342.1918,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "nda-STU-academic-records",
+      "expected": "STU",
+      "predicted": "PER",
+      "confidence": 0.8630536150259572,
+      "latency_ms": 315.84279999999995,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "nda-TCH-faculty-eval",
+      "expected": "TCH",
+      "predicted": "ADM",
+      "confidence": 0.8802092255484795,
+      "latency_ms": 297.4118,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "nda-EXM-exam-paper",
+      "expected": "EXM",
+      "predicted": "EXM",
+      "confidence": 0.9946818072957154,
+      "latency_ms": 306.2527,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "drdo-ADM-programme-review",
+      "expected": "ADM",
+      "predicted": "OPS",
+      "confidence": 0.562945625141779,
+      "latency_ms": 244.8011,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "mea-COM-diplomatic-note",
+      "expected": "COM",
+      "predicted": "DIP",
+      "confidence": 0.9930451595172589,
+      "latency_ms": 230.49620000000002,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "drdo-ANA-rd-expenditure",
+      "expected": "ANA",
+      "predicted": "ANA",
+      "confidence": 0.9980854729660072,
+      "latency_ms": 338.7527,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "isro-PUB-gsat-press-release",
+      "expected": "PUB",
+      "predicted": "SPC",
+      "confidence": 0.9366992602355183,
+      "latency_ms": 262.4628,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "drdo-PUB-defexpo-brochure",
+      "expected": "PUB",
+      "predicted": "PUB",
+      "confidence": 0.26579587747440103,
+      "latency_ms": 258.9157,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "ood-canteen-menu",
+      "expected": "OOD",
+      "predicted": "OOD",
+      "confidence": 0.879743056595947,
+      "latency_ms": 224.477,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "ood-sports-day-notice",
+      "expected": "OOD",
+      "predicted": "COM",
+      "confidence": 0.5433338581706378,
+      "latency_ms": 220.00900000000001,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "drdo-INS-lab-safety-audit",
+      "expected": "INS",
+      "predicted": "INS",
+      "confidence": 0.9954603846979159,
+      "latency_ms": 403.4581,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mod-POL-nucoptions-confusion",
+      "expected": "POL",
+      "predicted": "DIP",
+      "confidence": 0.8570196830285034,
+      "latency_ms": 376.993,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "navy-SPC-spy-sat-tasking",
+      "expected": "SPC",
+      "predicted": "INT",
+      "confidence": 0.9936744098536872,
+      "latency_ms": 270.6964,
+      "correct": false,
+      "error": null
+    }
+  ],
+  "error": null
+}

@@ -165,6 +165,7 @@ export default function ReadDenyPolicy() {
         watchPaths: [...(policy.watchPaths || [])],
         readersAuthority: policy.readersAuthority || 'merge',
         denyRemoteSessions: policy.denyRemoteSessions ?? false,
+        bluetoothMode: policy.bluetoothMode || 'off',
       })
   }, [policy, selectedGroupId])
 
@@ -196,6 +197,7 @@ export default function ReadDenyPolicy() {
         watchPaths: policy.watchPaths || [],
         readersAuthority: policy.readersAuthority || 'merge',
         denyRemoteSessions: policy.denyRemoteSessions ?? false,
+        bluetoothMode: policy.bluetoothMode || 'off',
       })
 
   const addPath = (raw) => {
@@ -220,6 +222,7 @@ export default function ReadDenyPolicy() {
         failBlock: form.failBlock,
         readersAuthority: form.readersAuthority,
         denyRemoteSessions: form.denyRemoteSessions,
+        bluetoothMode: form.bluetoothMode,
       }).unwrap()
       setMsg({ kind: 'ok', text: 'Policy saved — endpoints apply it at their next check-in.' })
     } catch (e) {
@@ -433,6 +436,19 @@ export default function ReadDenyPolicy() {
               </Section>
             </>
           )}
+        </div>
+
+        <div className="px-6 pb-6">
+          <Section title="Bluetooth file transfer" desc="Protect files sent through the built-in Windows Bluetooth transfer wizard. This mode is independent of general read-deny and applies across attached source volumes.">
+            <select aria-label="Bluetooth mode" value={form.bluetoothMode} disabled={!canWrite}
+              onChange={(e) => set({ bluetoothMode: e.target.value })}
+              className="rounded-md border border-gray-300 px-3 py-2 text-sm">
+              <option value="off">Off</option>
+              <option value="monitor">Monitor</option>
+              <option value="enforce">Block sensitive transfers</option>
+            </select>
+            <p className="mt-2 text-xs text-gray-500">Fingerprint or ML sensitivity blocks a transfer. In Block mode, pending, unreadable, or oversized files are denied until they can be verified. Third-party Bluetooth apps and tethering are outside the coverage of this channel.</p>
+          </Section>
         </div>
 
         <div className="flex items-center gap-3 px-6 py-4 border-t border-gray-200 bg-gray-50">

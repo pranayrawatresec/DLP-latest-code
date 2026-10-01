@@ -1,0 +1,731 @@
+{
+  "ok": true,
+  "total_cases": 41,
+  "passed": 22,
+  "accuracy": 0.5365853658536586,
+  "macro_f1": 0.5029761904761905,
+  "total_latency_ms": 15680.2405,
+  "throughput_docs_per_sec": 2.6147558132160027,
+  "latency": {
+    "p50": 385.23600000000005,
+    "p95": 472.9252,
+    "p99": 525.5217200000001,
+    "min": 261.4976,
+    "max": 526.9118000000001,
+    "mean": 382.43520243902435
+  },
+  "label_metrics": [
+    {
+      "id": "NUC",
+      "name": "Nuclear & Strategic Systems",
+      "domain": "defence",
+      "support": 4,
+      "tp": 0,
+      "fp": 1,
+      "fn_count": 4,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "WPN",
+      "name": "Weapons & Armament",
+      "domain": "defence",
+      "support": 4,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 3,
+      "precision": 1,
+      "recall": 0.25,
+      "f1": 0.4
+    },
+    {
+      "id": "INT",
+      "name": "Intelligence & Threat Assessment",
+      "domain": "defence",
+      "support": 3,
+      "tp": 3,
+      "fp": 3,
+      "fn_count": 0,
+      "precision": 0.5,
+      "recall": 1,
+      "f1": 0.6666666666666666
+    },
+    {
+      "id": "SIG",
+      "name": "Signals & Communications",
+      "domain": "defence",
+      "support": 3,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 2,
+      "precision": 1,
+      "recall": 0.3333333333333333,
+      "f1": 0.5
+    },
+    {
+      "id": "OOD",
+      "name": "Other / Unknown",
+      "domain": "general",
+      "support": 2,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 2,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "PUB",
+      "name": "Public Information",
+      "domain": "general",
+      "support": 2,
+      "tp": 2,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "AVI",
+      "name": "Aviation & Air Systems",
+      "domain": "defence",
+      "support": 2,
+      "tp": 1,
+      "fp": 3,
+      "fn_count": 1,
+      "precision": 0.25,
+      "recall": 0.5,
+      "f1": 0.3333333333333333
+    },
+    {
+      "id": "CYB",
+      "name": "Cyber Defence",
+      "domain": "defence",
+      "support": 2,
+      "tp": 2,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "DIP",
+      "name": "Defence Diplomacy & Border Affairs",
+      "domain": "defence",
+      "support": 2,
+      "tp": 2,
+      "fp": 1,
+      "fn_count": 0,
+      "precision": 0.6666666666666666,
+      "recall": 1,
+      "f1": 0.8
+    },
+    {
+      "id": "OPS",
+      "name": "Planning & Operations",
+      "domain": "general",
+      "support": 2,
+      "tp": 2,
+      "fp": 3,
+      "fn_count": 0,
+      "precision": 0.4,
+      "recall": 1,
+      "f1": 0.5714285714285715
+    },
+    {
+      "id": "SPC",
+      "name": "Space & Satellite Systems",
+      "domain": "defence",
+      "support": 2,
+      "tp": 2,
+      "fp": 1,
+      "fn_count": 0,
+      "precision": 0.6666666666666666,
+      "recall": 1,
+      "f1": 0.8
+    },
+    {
+      "id": "FIN",
+      "name": "Finance",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "POL",
+      "name": "Policies",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 1,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "ANA",
+      "name": "Analytics",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "GOV",
+      "name": "Government Reporting",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 2,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "ADM",
+      "name": "Administration",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 1,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "COM",
+      "name": "Communication",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 3,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "LEG",
+      "name": "Legal",
+      "domain": "general",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "NAV",
+      "name": "Naval & Maritime Systems",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "ACQ",
+      "name": "Defence Acquisition & Procurement",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    },
+    {
+      "id": "PER",
+      "name": "Personnel & Service Records",
+      "domain": "general",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "MNT",
+      "name": "Maintenance & Engineering",
+      "domain": "defence",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "LOG",
+      "name": "Defence Logistics & Supply",
+      "domain": "defence",
+      "support": 1,
+      "tp": 0,
+      "fp": 0,
+      "fn_count": 1,
+      "precision": 0,
+      "recall": 0,
+      "f1": 0
+    },
+    {
+      "id": "TRN",
+      "name": "Military Training & Doctrine",
+      "domain": "defence",
+      "support": 1,
+      "tp": 1,
+      "fp": 0,
+      "fn_count": 0,
+      "precision": 1,
+      "recall": 1,
+      "f1": 1
+    }
+  ],
+  "top_errors": [
+    {
+      "expected": "OOD",
+      "predicted": "COM",
+      "count": 2
+    },
+    {
+      "expected": "WPN",
+      "predicted": "AVI",
+      "count": 2
+    },
+    {
+      "expected": "NUC",
+      "predicted": "OPS",
+      "count": 1
+    },
+    {
+      "expected": "COM",
+      "predicted": "GOV",
+      "count": 1
+    },
+    {
+      "expected": "GOV",
+      "predicted": "OPS",
+      "count": 1
+    },
+    {
+      "expected": "NUC",
+      "predicted": "INT",
+      "count": 1
+    },
+    {
+      "expected": "POL",
+      "predicted": "DIP",
+      "count": 1
+    },
+    {
+      "expected": "NUC",
+      "predicted": "GOV",
+      "count": 1
+    },
+    {
+      "expected": "LOG",
+      "predicted": "OPS",
+      "count": 1
+    },
+    {
+      "expected": "MNT",
+      "predicted": "AVI",
+      "count": 1
+    }
+  ],
+  "cases": [
+    {
+      "name": "india-NUC-doctrine-nfu",
+      "expected": "NUC",
+      "predicted": "GOV",
+      "confidence": 0.8878430819625138,
+      "latency_ms": 386.4465,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "pakistan-NUC-tactical-nasr",
+      "expected": "NUC",
+      "predicted": "OPS",
+      "confidence": 0.35683670701311687,
+      "latency_ms": 308.9757,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-NUC-postsindoor-nca-review",
+      "expected": "NUC",
+      "predicted": "INT",
+      "confidence": 0.5682535008345732,
+      "latency_ms": 308.1128,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "pakistan-NUC-fsd-uranium",
+      "expected": "NUC",
+      "predicted": "POL",
+      "confidence": 0.37446209631554156,
+      "latency_ms": 306.4849,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-INT-opsindoor-threat-assess",
+      "expected": "INT",
+      "predicted": "INT",
+      "confidence": 0.9946948342415382,
+      "latency_ms": 376.5745,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "ib-INT-pakistan-mole",
+      "expected": "INT",
+      "predicted": "INT",
+      "confidence": 0.9946788674765014,
+      "latency_ms": 324.4004,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "pakistan-WPN-nasr-employment-doc",
+      "expected": "WPN",
+      "predicted": "WPN",
+      "confidence": 0.850204600814566,
+      "latency_ms": 336.29769999999996,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-WPN-hypersonic-missile",
+      "expected": "WPN",
+      "predicted": "AVI",
+      "confidence": 0.9095897541177576,
+      "latency_ms": 403.7296,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "pakistan-WPN-shaheen3-test",
+      "expected": "WPN",
+      "predicted": "SPC",
+      "confidence": 0.6704561073424815,
+      "latency_ms": 364.409,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-WPN-brahmos-extended-range",
+      "expected": "WPN",
+      "predicted": "AVI",
+      "confidence": 0.5498168328993166,
+      "latency_ms": 359.183,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "army-SIG-opsindoor-sigint",
+      "expected": "SIG",
+      "predicted": "SIG",
+      "confidence": 0.9343978899742493,
+      "latency_ms": 454.1351,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "drdo-SIG-gan-ew-chip",
+      "expected": "SIG",
+      "predicted": "NUC",
+      "confidence": 0.7005178584493615,
+      "latency_ms": 472.9252,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-SIG-pak-submarine-acoustic",
+      "expected": "SIG",
+      "predicted": "INT",
+      "confidence": 0.9884906256996491,
+      "latency_ms": 357.43760000000003,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "nciipc-CYB-sindoor-gridattack",
+      "expected": "CYB",
+      "predicted": "CYB",
+      "confidence": 0.31518313901701334,
+      "latency_ms": 395.9205,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-CYB-pak-apt36",
+      "expected": "CYB",
+      "predicted": "CYB",
+      "confidence": 0.8593434954875679,
+      "latency_ms": 466.2248,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mea-DIP-ceasefire-cable",
+      "expected": "DIP",
+      "predicted": "DIP",
+      "confidence": 0.9921394849938101,
+      "latency_ms": 372.8144,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "mea-DIP-wikileaks-cable-isinukes",
+      "expected": "DIP",
+      "predicted": "DIP",
+      "confidence": 0.9919959094587092,
+      "latency_ms": 391.2177,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-OPS-sindoor-strike-order",
+      "expected": "OPS",
+      "predicted": "OPS",
+      "confidence": 0.3507962765482248,
+      "latency_ms": 403.9556,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "pakistan-OPS-bunyanum-marsoos",
+      "expected": "OPS",
+      "predicted": "OPS",
+      "confidence": 0.3749008392741248,
+      "latency_ms": 393.4955,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-SPC-cartosat-sindoor",
+      "expected": "SPC",
+      "predicted": "SPC",
+      "confidence": 0.5053984010755177,
+      "latency_ms": 523.4366,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-SPC-risat-pak-naval",
+      "expected": "SPC",
+      "predicted": "SPC",
+      "confidence": 0.7052791559164772,
+      "latency_ms": 399.4599,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-AVI-opsindoor-aar",
+      "expected": "AVI",
+      "predicted": "AVI",
+      "confidence": 0.9920654280489072,
+      "latency_ms": 385.23600000000005,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "pakistan-AVI-jf17-threat-assess",
+      "expected": "AVI",
+      "predicted": "INT",
+      "confidence": 0.9119943244129943,
+      "latency_ms": 394.78220000000005,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "navy-NAV-pns-hamza-track",
+      "expected": "NAV",
+      "predicted": "NAV",
+      "confidence": 0.9892533657932846,
+      "latency_ms": 406.5222,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-POL-nfu-review-postsindoor",
+      "expected": "POL",
+      "predicted": "DIP",
+      "confidence": 0.9773282669287298,
+      "latency_ms": 393.30969999999996,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-GOV-opsindoor-modebrief",
+      "expected": "GOV",
+      "predicted": "OPS",
+      "confidence": 0.5168045191562373,
+      "latency_ms": 359.92600000000004,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-FIN-opsindoor-budget",
+      "expected": "FIN",
+      "predicted": "FIN",
+      "confidence": 0.9982367639876282,
+      "latency_ms": 386.54290000000003,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-ACQ-p8i-additional",
+      "expected": "ACQ",
+      "predicted": "ACQ",
+      "confidence": 0.9967821913888848,
+      "latency_ms": 367.153,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-LOG-opsindoor-reconstitution",
+      "expected": "LOG",
+      "predicted": "OPS",
+      "confidence": 0.975060296912953,
+      "latency_ms": 423.8754,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-MNT-rafale-poststrike-maint",
+      "expected": "MNT",
+      "predicted": "AVI",
+      "confidence": 0.7792158154413882,
+      "latency_ms": 378.0432,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-INT-pak-troop-movement",
+      "expected": "INT",
+      "predicted": "INT",
+      "confidence": 0.9949510268111267,
+      "latency_ms": 442.6365,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-TRN-opsindoor-lessons",
+      "expected": "TRN",
+      "predicted": "TRN",
+      "confidence": 0.9915807219797712,
+      "latency_ms": 526.9118000000001,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-ADM-nca-meeting-minutes",
+      "expected": "ADM",
+      "predicted": "COM",
+      "confidence": 0.980162888057686,
+      "latency_ms": 377.4518,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "ispr-PUB-sindoor-statement",
+      "expected": "PUB",
+      "predicted": "PUB",
+      "confidence": 0.97804915459509,
+      "latency_ms": 319.9846,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "pib-PUB-sindoor-statement",
+      "expected": "PUB",
+      "predicted": "PUB",
+      "confidence": 0.8627905875106139,
+      "latency_ms": 289.6451,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "ood-cricket-notice",
+      "expected": "OOD",
+      "predicted": "COM",
+      "confidence": 0.7276153459104533,
+      "latency_ms": 261.4976,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "ood-leave-policy",
+      "expected": "OOD",
+      "predicted": "COM",
+      "confidence": 0.8200992926845051,
+      "latency_ms": 354.5025,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-COM-mod-letter",
+      "expected": "COM",
+      "predicted": "GOV",
+      "confidence": 0.717701088922818,
+      "latency_ms": 341.30519999999996,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-ANA-sindoor-threat-analytics",
+      "expected": "ANA",
+      "predicted": "ANA",
+      "confidence": 0.9850698614778687,
+      "latency_ms": 389.435,
+      "correct": true,
+      "error": null
+    },
+    {
+      "name": "india-PER-sfc-posting",
+      "expected": "PER",
+      "predicted": "ADM",
+      "confidence": 0.8218566892330036,
+      "latency_ms": 323.8663,
+      "correct": false,
+      "error": null
+    },
+    {
+      "name": "india-LEG-osa-prosecution",
+      "expected": "LEG",
+      "predicted": "LEG",
+      "confidence": 0.9983408654103033,
+      "latency_ms": 451.5793,
+      "correct": true,
+      "error": null
+    }
+  ],
+  "error": null
+}

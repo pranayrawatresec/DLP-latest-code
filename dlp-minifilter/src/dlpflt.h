@@ -33,7 +33,7 @@ and are consumed by dlpflt.c and comms.c only.
  * ------------------------------------------------------------------------- */
 
 /* Wire protocol version. Bump on ANY change to the structs below. */
-#define DLP_MSG_VERSION      2
+#define DLP_MSG_VERSION      3
 
 /* Verdict values carried in DLP_SCAN_REPLY.Verdict. */
 #define DLP_VERDICT_ALLOW    0
@@ -50,6 +50,15 @@ and are consumed by dlpflt.c and comms.c only.
  *           a BLOCK reply makes the driver deny the read / the mapping).      */
 #define DLP_REASON_WRITE     0
 #define DLP_REASON_READ      1
+#define DLP_REASON_BLUETOOTH 2
+
+#define DLP_BLUETOOTH_VERSION 0x42706c44u
+#define DLP_BLUETOOTH_PROTOCOL 1u
+typedef struct _DLP_BLUETOOTH_POLICY {
+    ULONG Version;
+    ULONG Protocol;
+    ULONG Mode; /* 0 off, 1 enforce, 2 monitor */
+} DLP_BLUETOOTH_POLICY, *PDLP_BLUETOOTH_POLICY;
 
 /* Max path length (in WCHARs) carried inline in a scan request. Paths longer
  * than this are truncated by the driver; the truncation is flagged so the
@@ -104,7 +113,7 @@ and are consumed by dlpflt.c and comms.c only.
  *   [DLP_SCAN_REQUEST header][ContentLength bytes of file content]
  * Total sender size = sizeof(DLP_SCAN_REQUEST) + ContentLength. */
 typedef struct _DLP_SCAN_REQUEST {
-    ULONG     Version;                    /* = DLP_MSG_VERSION (= 2)          */
+    ULONG     Version;                    /* = DLP_MSG_VERSION (= 3)          */
     ULONG     Reserved;                   /* alignment / future flags         */
     ULONGLONG FileId;                     /* correlation id (per request)     */
     ULONG     ProcessId;                  /* requestor PID (for the reviewer) */
@@ -282,6 +291,9 @@ typedef struct _DLP_STREAM_CONTEXT {
      * repeat open of an already-classified sensitive file slips past the open-deny
      * (positive defaults FALSE) and re-opens the delegate-read window. Set alongside
      * ExfilVerdict=_DENY; cleared to 0 when the verdict is evicted to _UNKNOWN. */
+    volatile LONG BluetoothVerdict;
+    volatile LONG BluetoothPositive;
+    volatile LONG BluetoothEpoch;
     volatile LONG ExfilPositive;
     /* NOTE: repeat-deny audit dedup is NOT here — a stream context is shared across
      * every open of a file, so it cannot count distinct opens/processes. That lives
@@ -462,6 +474,8 @@ typedef struct _DLP_FLT_DATA {
      * (DLP_EXFIL_UPDATE); DlpPreRead consults it, then content-classifies +
      * denies a sensitive read. Reuses SensFile/BadHash/DlpQueryVerdict + the
      * DLP_CONFIG watch scope. */
+    volatile LONG   BluetoothMode;
+    volatile LONG   BluetoothReady; /* scanner negotiated this protocol */
     ULONG           ExfilReadBlockEnabled;  /* DLP_EXFILREAD_* (registry, default 0) */
     ULONG           ExfilReadFailBlock;     /* deny on unverifiable content (default 1) */
     KSPIN_LOCK      ExfilLock;

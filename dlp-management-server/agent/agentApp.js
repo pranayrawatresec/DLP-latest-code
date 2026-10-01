@@ -425,6 +425,7 @@ app.get('/agent/read-deny-policy', async (req, res, next) => {
       // Deny ALL sensitive reads by any process in an RDP (WTS remote) session
       // (strict / token model). Off by default; see migration 017.
       denyRemoteSessions: p.deny_remote_sessions ?? false,
+      bluetoothMode: p.bluetooth_mode || 'off',
     };
 
     await audit('agent-policy', 'agent.policy_delivered', agent.id, {

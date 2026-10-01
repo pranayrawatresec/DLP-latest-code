@@ -111,6 +111,7 @@ DlpCloseCommunicationPort(VOID)
     }
     /* ClientPort is closed by FltMgr via DisconnectNotify; clear defensively. */
     gDlpData.ClientPort = NULL;
+    InterlockedExchange(&gDlpData.BluetoothReady, 0);
     InterlockedExchange(&gDlpData.ServicePid, 0);
 }
 
@@ -164,6 +165,7 @@ DlpPortConnect(_In_ PFLT_PORT ClientPort,
 
     /* Scanner connection. ConnectNotify runs in the connecting process's context,
      * so PsGetCurrentProcessId() is the service PID we self-skip on (SPEC 2.4). */
+    InterlockedExchange(&gDlpData.BluetoothReady, 0);
     gDlpData.ClientPort = ClientPort;
     InterlockedExchange(&gDlpData.ServicePid,
                         (LONG)(ULONG_PTR)PsGetCurrentProcessId());
@@ -196,6 +198,7 @@ DlpPortDisconnect(_In_opt_ PVOID ConnectionCookie)
         FltCloseClientPort(gDlpData.Filter, &gDlpData.ClientPort);
         gDlpData.ClientPort = NULL;
     }
+    InterlockedExchange(&gDlpData.BluetoothReady, 0);
     InterlockedExchange(&gDlpData.ServicePid, 0);
 }
 
@@ -251,6 +254,29 @@ DlpPortMessage(_In_opt_ PVOID PortCookie,
         version = *(volatile ULONG *)InputBuffer;
     } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
         return STATUS_INVALID_USER_BUFFER;
+    }
+
+    /* Bluetooth policy is negotiated ONLY by the scanner. Persisted mode stays
+     * effective across disconnection; an incompatible scanner cannot allow data. */
+    if (version == DLP_BLUETOOTH_VERSION) {
+        DLP_BLUETOOTH_POLICY policy;
+        if (PortCookie != DLP_CONN_SCAN || InputBufferLength != sizeof(policy)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        __try {
+            ProbeForRead(InputBuffer, sizeof(policy), __alignof(ULONG));
+            RtlCopyMemory(&policy, InputBuffer, sizeof(policy));
+        } __except (DlpConfigExceptionFilter(GetExceptionCode())) {
+            return STATUS_INVALID_USER_BUFFER;
+        }
+        if (policy.Protocol != DLP_BLUETOOTH_PROTOCOL || policy.Mode > 2) {
+            return STATUS_REVISION_MISMATCH;
+        }
+        if (InterlockedExchange(&gDlpData.BluetoothMode, (LONG)policy.Mode) != (LONG)policy.Mode) {
+            InterlockedIncrement(&gDlpData.Epoch);
+        }
+        InterlockedExchange(&gDlpData.BluetoothReady, 1);
+        return STATUS_SUCCESS;
     }
 
     /* ---- DLP_DRAIN_VERSION (read-deny audit drain: kernel -> user reply) --- *
@@ -594,6 +620,9 @@ DlpQueryVerdict(_In_ PUNICODE_STRING Path,
         return STATUS_INVALID_DEVICE_STATE;   /* *Block already FailMode */
     }
 
+    if (Reason == DLP_REASON_BLUETOOTH && !gDlpData.BluetoothReady) {
+        return STATUS_REVISION_MISMATCH;
+    }
     if (gDlpData.ClientPort == NULL) {
         return STATUS_PORT_DISCONNECTED;   /* *Block already set from FailMode */
     }
@@ -797,6 +826,7 @@ DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath)
     OBJECT_ATTRIBUTES oa;
     HANDLE key = NULL;
     ULONG enabled = DLP_EXFILREAD_DISABLED;
+    ULONG bluetoothMode = 0;
     ULONG failBlock = 1;                    /* default: deny unverifiable content */
 
     PAGED_CODE();
@@ -812,6 +842,8 @@ DlpReadExfilPolicy(_In_ PUNICODE_STRING RegistryPath)
         return;
     }
 
+    DlpReadDword(key, L"BluetoothMode", &bluetoothMode);
+    gDlpData.BluetoothMode = bluetoothMode <= 2 ? (LONG)bluetoothMode : 1;
     DlpReadDword(key, L"ExfilReadBlockEnabled", &enabled);
     DlpReadDword(key, L"ExfilReadFailBlock", &failBlock);
 

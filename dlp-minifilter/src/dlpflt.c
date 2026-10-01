@@ -116,14 +116,14 @@ static LONG DlpExfilClassifyAndCache(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ ULONG Pid,
-    _Out_opt_ PBOOLEAN Positive);
+    _Out_opt_ PBOOLEAN Positive, _In_ ULONG Reason);
 
 /* Record a SILENT (cache-served, no up-call) read-deny into the audit ring, at
  * most once per OPEN. Uses a per-FILE_OBJECT stream-handle context so distinct
  * untrusted processes reading the same already-flagged file each produce exactly
  * one audit event — the shared stream context cannot distinguish opens. Best-
  * effort: any context or file-id failure just skips the audit (never the deny). */
-static VOID DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid);
+static VOID DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid, _In_ ULONG Reason);
 
 /* Per-thread re-entrancy guard. Our own cached FltReadFile (in the classifier)
  * lazily creates the file's data section, re-entering DlpPreAcquireForSection on
@@ -180,7 +180,7 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_CREATE,          0, NULL,                    DlpPostCreate },
     /* SKIP_PAGING_IO on the write/cleanup ops that up-call (item 7): keeps us
      * off the modified/lazy-writer path, where an up-call must never wait. */
-    { IRP_MJ_WRITE,           FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
+    { IRP_MJ_WRITE,           0,
                                  DlpPreWrite,             NULL          },
     { IRP_MJ_CLEANUP,         FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
                                  DlpPreCleanup,           NULL          },
@@ -242,6 +242,58 @@ CONST FLT_REGISTRATION FilterRegistration = {
     NULL                                /* SectionNotificationCallback */
 };
 
+
+/* The wizard must be able to load Windows' own code/resources. Resolve the
+ * actual OS directory once, never trust a user-supplied "Windows" directory. */
+static WCHAR gBluetoothSystemRootBuffer[512];
+static UNICODE_STRING gBluetoothSystemRoot;
+
+static VOID DlpBluetoothResolveSystemRoot(VOID)
+{
+    UNICODE_STRING name = RTL_CONSTANT_STRING(L"\\SystemRoot");
+    OBJECT_ATTRIBUTES oa;
+    HANDLE link;
+    InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    gBluetoothSystemRoot.Buffer = gBluetoothSystemRootBuffer;
+    gBluetoothSystemRoot.MaximumLength = sizeof(gBluetoothSystemRootBuffer);
+    gBluetoothSystemRoot.Length = 0;
+    if (NT_SUCCESS(ZwOpenSymbolicLinkObject(&link, GENERIC_READ, &oa))) {
+        if (!NT_SUCCESS(ZwQuerySymbolicLinkObject(link, &gBluetoothSystemRoot, NULL))) {
+            gBluetoothSystemRoot.Length = 0;
+        }
+        ZwClose(link);
+    }
+}
+
+static BOOLEAN DlpBluetoothRuntimeResource(_In_ PFLT_CALLBACK_DATA Data)
+{
+    PFLT_FILE_NAME_INFORMATION info = NULL;
+    UNICODE_STRING tail;
+    UNICODE_STRING dirs[] = { RTL_CONSTANT_STRING(L"\\System32\\"),
+        RTL_CONSTANT_STRING(L"\\SysWOW64\\"), RTL_CONSTANT_STRING(L"\\WinSxS\\") };
+    UNICODE_STRING extensions[] = { RTL_CONSTANT_STRING(L"dll"), RTL_CONSTANT_STRING(L"exe"),
+        RTL_CONSTANT_STRING(L"mui"), RTL_CONSTANT_STRING(L"nls") };
+    ULONG i;
+    BOOLEAN directory = FALSE, extension = FALSE;
+    if (gBluetoothSystemRoot.Length == 0 || !NT_SUCCESS(FltGetFileNameInformation(Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &info)) || info == NULL) {
+        return FALSE;
+    }
+    if (NT_SUCCESS(FltParseFileNameInformation(info)) && info->Stream.Length == 0 &&
+        RtlPrefixUnicodeString(&gBluetoothSystemRoot, &info->Name, TRUE)) {
+        tail.Buffer = info->Name.Buffer + gBluetoothSystemRoot.Length / sizeof(WCHAR);
+        tail.Length = (USHORT)(info->Name.Length - gBluetoothSystemRoot.Length);
+        tail.MaximumLength = tail.Length;
+        for (i = 0; i < RTL_NUMBER_OF(dirs); ++i) {
+            if (RtlPrefixUnicodeString(&dirs[i], &tail, TRUE)) directory = TRUE;
+        }
+        for (i = 0; i < RTL_NUMBER_OF(extensions); ++i) {
+            if (RtlEqualUnicodeString(&extensions[i], &info->Extension, TRUE)) extension = TRUE;
+        }
+    }
+    FltReleaseFileNameInformation(info);
+    return directory && extension;
+}
 
 /* ------------------------------------------------------------------------- *
  *  DriverEntry                                                              *
@@ -310,6 +362,7 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
      * same key BEFORE FltStartFiltering, so DlpPreRead's kill-switch is correct from
      * the first read. Absent key => stays OFF (today's behavior). */
     DlpReadExfilPolicy(RegistryPath);
+    DlpBluetoothResolveSystemRoot();
 
     /* Seed the fixed-volume scan scope from the registry BEFORE FltStartFiltering,
      * so InstanceSetup attaches C: at mount time on boot — closing the window where
@@ -482,7 +535,7 @@ DlpInstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     if (VolumeDeviceType == FILE_DEVICE_NETWORK_FILE_SYSTEM) {
         /* Network (SMB) redirector: a copy to a share is an egress target, but
          * only inspect it when the deployment opted in. */
-        if (!DlpConfigScanNetwork()) {
+        if (!DlpConfigScanNetwork() && gDlpData.BluetoothMode == 0) {
             return STATUS_FLT_DO_NOT_ATTACH;
         }
         volumeClass = DLP_VOL_NETWORK;
@@ -494,7 +547,7 @@ DlpInstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
          * configured (DlpConfigScanFixed enforces ScanFixed AND WatchCount>0).
          * With no config we return DO_NOT_ATTACH -- never sit on the system
          * disk by default. This is the back-compat safety invariant. */
-        if (!DlpConfigScanFixed()) {
+        if (!DlpConfigScanFixed() && gDlpData.BluetoothMode == 0) {
             return STATUS_FLT_DO_NOT_ATTACH;
         }
         volumeClass = DLP_VOL_FIXED;
@@ -665,6 +718,47 @@ DlpShouldSkip(_In_ PFLT_CALLBACK_DATA Data,
 }
 
 
+/* Synchronous process identity: no polling window, stale PID, or trust-list
+ * exemption. This recognizes the built-in wizard, not arbitrary OBEX clients.
+ * SeLocateProcessImageName is PASSIVE-only; callers pass DlpShouldSkip first. */
+static ULONG
+DlpReadReason(_In_ PFLT_CALLBACK_DATA Data)
+{
+    PEPROCESS process;
+    PUNICODE_STRING image = NULL;
+    UNICODE_STRING leaf, expected = RTL_CONSTANT_STRING(L"fsquirt.exe");
+    USHORT n, start;
+    BOOLEAN match = FALSE;
+    if (gDlpData.BluetoothMode == 0) return DLP_REASON_READ;
+    process = FltGetRequestorProcess(Data);
+    if (process == NULL) return DLP_REASON_READ;
+    if (NT_SUCCESS(SeLocateProcessImageName(process, &image)) && image != NULL) {
+        n = image->Length / sizeof(WCHAR);
+        start = n;
+        while (start > 0 && image->Buffer[start - 1] != L'\\') --start;
+        leaf.Buffer = image->Buffer + start;
+        leaf.Length = (USHORT)((n - start) * sizeof(WCHAR));
+        leaf.MaximumLength = leaf.Length;
+        match = RtlEqualUnicodeString(&leaf, &expected, TRUE);
+        ExFreePool(image);
+    }
+    if (match && DlpBluetoothRuntimeResource(Data)) return DLP_REASON_READ;
+    /* Monitor must never exempt a reader already subject to general enforcement. */
+    if (match && gDlpData.BluetoothMode == DLP_EXFILREAD_MONITOR &&
+        gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED &&
+        (DlpExfilLookup((ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data)) ||
+         DlpSessionIsRemote(Data))) {
+        return DLP_REASON_READ;
+    }
+    return match ? DLP_REASON_BLUETOOTH : DLP_REASON_READ;
+}
+
+static ULONG DlpReadMode(_In_ ULONG Reason)
+{
+    return Reason == DLP_REASON_BLUETOOTH ? (ULONG)gDlpData.BluetoothMode
+                                        : gDlpData.ExfilReadBlockEnabled;
+}
+
 /* ------------------------------------------------------------------------- *
  *  IRP_MJ_CREATE (post) -- flag a write-capable open as a candidate         *
  * ------------------------------------------------------------------------- */
@@ -679,6 +773,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
     ULONG desiredAccess;
     BOOLEAN wantsWrite;
     BOOLEAN isDirectory = FALSE;
+    ULONG readReason;
 
     UNREFERENCED_PARAMETER(CompletionContext);
 
@@ -705,6 +800,7 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
     }
 
     desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
+    readReason = DlpReadReason(Data);
 
     /* Open-time read-deny (exfil channel). An untrusted process opening an
      * in-scope SENSITIVE file for read is denied the OPEN itself
@@ -716,17 +812,17 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
      * DlpPreRead (read-deny enabled + exfil PID + a read-capable open); scope and
      * sensitivity come from the shared classifier, whose SensFile/CleanFile cache
      * makes repeat opens O(1). A non-read open falls through to the write path. */
-    if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_DISABLED &&
+    if (DlpReadMode(readReason) != DLP_EXFILREAD_DISABLED &&
         (desiredAccess & (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ |
                           GENERIC_ALL | MAXIMUM_ALLOWED)) != 0) {
         ULONG exfilPid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
         BOOLEAN positive = FALSE;
         /* The classify runs in BOTH monitor and enforce (its up-call is what raises
          * the would-block / block incident); only ENFORCE cancels the open. */
-        if ((DlpExfilLookup(exfilPid) || DlpSessionIsRemote(Data)) &&
-            DlpExfilClassifyAndCache(FltObjects, Data, exfilPid, &positive) == DLP_EXFIL_DENY &&
+        if ((readReason == DLP_REASON_BLUETOOTH || DlpExfilLookup(exfilPid) || DlpSessionIsRemote(Data)) &&
+            DlpExfilClassifyAndCache(FltObjects, Data, exfilPid, &positive, readReason) == DLP_EXFIL_DENY &&
             positive &&
-            gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
+            DlpReadMode(readReason) == DLP_EXFILREAD_ENABLED) {
             /* Cancel the OPEN only on a POSITIVE sensitive match — never on the
              * fail-safe (empty/new/unreadable) path, which would otherwise break
              * the creation of ordinary files by untrusted apps. Fail-safe reads
@@ -760,6 +856,9 @@ DlpPostCreate(_Inout_ PFLT_CALLBACK_DATA Data,
         ctx->Dirty = 0;
         ctx->Inspected = 0;
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
+        ctx->BluetoothVerdict = DLP_EXFIL_UNKNOWN;
+        ctx->BluetoothPositive = 0;
+        ctx->BluetoothEpoch = 0;
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;   /* contexts are NOT zeroed by FltMgr */
         ctx->WriteEvicted = 0;
         ctx->ExfilPositive = 0;
@@ -794,6 +893,17 @@ DlpPreWrite(_Inout_ PFLT_CALLBACK_DATA Data,
 
     UNREFERENCED_PARAMETER(CompletionContext);
 
+    /* Paging writes must evict Bluetooth verdicts too. No up-call or name
+     * query here; FltGetStreamContext is legal through APC_LEVEL. */
+    if (KeGetCurrentIrql() <= APC_LEVEL && FltObjects->FileObject != NULL &&
+        NT_SUCCESS(FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
+                                      (PFLT_CONTEXT *)&ctx)) && ctx != NULL) {
+        InterlockedExchange(&ctx->BluetoothVerdict, DLP_EXFIL_UNKNOWN);
+        InterlockedExchange(&ctx->BluetoothPositive, 0);
+        FltReleaseContext((PFLT_CONTEXT)ctx);
+        ctx = NULL;
+    }
+
     /* Item 1: single top-of-callback gate. */
     if (DlpShouldSkip(Data, FltObjects)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -802,6 +912,8 @@ DlpPreWrite(_Inout_ PFLT_CALLBACK_DATA Data,
     status = FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                  (PFLT_CONTEXT *)&ctx);
     if (NT_SUCCESS(status)) {
+        InterlockedExchange(&ctx->BluetoothVerdict, DLP_EXFIL_UNKNOWN);
+        InterlockedExchange(&ctx->BluetoothPositive, 0);
         InterlockedExchange(&ctx->Dirty, 1);
 
         /* Read-deny cache coherence: a CONTENT change must invalidate any cached
@@ -859,6 +971,13 @@ DlpPreSetInformation(_Inout_ PFLT_CALLBACK_DATA Data,
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    if (NT_SUCCESS(FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
+            (PFLT_CONTEXT *)&ctx)) && ctx != NULL) {
+        InterlockedExchange(&ctx->BluetoothVerdict, DLP_EXFIL_UNKNOWN);
+        InterlockedExchange(&ctx->BluetoothPositive, 0);
+        FltReleaseContext((PFLT_CONTEXT)ctx);
+        ctx = NULL;
+    }
     infoClass = Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
 
     /* A rename/move whose destination is on our (removable) instance means a
@@ -879,7 +998,12 @@ DlpPreSetInformation(_Inout_ PFLT_CALLBACK_DATA Data,
                 ctx->Dirty = 1;
                 ctx->Inspected = 0;
                 ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0); /* item 4 */
-                ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;  /* contexts are NOT zeroed */
+                ctx->BluetoothVerdict = DLP_EXFIL_UNKNOWN;
+                ctx->BluetoothPositive = 0;
+                ctx->BluetoothEpoch = 0;
+                ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
+                ctx->WriteEvicted = 0;
+                ctx->ExfilPositive = 0;
                 if (!NT_SUCCESS(FltSetStreamContext(
                         FltObjects->Instance, FltObjects->FileObject,
                         FLT_SET_CONTEXT_KEEP_IF_EXISTS, (PFLT_CONTEXT)ctx, NULL))) {
@@ -891,6 +1015,8 @@ DlpPreSetInformation(_Inout_ PFLT_CALLBACK_DATA Data,
             }
         } else {
             InterlockedExchange(&ctx->WriteCandidate, 1);
+            InterlockedExchange(&ctx->BluetoothVerdict, DLP_EXFIL_UNKNOWN);
+            InterlockedExchange(&ctx->BluetoothPositive, 0);
             InterlockedExchange(&ctx->Dirty, 1);
         }
 
@@ -939,6 +1065,12 @@ DlpPreCleanup(_Inout_ PFLT_CALLBACK_DATA Data,
     if (NT_SUCCESS(status) && instCtx != NULL) {
         volumeClass = instCtx->VolumeClass;
         FltReleaseContext((PFLT_CONTEXT)instCtx);
+    }
+
+    if (volumeClass == DLP_VOL_FIXED ||
+        (volumeClass == DLP_VOL_NETWORK && !DlpConfigScanNetwork())) {
+        FltReleaseContext((PFLT_CONTEXT)ctx);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     /* Only dirty write-candidates, and only once per stream. */
@@ -1696,7 +1828,7 @@ DlpDenyRead(_Inout_ PFLT_CALLBACK_DATA Data)
  * PASSIVE from the classifier. Grabs/creates the per-FILE_OBJECT handle context,
  * flips DenyReported 0->1 exactly once, then resolves the file id and rings it. */
 static VOID
-DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid)
+DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid, _In_ ULONG Reason)
 {
     PDLP_HANDLE_CONTEXT hctx = NULL;
     NTSTATUS status;
@@ -1733,7 +1865,7 @@ DlpAuditSilentDeny(_In_ PCFLT_RELATED_OBJECTS FltObjects, _In_ ULONG Pid)
                 &intInfo, sizeof(intInfo), FileInternalInformation, NULL))) {
             fileId = (ULONGLONG)intInfo.IndexNumber.QuadPart;
         }
-        DlpDenyReport(Pid, fileId, DLP_REASON_READ);
+        DlpDenyReport(Pid, fileId, Reason);
     }
     FltReleaseContext((PFLT_CONTEXT)hctx);
 }
@@ -1749,7 +1881,7 @@ static LONG
 DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
                          _Inout_ PFLT_CALLBACK_DATA Data,
                          _In_ ULONG Pid,
-                         _Out_opt_ PBOOLEAN Positive)
+                         _Out_opt_ PBOOLEAN Positive, _In_ ULONG Reason)
 {
     NTSTATUS status;
     PDLP_STREAM_CONTEXT ctx = NULL;
@@ -1766,6 +1898,9 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     BOOLEAN upCalled = FALSE;                /* TRUE once a real verdict up-call ran */
     BOOLEAN guardHeld;
     UCHAR sha[DLP_SHA256_LEN];
+    BOOLEAN bluetooth = (Reason == DLP_REASON_BLUETOOTH);
+    ULONG failBlock = bluetooth ? 1u : gDlpData.ExfilReadFailBlock;
+    volatile LONG *cachedVerdict, *cachedPositive, *cachedEpoch;
 
     /* `Positive` separates a genuine sensitive match (known-bad hash / real
      * verdict / SensFile hit) from a fail-safe DENY (unreadable / timeout). The
@@ -1784,12 +1919,15 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
                                     sizeof(DLP_STREAM_CONTEXT), NonPagedPoolNx,
                                     (PFLT_CONTEXT *)&ctx);
         if (!NT_SUCCESS(status)) {
-            return gDlpData.ExfilReadFailBlock ? DLP_EXFIL_DENY : DLP_EXFIL_ALLOW;
+            return failBlock ? DLP_EXFIL_DENY : DLP_EXFIL_ALLOW;
         }
         ctx->WriteCandidate = 0;
         ctx->Dirty = 0;
         ctx->Inspected = 0;
         ctx->Epoch = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
+        ctx->BluetoothVerdict = DLP_EXFIL_UNKNOWN;
+        ctx->BluetoothPositive = 0;
+        ctx->BluetoothEpoch = 0;
         ctx->ExfilVerdict = DLP_EXFIL_UNKNOWN;
         ctx->WriteEvicted = 0;
         ctx->ExfilPositive = 0;
@@ -1802,11 +1940,14 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
             ctx = NULL;
             if (!NT_SUCCESS(FltGetStreamContext(FltObjects->Instance,
                     FltObjects->FileObject, (PFLT_CONTEXT *)&ctx)) || ctx == NULL) {
-                return gDlpData.ExfilReadFailBlock ? DLP_EXFIL_DENY : DLP_EXFIL_ALLOW;
+                return failBlock ? DLP_EXFIL_DENY : DLP_EXFIL_ALLOW;
             }
         }
     }
 
+    cachedVerdict = bluetooth ? &ctx->BluetoothVerdict : &ctx->ExfilVerdict;
+    cachedPositive = bluetooth ? &ctx->BluetoothPositive : &ctx->ExfilPositive;
+    cachedEpoch = bluetooth ? &ctx->BluetoothEpoch : &ctx->Epoch;
     /* B. Verdict already decided for this file (any prior open)? O(1). This is the
      *    path that serves EVERY untrusted open after the first classification, so a
      *    cached DENY here is the repeat attempt to audit — once per open.
@@ -1822,23 +1963,27 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
      *    re-scores the file under the new content and re-caches it. */
     {
         LONG epochNow = InterlockedCompareExchange(&gDlpData.Epoch, 0, 0);
-        cached = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
+        cached = InterlockedCompareExchange(cachedVerdict, 0, 0);
         if ((cached == DLP_EXFIL_DENY || cached == DLP_EXFIL_ALLOW) &&
-            InterlockedCompareExchange(&ctx->Epoch, 0, 0) != epochNow) {
-            InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_UNKNOWN);
-            InterlockedExchange(&ctx->ExfilPositive, 0);
+            InterlockedCompareExchange(cachedEpoch, 0, 0) != epochNow) {
+            InterlockedExchange(cachedVerdict, DLP_EXFIL_UNKNOWN);
+            InterlockedExchange(cachedPositive, 0);
+            cached = DLP_EXFIL_UNKNOWN;
+        }
+        if (bluetooth && cached == DLP_EXFIL_ALLOW) {
+            InterlockedExchange(cachedVerdict, DLP_EXFIL_UNKNOWN);
             cached = DLP_EXFIL_UNKNOWN;
         }
         if (cached != DLP_EXFIL_DENY && cached != DLP_EXFIL_ALLOW) {
             /* About to classify: stamp the epoch the new verdict is decided under.
              * If the epoch moves again mid-classification, the stored verdict is
              * stale on the next open and is simply re-scored — the safe direction. */
-            InterlockedExchange(&ctx->Epoch, epochNow);
+            InterlockedExchange(cachedEpoch, epochNow);
         }
     }
     if (cached == DLP_EXFIL_DENY || cached == DLP_EXFIL_ALLOW) {
         if (cached == DLP_EXFIL_DENY) {
-            DlpAuditSilentDeny(FltObjects, Pid);
+            DlpAuditSilentDeny(FltObjects, Pid, Reason);
             /* Carry the cached DENY's positiveness so the OPEN-deny cancels EVERY
              * untrusted open of a known-sensitive file, not only the first (which took
              * the step-E path). Without this, once a file is classified its stream
@@ -1847,7 +1992,7 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
              * re-opening the delegate-read window this whole mechanism closes. A
              * fail-safe DENY (ExfilPositive==0) still does NOT cancel opens. */
             if (Positive != NULL) {
-                *Positive = (InterlockedCompareExchange(&ctx->ExfilPositive, 0, 0) != 0);
+                *Positive = (InterlockedCompareExchange(cachedPositive, 0, 0) != 0);
             }
         }
         FltReleaseContext((PFLT_CONTEXT)ctx);
@@ -1860,7 +2005,8 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
     status = FltGetFileNameInformation(
         Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
     if (!NT_SUCCESS(status) || nameInfo == NULL) {
-        InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_ALLOW);
+        if (bluetooth) { FltReleaseContext((PFLT_CONTEXT)ctx); return DLP_EXFIL_DENY; }
+        InterlockedExchange(cachedVerdict, DLP_EXFIL_ALLOW);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         return DLP_EXFIL_ALLOW;
     }
@@ -1872,10 +2018,10 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         volumeClass = instCtx->VolumeClass;
         FltReleaseContext((PFLT_CONTEXT)instCtx);
     }
-    if (volumeClass == DLP_VOL_FIXED &&
+    if (!bluetooth && volumeClass == DLP_VOL_FIXED &&
         !DlpConfigPathIsWatched(&nameInfo->Name)) {
         FltReleaseFileNameInformation(nameInfo);
-        InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_ALLOW);   /* out of scope */
+        InterlockedExchange(cachedVerdict, DLP_EXFIL_ALLOW);   /* out of scope */
         FltReleaseContext((PFLT_CONTEXT)ctx);
         return DLP_EXFIL_ALLOW;
     }
@@ -1892,14 +2038,14 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
             fileId = (ULONGLONG)intInfo.IndexNumber.QuadPart;
         }
     }
-    if (fileId != 0 && DlpSensFileLookup(fileId, 0)) {
+    if (!bluetooth && fileId != 0 && DlpSensFileLookup(fileId, 0)) {
         /* Cross-open cache-hit deny (no up-call) with a FRESH stream context: audit
          * it once per open. (When the stream context persists instead, step B above
          * serves the same file and audits there — the per-open handle context keeps
          * either path to exactly one event per attempt.) */
-        DlpAuditSilentDeny(FltObjects, Pid);
-        InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
-        InterlockedExchange(&ctx->ExfilPositive, 1);  /* known-sensitive -> open-deny */
+        DlpAuditSilentDeny(FltObjects, Pid, Reason);
+        InterlockedExchange(cachedVerdict, DLP_EXFIL_DENY);
+        InterlockedExchange(cachedPositive, 1);  /* known-sensitive -> open-deny */
         FltReleaseFileNameInformation(nameInfo);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         if (Positive != NULL) {
@@ -1907,8 +2053,8 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         }
         return DLP_EXFIL_DENY;
     }
-    if (fileId != 0 && DlpCleanFileLookup(fileId, 0)) {
-        InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_ALLOW);
+    if (!bluetooth && fileId != 0 && DlpCleanFileLookup(fileId, 0)) {
+        InterlockedExchange(cachedVerdict, DLP_EXFIL_ALLOW);
         FltReleaseFileNameInformation(nameInfo);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         return DLP_EXFIL_ALLOW;
@@ -1931,25 +2077,26 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
         FltReleaseFileNameInformation(nameInfo);
         /* Unverifiable content read by an exfil tool -> fail-safe. Do NOT seed the
          * cross-open rings on a transient failure; only cache per-file (stream ctx). */
-        if (gDlpData.ExfilReadFailBlock) {
-            InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
-            InterlockedExchange(&ctx->ExfilPositive, 0);  /* fail-safe: reads denied, opens not cancelled */
+        if (bluetooth) { FltReleaseContext((PFLT_CONTEXT)ctx); return DLP_EXFIL_DENY; }
+        if (failBlock) {
+            InterlockedExchange(cachedVerdict, DLP_EXFIL_DENY);
+            InterlockedExchange(cachedPositive, 0);  /* fail-safe: reads denied, opens not cancelled */
             FltReleaseContext((PFLT_CONTEXT)ctx);
             return DLP_EXFIL_DENY;
         }
-        InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_ALLOW);
+        InterlockedExchange(cachedVerdict, DLP_EXFIL_ALLOW);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         return DLP_EXFIL_ALLOW;
     }
 
     DlpComputeSha256((const UCHAR *)content, contentBytes, sha);
-    if (DlpBadHashLookup(sha)) {
+    if (!bluetooth && DlpBadHashLookup(sha)) {
         block = TRUE;                          /* known-bad content -> deny       */
         positiveMatch = TRUE;
     } else {
         NTSTATUS vstatus =
             DlpQueryVerdict(&nameInfo->Name, fileId, Pid, content, contentBytes,
-                            truncated, DLP_REASON_READ, &block);
+                            truncated, Reason, &block);
         /* ONLY an exact STATUS_SUCCESS is a genuine verdict. STATUS_TIMEOUT (and
          * other IPC failures) are NT_SUCCESS-*severity* codes but mean "no verdict"
          * -- treating them as a real BLOCK would deny every read under agent load
@@ -1962,14 +2109,19 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
             /* Genuine verdict -> seed the matching cross-open cache. */
             if (block) {
                 positiveMatch = TRUE;          /* real sensitive match            */
-                DlpBadHashInsert(sha);         /* seed the fast path              */
-                DlpSensFileInsert(fileId, 0);
+                if (!bluetooth) DlpBadHashInsert(sha);         /* seed the fast path              */
+                if (!bluetooth) DlpSensFileInsert(fileId, 0);
             } else {
-                DlpCleanFileInsert(fileId, 0); /* bound future up-calls           */
+                if (!bluetooth) DlpCleanFileInsert(fileId, 0); /* bound future up-calls           */
             }
+        } else if (bluetooth) {
+            ExFreePoolWithTag(content, DLP_GENERAL_TAG);
+            FltReleaseFileNameInformation(nameInfo);
+            FltReleaseContext((PFLT_CONTEXT)ctx);
+            return DLP_EXFIL_DENY; /* unknown: fail closed, cache nothing */
         } else {
             /* Up-call failed (no client / timeout). Fail-safe; no cross-open seed. */
-            block = (gDlpData.ExfilReadFailBlock != 0);
+            block = (failBlock != 0);
         }
     }
 
@@ -1986,17 +2138,17 @@ DlpExfilClassifyAndCache(_In_ PCFLT_RELATED_OBJECTS FltObjects,
          * known-bad-hash or fail-secure deny (no up-call) is NOT, so ring-audit
          * those — once per open via the handle context. */
         if (!upCalled) {
-            DlpAuditSilentDeny(FltObjects, Pid);
+            DlpAuditSilentDeny(FltObjects, Pid, Reason);
         }
-        InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_DENY);
-        InterlockedExchange(&ctx->ExfilPositive, positiveMatch ? 1 : 0);
+        InterlockedExchange(cachedVerdict, DLP_EXFIL_DENY);
+        InterlockedExchange(cachedPositive, positiveMatch ? 1 : 0);
         FltReleaseContext((PFLT_CONTEXT)ctx);
         if (Positive != NULL) {
             *Positive = positiveMatch;
         }
         return DLP_EXFIL_DENY;
     }
-    InterlockedExchange(&ctx->ExfilVerdict, DLP_EXFIL_ALLOW);
+    InterlockedExchange(cachedVerdict, DLP_EXFIL_ALLOW);
     FltReleaseContext((PFLT_CONTEXT)ctx);
     return DLP_EXFIL_ALLOW;
 }
@@ -2006,14 +2158,14 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
            _In_ PCFLT_RELATED_OBJECTS FltObjects,
            _Flt_CompletionContext_Outptr_ PVOID *CompletionContext)
 {
-    ULONG pid;
+    ULONG pid, reason;
     LONG verdict;
 
     *CompletionContext = NULL;
 
     /* 1. Kill-switch (default OFF). Monitor AND enforce both classify here; only
      *    enforce denies (step 5). */
-    if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_DISABLED) {
+    if (gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_DISABLED && gDlpData.BluetoothMode == 0) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* 2. Top-of-callback gate: PASSIVE + no re-entrancy + skip agent/System. */
@@ -2024,8 +2176,10 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
      *    session -- are subject to read-deny. The common case (ordinary app on the
      *    console) exits here after ONE spinlocked scan; the session check is
      *    short-circuited when no RDP session is flagged. */
+    reason = DlpReadReason(Data);
+    if (DlpReadMode(reason) == DLP_EXFILREAD_DISABLED) return FLT_PREOP_SUCCESS_NO_CALLBACK;
     pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-    if (!DlpExfilLookup(pid) && !DlpSessionIsRemote(Data)) {
+    if (reason != DLP_REASON_BLUETOOTH && !DlpExfilLookup(pid) && !DlpSessionIsRemote(Data)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* 4. Zero-length read: nothing to gate. */
@@ -2035,9 +2189,9 @@ DlpPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
 
     /* 5. Classify (cache-first; reads + up-calls at most once per file/epoch).
      *    DlpDenyRead completes the buffered read as STATUS_ACCESS_DENIED. */
-    verdict = DlpExfilClassifyAndCache(FltObjects, Data, pid, NULL);
+    verdict = DlpExfilClassifyAndCache(FltObjects, Data, pid, NULL, reason);
     if (verdict == DLP_EXFIL_DENY &&
-        gDlpData.ExfilReadBlockEnabled == DLP_EXFILREAD_ENABLED) {
+        DlpReadMode(reason) == DLP_EXFILREAD_ENABLED) {
         return DlpDenyRead(Data);   /* MONITOR: classify ran (would-block reported); allow */
     }
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -2059,7 +2213,7 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
                         _In_ PCFLT_RELATED_OBJECTS FltObjects,
                         _Flt_CompletionContext_Outptr_ PVOID *CompletionContext)
 {
-    ULONG pid;
+    ULONG pid, reason;
     LONG verdict = DLP_EXFIL_UNKNOWN;
     PDLP_STREAM_CONTEXT ctx = NULL;
     ULONGLONG fileId = 0;
@@ -2067,7 +2221,7 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
     *CompletionContext = NULL;
 
     /* 1. Kill-switch. */
-    if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_ENABLED) {
+    if (gDlpData.ExfilReadBlockEnabled != DLP_EXFILREAD_ENABLED && gDlpData.BluetoothMode != 1) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     /* 2. Our OWN classification read lazily creates this file's data section on
@@ -2094,8 +2248,10 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
     }
     /* 6. Only exfil-channel PIDs -- or a requestor in a flagged REMOTE (RDP)
      *    session (mapped-read half of the same gate). */
+    reason = DlpReadReason(Data);
+    if (DlpReadMode(reason) != DLP_EXFILREAD_ENABLED) return FLT_PREOP_SUCCESS_NO_CALLBACK;
     pid = (ULONG)(ULONG_PTR)FltGetRequestorProcessId(Data);
-    if (!DlpExfilLookup(pid) && !DlpSessionIsRemote(Data)) {
+    if (reason != DLP_REASON_BLUETOOTH && !DlpExfilLookup(pid) && !DlpSessionIsRemote(Data)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -2106,20 +2262,20 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
      *      else UNKNOWN -> fail-safe (ExfilReadFailBlock). */
     if (NT_SUCCESS(FltGetStreamContext(FltObjects->Instance, FltObjects->FileObject,
                                        (PFLT_CONTEXT *)&ctx)) && ctx != NULL) {
-        verdict = InterlockedCompareExchange(&ctx->ExfilVerdict, 0, 0);
+        verdict = InterlockedCompareExchange((reason == DLP_REASON_BLUETOOTH ? &ctx->BluetoothVerdict : &ctx->ExfilVerdict), 0, 0);
         /* Same epoch rule as step B of DlpExfilClassifyAndCache: a verdict decided
          * under an older content epoch (a new index or ML policy since) is not an
          * answer. This path is cache-only, so it is treated as UNKNOWN — falling
          * through to the epoch-checked file-id caches and then the fail-safe — and
          * the buffered-read classifier re-scores and re-stamps it. */
         if (verdict != DLP_EXFIL_UNKNOWN &&
-            InterlockedCompareExchange(&ctx->Epoch, 0, 0) !=
+            InterlockedCompareExchange((reason == DLP_REASON_BLUETOOTH ? &ctx->BluetoothEpoch : &ctx->Epoch), 0, 0) !=
                 InterlockedCompareExchange(&gDlpData.Epoch, 0, 0)) {
             verdict = DLP_EXFIL_UNKNOWN;
         }
         FltReleaseContext((PFLT_CONTEXT)ctx);
     }
-    if (verdict == DLP_EXFIL_UNKNOWN) {
+    if (reason != DLP_REASON_BLUETOOTH && verdict == DLP_EXFIL_UNKNOWN) {
         FILE_INTERNAL_INFORMATION intInfo;
         RtlZeroMemory(&intInfo, sizeof(intInfo));
         if (NT_SUCCESS(FltQueryInformationFile(FltObjects->Instance,
@@ -2142,7 +2298,7 @@ DlpPreAcquireForSection(_Inout_ PFLT_CALLBACK_DATA Data,
      * exfil process's real mapping -- failing it secure is correct, and
      * MmCreateSection then aborts the mmap/copy. */
     if (verdict == DLP_EXFIL_DENY ||
-        (verdict == DLP_EXFIL_UNKNOWN && gDlpData.ExfilReadFailBlock)) {
+        (verdict == DLP_EXFIL_UNKNOWN && (reason == DLP_REASON_BLUETOOTH || gDlpData.ExfilReadFailBlock))) {
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
         Data->IoStatus.Information = 0;
         return FLT_PREOP_COMPLETE;

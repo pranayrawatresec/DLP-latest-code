@@ -33,7 +33,7 @@
 //! **Coexistence with the user-mode sealer (`usb-monitor`):** the monitor runs
 //! as a DIFFERENT PID, so its writes are NOT skip-self and the guard scans
 //! them. Two user-mode accommodations make the pair safe together (the driver
-//! and wire protocol are untouched — `DLP_MSG_VERSION` stays 2):
+//! retain their behavior; protocol v3 adds the Bluetooth read reason):
 //! * `.dlpenc` envelopes (the `DLPE` magic, `crypto::envelope::MAGIC`) pass
 //!   through unscanned on BOTH scan reasons — an envelope is already the
 //!   strongest protected state; scanning ciphertext is noise, and quarantining
@@ -69,7 +69,7 @@ use anyhow::Result;
 /// Wire protocol version — must equal `DLP_MSG_VERSION` in `dlpflt.h`.
 /// v2 = content-over-port: the fixed header is followed by `content_length`
 /// bytes of file content in the same message buffer.
-pub const DLP_MSG_VERSION: u32 = 2;
+pub const DLP_MSG_VERSION: u32 = 3;
 /// Max path chars carried inline — must equal `DLP_MAX_PATH_CHARS` in `dlpflt.h`.
 pub const DLP_MAX_PATH_CHARS: usize = 512;
 /// Max bytes of file content that follow the header — must equal
@@ -102,6 +102,8 @@ pub const DLP_EXFILREAD_MONITOR: u32 = 2;
 ///   file; on BLOCK the driver denies the read/mapping (read-deny-LLD §3).
 pub const DLP_REASON_WRITE: u32 = 0;
 pub const DLP_REASON_READ: u32 = 1;
+/// Built-in Bluetooth transfer read; independent policy, fail closed on unknown.
+pub const DLP_REASON_BLUETOOTH: u32 = 2;
 
 /// `#[repr(C)]` mirror of `DLP_SCAN_REQUEST` (dlpflt.h, `#pragma pack(8)`).
 /// Field order + natural x64 alignment reproduce the C layout exactly
@@ -237,6 +239,7 @@ fn reason_label(reason: u32) -> &'static str {
     match reason {
         DLP_REASON_WRITE => "write",
         DLP_REASON_READ => "read",
+        DLP_REASON_BLUETOOTH => "bluetooth-read",
         _ => "unknown",
     }
 }
@@ -247,7 +250,9 @@ fn reason_label(reason: u32) -> &'static str {
 /// denied this read" from the legacy write/quarantine block, which keeps its
 /// `kernel-blocked` note.
 fn block_note(reason: u32) -> &'static str {
-    if reason == DLP_REASON_READ {
+    if reason == DLP_REASON_BLUETOOTH {
+        "bluetooth-read-denied"
+    } else if reason == DLP_REASON_READ {
         "exfil-read-denied"
     } else {
         "kernel-blocked"
@@ -293,7 +298,12 @@ fn incident_for(
     channel: &str,
     reason: u32,
 ) -> Option<UsbIncident> {
-    let device = synthetic_device(display_path);
+    let mut device = synthetic_device(display_path);
+    let channel = if reason == DLP_REASON_BLUETOOTH {
+        device.bus_type = "bluetooth".into();
+        device.removable = false;
+        crate::bluetooth::CHANNEL
+    } else { channel };
     let action = if blocked { ActionTaken::Blocked } else { ActionTaken::Audited };
 
     if blocked {
@@ -566,6 +576,7 @@ where
     // not loaded (operator manual step, SPEC §8). Also used to RE-connect when
     // the content generation changes (see the loop below).
     let connect = || -> Result<HANDLE> {
+        let current = snapshot_config(shared_cfg);
         let port_name: Vec<u16> = "\\DlpFltPort".encode_utf16().chain(std::iter::once(0)).collect();
         let port: HANDLE = unsafe {
             FilterConnectCommunicationPort(PCWSTR(port_name.as_ptr()), 0, None, 0, None)
@@ -576,7 +587,7 @@ where
         // Send the watch-set config (spec §3.0) so the driver knows whether to
         // inspect fixed/network volumes and which path prefixes to watch. An empty
         // watch-set leaves the driver in removable-only mode (backward compatible).
-        send_config(port, &initial.kguard);
+        send_config(port, &current.kguard);
 
         // Fixed-volume attach (console read-deny policy, scan_fixed=on). The driver's
         // InstanceSetup only accepts a FIXED volume once its config says ScanFixed=1
@@ -585,7 +596,7 @@ where
         // \DlpFltPort connection, in the correct order) is what actually puts an
         // instance on C:; the run-endpoint apply path only writes the registry knobs.
         // Idempotent: "already attached" is success. Runs each (re)connect.
-        if initial.kguard.exfil_read_block && initial.kguard.scan_fixed {
+        if current.kguard.exfil_read_block && current.kguard.scan_fixed {
             #[cfg(windows)]
             crate::readdenypolicy::attach_fixed_volume("C:");
         }
@@ -1044,6 +1055,11 @@ where
         reply: DlpScanReply,
     }
 
+    // Snapshot the EXACT mode sent, before issuing any overlapped receive. A
+    // subsequent live policy change then safely cancels/drains and reconnects.
+    let connected_bluetooth = snapshot_config(shared_cfg).kguard.bluetooth_mode;
+    send_bluetooth_policy(port, connected_bluetooth)?;
+
     // Receive buffer sized for the filter-manager header + our fixed request
     // header + up to DLP_MAX_CONTENT (4 MiB) of trailing file content, since
     // `FilterGetMessage` fills header + content into ONE buffer (v2 content-over-
@@ -1106,7 +1122,9 @@ where
         if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
             return Some(LoopEnd::Stopped);
         }
-        if content_generation(live) != connected_generation {
+        if content_generation(live) != connected_generation
+            || snapshot_config(shared_cfg).kguard.bluetooth_mode != connected_bluetooth
+        {
             return Some(LoopEnd::ContentChanged);
         }
         None
@@ -1251,6 +1269,15 @@ where
             }
         }
 
+        if req.reason == DLP_REASON_BLUETOOTH
+            && kg.bluetooth_mode == crate::bluetooth::Mode::Monitor
+        {
+            if let Some(inc) = incident.as_mut() {
+                inc.action_taken = ActionTaken::Audited;
+                inc.note = Some("bluetooth-read-would-block".into());
+            }
+        }
+
         // Reply to the driver.
         let mut out: ReplyMessage = unsafe { std::mem::zeroed() };
         out.header.MessageId = message_id;
@@ -1291,6 +1318,101 @@ where
     Ok(end)
 }
 
+/// Negotiate on the scanner connection. An old driver rejects the magic/version;
+/// propagate that error so the supervisor reports failure, never false protection.
+#[cfg(windows)]
+fn send_bluetooth_policy(
+    port: windows::Win32::Foundation::HANDLE,
+    mode: crate::bluetooth::Mode,
+) -> Result<()> {
+    use windows::Win32::Storage::InstallableFileSystems::FilterSendMessage;
+    let msg = crate::bluetooth::PolicyMessage {
+        magic: crate::bluetooth::POLICY_MAGIC,
+        protocol: crate::bluetooth::PROTOCOL,
+        mode: mode.wire(),
+    };
+    unsafe {
+        FilterSendMessage(port, &msg as *const _ as *const core::ffi::c_void,
+            core::mem::size_of_val(&msg) as u32, None, 0, &mut 0u32)
+    }.map_err(|e| anyhow::anyhow!("Bluetooth policy handshake failed; deploy matching driver and agent: {e}"))?;
+    if mode != crate::bluetooth::Mode::Off {
+        attach_bluetooth_volumes();
+    }
+    tracing::info!(?mode, "Bluetooth driver policy applied");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn attach_bluetooth_volumes() {
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{ERROR_FLT_INSTANCE_ALTITUDE_COLLISION,
+        ERROR_FLT_INSTANCE_NAME_COLLISION};
+    use windows::Win32::Storage::FileSystem::{FindFirstVolumeW, FindNextVolumeW,
+        FindVolumeClose, GetLogicalDrives, GetDriveTypeW};
+    use windows::Win32::Storage::InstallableFileSystems::FilterAttach;
+    let attach = |volume: &str| {
+        match unsafe { FilterAttach(&HSTRING::from("dlpflt"), &HSTRING::from(volume),
+            PCWSTR::null(), 0, PWSTR::null()) } {
+            Ok(()) => tracing::info!(volume, "Bluetooth source volume attached"),
+            Err(e) if e.code() == ERROR_FLT_INSTANCE_NAME_COLLISION
+                || e.code() == ERROR_FLT_INSTANCE_ALTITUDE_COLLISION => {},
+            Err(e) => tracing::warn!(volume, error = %e,
+                "Bluetooth source volume attach failed; this volume is not confirmed protected"),
+        }
+    };
+    // Volume GUIDs cover local volumes mounted into folders as well as letters.
+    let mut name = [0u16; 1024];
+    match unsafe { FindFirstVolumeW(&mut name) } {
+        Ok(find) => {
+            loop {
+                let len = name.iter().position(|&x| x == 0).unwrap_or(name.len());
+                attach(&String::from_utf16_lossy(&name[..len]));
+                if unsafe { FindNextVolumeW(find, &mut name) }.is_err() { break; }
+            }
+            unsafe { let _ = FindVolumeClose(find); }
+        }
+        Err(e) => tracing::error!(error = %e, "Bluetooth source-volume enumeration failed"),
+    }
+    // FindFirstVolume excludes mapped network drives. New mounts are handled by
+    // the driver's InstanceSetup while Bluetooth mode is active.
+    let mask = unsafe { GetLogicalDrives() };
+    for n in 0..26 {
+        if mask & (1 << n) != 0 {
+            let drive = format!("{}:", (b'A' + n) as char);
+            let root: Vec<u16> = format!("{drive}\\").encode_utf16().chain(Some(0)).collect();
+            if unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } == 4 { attach(&drive); }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn decide_bluetooth(
+    kg: &KguardConfig, bundle: Option<&Bundle>, path: &str, content: &[u8], truncated: bool,
+) -> (Option<bool>, Option<UsbIncident>) {
+    let filename = basename_of(path);
+    let mut verdict = bundle.map(|b| detect::verdict_bytes(content, &filename, b));
+    if let Some(v) = verdict.as_mut() {
+        // Cache lookup + bounded background enqueue only. Never inline inference.
+        v.ml = detect::decide::read_path_ml(content, &filename).0;
+    }
+    let decision = crate::bluetooth::decide(verdict.as_ref(),
+        &detect::Bands::new(kg.block_at, kg.coverage_block_at),
+        !crate::mlpolicy::active().is_inert(), truncated);
+    match decision {
+        crate::bluetooth::Decision::Sensitive => {
+            let inc = incident_for(path, verdict.unwrap(), true,
+                crate::bluetooth::CHANNEL, DLP_REASON_BLUETOOTH);
+            (Some(true), inc)
+        }
+        crate::bluetooth::Decision::Clean => (Some(false), None),
+        crate::bluetooth::Decision::Unknown(reason) => {
+            crate::ml::queue::note_deny_unclassified();
+            tracing::debug!(reason, "Bluetooth transfer unverifiable; no clean verdict cached");
+            (None, None)
+        }
+    }
+}
+
 /// The basename (final path component) of an NT device path, used only to give
 /// extraction the file extension so it picks the right format. Splits on both NT
 /// (`\`) and DOS/POSIX (`/`) separators; falls back to the whole path when the
@@ -1324,6 +1446,10 @@ fn decide(
     reason: u32,
     sealer_healthy: bool,
 ) -> (Option<bool>, Option<UsbIncident>) {
+    if reason == DLP_REASON_BLUETOOTH {
+        return decide_bluetooth(kg, bundle, device_path, content, truncated);
+    }
+
     // Sealer coexistence, defect 1: a `.dlpenc` envelope passes untouched —
     // both scan reasons, every volume, before any scoring (see the gate's doc).
     if let Some(pass) = envelope_passthrough(content, reason) {
@@ -1808,6 +1934,68 @@ mod tests {
         assert_eq!(inc.kind, IncidentKind::Match);
         assert_eq!(inc.action_taken, ActionTaken::Blocked);
         assert_eq!(inc.note.as_deref(), Some("exfil-read-denied"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bluetooth_real_bundle_and_cached_ml_pipeline() {
+        use crate::ml::cache::{CachedVerdict, VerdictCache};
+        use crate::mlpolicy::{self, MlAction, MlLabelRule, MlPolicy};
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                mlpolicy::set_active(MlPolicy::default());
+                crate::ml::queue::set_verdict_cache(None);
+            }
+        }
+        let _reset = Reset;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../dlp-management-server/test/fixtures/bundle-sample");
+        let bundle = Bundle::load(&std::fs::read(fixture.join("sample.bundle")).unwrap(),
+            &std::fs::read(fixture.join("ca-cert.pem")).unwrap()).unwrap();
+        let kg = KguardConfig::default();
+        let text = format!("Operation fixture alpha. {}", (1..=12).map(|i| format!(
+            "Unit {i} advances to grid reference alpha {i} and holds the river crossing until the fuel convoy has cleared checkpoint delta {i}."
+        )).collect::<Vec<_>>().join(" "));
+        let (block, incident) = decide_bluetooth(&kg, Some(&bundle), "renamed.txt", text.as_bytes(), false);
+        assert_eq!(block, Some(true));
+        assert_eq!(incident.unwrap().channel, "bluetooth");
+        let clean = b"Coffee with friends at ten, followed by a picnic.";
+        assert_eq!(decide_bluetooth(&kg, Some(&bundle), "clean.txt", clean, false).0, Some(false));
+        // An enabled model must have classified this exact content. Audit action
+        // does not override the Bluetooth channel's enforcement disposition.
+        let policy = MlPolicy { enabled: true, action: MlAction::Audit,
+            labels: vec![MlLabelRule { id: "FIN".into(), min_confidence: None }],
+            ..MlPolicy::default() };
+        let model_version = policy.model_version.clone();
+        mlpolicy::set_active(policy);
+        assert_eq!(decide_bluetooth(&kg, Some(&bundle), "clean.txt", clean, false).0, None);
+        let dir = std::env::temp_dir().join(format!("dlp-bluetooth-cache-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let cache = std::sync::Arc::new(VerdictCache::open(&dir, 10).unwrap());
+        cache.put(VerdictCache::key_for(clean), CachedVerdict { model_version,
+            label_id: "FIN".into(), label_index: 3, confidence: 0.99, chunks: 1,
+            tokens: 20, truncated: false, classified_at: 1_700_000_000 }).unwrap();
+        crate::ml::queue::set_verdict_cache(Some(cache.clone()));
+        let (block, incident) = decide_bluetooth(&kg, Some(&bundle), "clean.txt", clean, false);
+        assert_eq!(block, Some(true));
+        let v = incident.unwrap().verdict.unwrap();
+        assert!(v.idm.is_empty() && v.edm.is_empty());
+        assert!(v.ml.unwrap().sensitive);
+        crate::ml::queue::set_verdict_cache(None);
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bluetooth_incident_is_not_mislabelled_as_usb() {
+        let inc = incident_for("C:\\secret.txt", verdict_with(1.0, 1.0), true,
+            "usb-kguard", DLP_REASON_BLUETOOTH).unwrap();
+        assert_eq!(inc.channel, "bluetooth");
+        assert_eq!(inc.device.bus_type, "bluetooth");
+        assert!(!inc.device.removable);
+        assert_eq!(inc.note.as_deref(), Some("bluetooth-read-denied"));
+        assert_eq!(inc.action_taken, ActionTaken::Blocked);
     }
 
     #[test]

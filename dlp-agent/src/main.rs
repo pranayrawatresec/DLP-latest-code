@@ -24,7 +24,7 @@ mod service;
 // modules at the crate root so the binary submodules keep addressing them as
 // `crate::config` / `crate::storage`.
 use dlp_agent::{
-    browser_host, clipboard, clippolicy, config, crypto, decrypt, detect, exfil,
+    bluetooth, browser_host, clipboard, clippolicy, config, crypto, decrypt, detect, exfil,
     livebundle, ml, mlpolicy, netfilter, notify, readdenypolicy, storage, supervise, trustdest,
     trustedreaders, trustsync, usb, usersession,
 };
@@ -1208,6 +1208,14 @@ fn cmd_ml_status(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
                 "coversCurrentModel": covered,
                 "inProgress": checkpoint.is_some(),
                 "inProgressCandidates": checkpoint.as_ref().map(|c| c.counts.candidates),
+                "pendingDirs": checkpoint
+                    .as_ref()
+                    .map(|c| c.pending_dirs.len() as u64 + c.spill.count),
+                "pendingDirsInMemory": checkpoint.as_ref().map(|c| c.pending_dirs.len()),
+                "pendingDirsOnDisk": checkpoint.as_ref().map(|c| c.spill.count),
+                // True only in degraded mode: the queue could not be persisted,
+                // so a restart re-walks the current scope.
+                "pendingTruncated": checkpoint.as_ref().map(|c| c.pending_truncated),
             },
             "readyForDenyUnclassified": ready,
             "coverage": coverage_line,
@@ -1353,10 +1361,24 @@ fn cmd_ml_status(cfg: &Config, storage: &Storage, args: &[String]) -> Result<()>
         None => println!("  last full sweep: NEVER"),
     }
     match &checkpoint {
-        Some(cp) => println!(
-            "  in progress:    yes — sweep #{}, {} dirs listed, {} files looked at so far",
-            cp.sweep_seq, cp.counts.dirs, cp.counts.candidates
-        ),
+        Some(cp) => {
+            println!(
+                "  in progress:    yes — sweep #{}, {} dirs listed, {} files looked at so far",
+                cp.sweep_seq, cp.counts.dirs, cp.counts.candidates
+            );
+            if cp.pending_truncated {
+                println!(
+                    "  queued dirs:    NOT PERSISTED — a restart re-walks the current scope"
+                );
+            } else {
+                println!(
+                    "  queued dirs:    {} still to visit ({} in memory, {} in the sidecar) — a restart resumes here",
+                    cp.pending_dirs.len() as u64 + cp.spill.count,
+                    cp.pending_dirs.len(),
+                    cp.spill.count
+                );
+            }
+        }
         None => println!("  in progress:    no"),
     }
     println!();
@@ -2251,8 +2273,10 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
         handles.push(supervised_thread("deny-drain", stop.clone(), Duration::from_secs(3), move || {
             let storage = Storage::new(state_dir.clone());
             let queue = usb::queue::IncidentQueue::new(&state_dir);
-            let report = |pid: u32, file_id: u64, _reason: u32| {
+            let report = |pid: u32, file_id: u64, reason: u32| {
                 let snap = supervise::snapshot_config(&shared);
+                let bluetooth = reason == kguard::DLP_REASON_BLUETOOTH;
+                let monitor = bluetooth && snap.kguard.bluetooth_mode == dlp_agent::bluetooth::Mode::Monitor;
                 let file_name = format!("read-deny (file id 0x{file_id:x})");
                 // A synthetic verdict so this repeat-deny POSTS to the console
                 // incident feed (like the first attempt) rather than only logging
@@ -2265,7 +2289,7 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                 // records that ANOTHER process (pid) was blocked reading the file.
                 let inc = UsbIncident {
                     kind: usb::IncidentKind::Match,
-                    channel: snap.kguard.channel_label.clone(),
+                    channel: if bluetooth { "bluetooth".into() } else { snap.kguard.channel_label.clone() },
                     file_name: file_name.clone(),
                     file_sha256: String::new(),
                     verdict: Some(detect::Verdict {
@@ -2284,11 +2308,13 @@ fn run_endpoint(cfg: &Config, storage: &Storage, stop: Arc<std::sync::atomic::At
                         product_id: String::new(),
                         serial: String::new(),
                         product_name: String::new(),
-                        bus_type: "fixed".into(),
+                        bus_type: if bluetooth { "bluetooth".into() } else { "fixed".into() },
                         removable: false,
                     },
-                    action_taken: ActionTaken::Blocked,
-                    note: Some(format!("exfil-read-denied-repeat pid={pid}")),
+                    action_taken: if monitor { ActionTaken::Audited } else { ActionTaken::Blocked },
+                    note: Some(format!("{} pid={pid}", if bluetooth {
+                        if monitor { "bluetooth-read-would-block-repeat" } else { "bluetooth-read-denied-repeat" }
+                    } else { "exfil-read-denied-repeat" })),
                     key_id: None,
                     sealed_sha256: None,
                 };

@@ -17,6 +17,7 @@ const POLICY_FALLBACK = {
   fail_block: false,
   readers_authority: 'merge',
   deny_remote_sessions: false,
+  bluetooth_mode: 'off',
 };
 
 // Effective policy for `groupId` (null => Default). `db` may be a pool or a client
@@ -30,7 +31,8 @@ async function effectivePolicyForGroup(groupId, db = pool) {
             COALESCE(o.watch_paths, r.watch_paths)             AS watch_paths,
             COALESCE(o.fail_block, r.fail_block)               AS fail_block,
             COALESCE(o.readers_authority, r.readers_authority) AS readers_authority,
-            COALESCE(o.deny_remote_sessions, r.deny_remote_sessions) AS deny_remote_sessions
+            COALESCE(o.deny_remote_sessions, r.deny_remote_sessions) AS deny_remote_sessions,
+            COALESCE(o.bluetooth_mode, r.bluetooth_mode) AS bluetooth_mode
        FROM read_deny_policy r
        LEFT JOIN group_read_deny_policy o ON o.group_id = $1
       WHERE r.id = 1`,
@@ -49,6 +51,7 @@ function policyJson(row) {
     failBlock: row.fail_block,
     readersAuthority: row.readers_authority || 'merge',
     denyRemoteSessions: row.deny_remote_sessions ?? false,
+    bluetoothMode: row.bluetooth_mode || 'off',
   };
 }
 

@@ -59,6 +59,7 @@ pub mod cache;
 pub mod chunk;
 pub mod engine;
 pub mod filter;
+pub mod frontier;
 pub mod labels;
 pub mod walk;
 pub mod watch;

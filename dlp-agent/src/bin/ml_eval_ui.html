@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DLP ML Eval Portal</title>
+<style>
+:root {
+  --bg:         #0f172a;
+  --surface:    #1e293b;
+  --surface-hi: #334155;
+  --border:     #475569;
+  --accent:     #6366f1;
+  --accent-hi:  #818cf8;
+  --success:    #10b981;
+  --warn:       #f59e0b;
+  --danger:     #ef4444;
+  --text:       #f1f5f9;
+  --muted:      #94a3b8;
+  --r:          8px;
+  --rl:         12px;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5}
+a{color:var(--accent-hi)}
+button{cursor:pointer;font:inherit;border:none;border-radius:var(--r)}
+textarea,input[type=range]{font:inherit}
+/* ---------- Layout ---------- */
+.container{max-width:1200px;margin:0 auto;padding:0 16px}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 0}
+.header-inner{display:flex;align-items:center;gap:16px;justify-content:space-between}
+.logo{font-size:22px;font-weight:800;letter-spacing:-1px;color:var(--accent-hi)}
+.logo span{color:var(--success)}
+.header-title h1{font-size:16px;font-weight:600}
+.header-title p{font-size:12px;color:var(--warn);font-weight:500}
+/* ---------- Tabs ---------- */
+.tabs{background:var(--surface);border-bottom:1px solid var(--border)}
+.tabs-inner{display:flex;gap:4px;padding:0 16px}
+.tab-btn{padding:10px 20px;background:none;color:var(--muted);font-weight:500;
+  border-bottom:2px solid transparent;border-radius:0;transition:all .15s}
+.tab-btn:hover{color:var(--text)}
+.tab-btn.active{color:var(--accent-hi);border-bottom-color:var(--accent)}
+.tab-panel{display:none;padding:24px 0}
+.tab-panel.active{display:block}
+/* ---------- Cards ---------- */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:16px}
+/* ---------- Grid ---------- */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+/* ---------- Stat tile ---------- */
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);
+  padding:16px;text-align:center}
+.stat-val{font-size:26px;font-weight:700;color:var(--text)}
+.stat-label{font-size:12px;color:var(--muted);margin-top:4px}
+/* ---------- Forms ---------- */
+textarea{width:100%;background:var(--surface-hi);border:1px solid var(--border);
+  border-radius:var(--r);color:var(--text);padding:12px;resize:vertical;
+  outline:none;transition:border-color .15s}
+textarea:focus{border-color:var(--accent)}
+.form-label{font-size:12px;color:var(--muted);margin-bottom:6px;display:block;font-weight:500}
+.btn{padding:9px 20px;border-radius:var(--r);font-weight:600;font-size:14px;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hi)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.btn-sm{padding:5px 12px;font-size:12px}
+.btn-ghost{background:var(--surface-hi);color:var(--text);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent-hi)}
+/* ---------- Badges ---------- */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
+  border-radius:99px;font-size:12px;font-weight:600}
+.badge-green{background:#064e3b;color:var(--success)}
+.badge-red{background:#450a0a;color:var(--danger)}
+.badge-yellow{background:#451a03;color:var(--warn)}
+.badge-blue{background:#1e1b4b;color:var(--accent-hi)}
+.badge-purple{background:#3b0764;color:#d8b4fe}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+/* ---------- Domain colours ---------- */
+.dom-general{color:#818cf8}
+.dom-education{color:var(--success)}
+.dom-defence{color:var(--danger)}
+/* ---------- Logit bars ---------- */
+.logit-group-label{font-size:11px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.08em;color:var(--muted);margin:12px 0 6px;padding-bottom:4px;
+  border-bottom:1px solid var(--border)}
+.logit-row{display:grid;grid-template-columns:42px 1fr 60px;align-items:center;
+  gap:8px;margin-bottom:4px}
+.logit-id{font-size:11px;font-weight:700;font-family:monospace}
+.logit-bar-wrap{background:var(--surface-hi);border-radius:3px;height:14px;overflow:hidden}
+.logit-bar{height:100%;border-radius:3px;transition:width .3s ease;min-width:2px}
+.logit-pct{font-size:11px;color:var(--muted);text-align:right;font-family:monospace}
+.logit-winner .logit-id{color:var(--text)}
+.logit-winner .logit-pct{color:var(--text);font-weight:700}
+/* ---------- Verdict box ---------- */
+.verdict-box{border-radius:var(--rl);padding:16px;display:flex;align-items:flex-start;gap:12px}
+.verdict-blocked{background:#450a0a;border:1px solid #b91c1c}
+.verdict-allowed{background:#022c22;border:1px solid #065f46}
+.verdict-unavailable{background:#1c1917;border:1px solid var(--border)}
+.verdict-icon{font-size:22px;line-height:1}
+.verdict-title{font-size:15px;font-weight:700}
+.verdict-reason{font-size:12px;color:var(--muted);margin-top:3px}
+/* ---------- Result header card ---------- */
+.result-header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:16px;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--rl)}
+.result-label-badge{font-size:28px;font-weight:800;padding:8px 16px;
+  border-radius:var(--r);background:var(--surface-hi)}
+.result-meta{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:12px}
+.conf-bar-wrap{flex:1;background:var(--surface-hi);height:8px;border-radius:4px;overflow:hidden;margin-top:8px}
+.conf-bar{height:100%;border-radius:4px;background:var(--accent)}
+/* ---------- Tables ---------- */
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th{text-align:left;padding:8px 10px;color:var(--muted);font-size:11px;
+  font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  border-bottom:1px solid var(--border)}
+.tbl td{padding:8px 10px;border-bottom:1px solid var(--border)}
+.tbl tr:last-child td{border-bottom:none}
+.tbl tr.correct td:first-child{border-left:2px solid var(--success)}
+.tbl tr.incorrect td:first-child{border-left:2px solid var(--danger)}
+.num{text-align:right;font-family:monospace;font-size:12px}
+/* ---------- Policy panel ---------- */
+.policy-panel{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--rl);padding:16px}
+.label-check-group{margin-bottom:10px}
+.label-check-group-title{font-size:11px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--muted);margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.label-checks{display:flex;flex-wrap:wrap;gap:6px}
+.label-check{display:flex;align-items:center;gap:5px;cursor:pointer;
+  background:var(--surface-hi);border:1px solid var(--border);border-radius:5px;
+  padding:4px 8px;font-size:12px;transition:border-color .15s}
+.label-check:hover{border-color:var(--accent)}
+.label-check input{cursor:pointer;accent-color:var(--accent)}
+.label-check.checked{border-color:var(--accent);background:#1e1b4b}
+.conf-slider-row{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.conf-slider-row input{flex:1;accent-color:var(--accent)}
+.conf-slider-val{font-size:13px;font-weight:600;font-family:monospace;
+  color:var(--accent-hi);min-width:36px;text-align:right}
+/* ---------- Misc ---------- */
+.section-gap{margin-top:20px}
+.dev-warning{background:#1c1403;border:1px solid #854d0e;border-radius:var(--r);
+  padding:8px 14px;font-size:12px;color:var(--warn);margin-bottom:20px;
+  display:flex;align-items:center;gap:8px}
+.empty-state{text-align:center;padding:48px 24px;color:var(--muted)}
+.empty-state-icon{font-size:36px;margin-bottom:12px}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.error-msg{color:var(--danger);font-size:13px;padding:12px;background:#450a0a;
+  border-radius:var(--r);border:1px solid #b91c1c;margin-top:12px}
+#pdf-header{display:none}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="container header-inner">
+    <div style="display:flex;align-items:center;gap:14px">
+      <div class="logo">DLP<span>ML</span></div>
+      <div class="header-title">
+        <h1>ML Evaluation Portal</h1>
+        <p>⚠ Development &amp; Testing Only · Not for Production</p>
+      </div>
+    </div>
+    <div id="model-status-badge" class="badge badge-yellow">
+      <span class="dot"></span> Loading…
+    </div>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="container">
+    <div class="tabs-inner">
+      <button class="tab-btn active" data-tab="classify">Classify</button>
+      <button class="tab-btn" data-tab="batch">Batch Eval</button>
+      <button class="tab-btn" data-tab="info">Model Info</button>
+    </div>
+  </div>
+</div>
+
+<main>
+  <!-- ================================================================ CLASSIFY -->
+  <div id="tab-classify" class="tab-panel active">
+    <div class="container">
+      <div class="dev-warning">⚠ Results in this portal reflect the on-device ONNX model. DLP verdict simulation below uses the policy settings you configure here — these settings do NOT affect the live agent.</div>
+
+      <div class="grid2" style="gap:20px;align-items:start">
+        <!-- Left: input + results -->
+        <div>
+          <div class="card">
+            <label class="form-label">Document Text</label>
+            <textarea id="classify-input" rows="10" placeholder="Paste document text here…"></textarea>
+            <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+              <button class="btn btn-primary" id="classify-btn" onclick="runClassify()">Classify</button>
+              <select id="sample-select" class="btn btn-ghost" onchange="loadSample()" style="padding:8px 10px;background:var(--surface-hi);color:var(--text);border:1px solid var(--border);border-radius:var(--r)">
+                <option value="">Load sample…</option>
+                <option value="fin">Finance (FIN)</option>
+                <option value="nuc">Nuclear (NUC)</option>
+                <option value="ops">Operations (OPS)</option>
+                <option value="int">Intelligence (INT)</option>
+                <option value="med">Medical (MED)</option>
+                <option value="cyb">Cyber (CYB)</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="classify-result" class="section-gap" style="display:none">
+            <!-- Result header -->
+            <div id="result-header" class="result-header"></div>
+
+            <!-- Verdict -->
+            <div id="verdict-box" class="section-gap"></div>
+
+            <!-- Logit bars -->
+            <div class="card section-gap">
+              <div class="card-title">Label Probability Distribution</div>
+              <div id="logit-bars"></div>
+            </div>
+          </div>
+
+          <div id="classify-error" class="error-msg" style="display:none"></div>
+        </div>
+
+        <!-- Right: policy simulation -->
+        <div>
+          <div class="policy-panel">
+            <div class="card-title">DLP Verdict Simulation</div>
+            <p style="font-size:12px;color:var(--muted);margin-bottom:14px">
+              Check labels your policy marks sensitive. The verdict below shows what the live agent would decide for this document + policy combination.
+            </p>
+
+            <div class="conf-slider-row">
+              <span style="font-size:12px;color:var(--muted);white-space:nowrap">Min confidence</span>
+              <input type="range" id="conf-slider" min="0" max="1" step="0.01" value="0.70" oninput="onConfSlider()">
+              <span id="conf-slider-val" class="conf-slider-val">0.70</span>
+            </div>
+
+            <div id="label-checks-container"></div>
+
+            <div style="margin-top:12px;display:flex;gap:8px">
+              <button class="btn btn-sm btn-ghost" onclick="markAllSensitive()">Mark all</button>
+              <button class="btn btn-sm btn-ghost" onclick="clearAllSensitive()">Clear all</button>
+              <button class="btn btn-sm btn-ghost" onclick="markDefenceSensitive()">Defence only</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================================================================ BATCH -->
+  <div id="tab-batch" class="tab-panel">
+    <div class="container">
+      <div class="dev-warning">⚠ Batch evaluation runs all documents through the ONNX engine in sequence and reports accuracy + latency metrics. No incidents are raised and no agent state is written.</div>
+
+      <div class="grid2" style="gap:20px;align-items:start">
+        <div class="card">
+          <div class="card-title">Evaluation Manifest (JSON)</div>
+          <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
+            Array of <code style="color:var(--accent-hi)">{ "name": "…", "expected": "FIN", "text": "…" }</code> objects.
+          </p>
+          <textarea id="batch-input" rows="14" placeholder='[{"name":"budget-memo","expected":"FIN","text":"The FY2026 budget…"},…]'></textarea>
+          <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center">
+            <button class="btn btn-primary" id="batch-btn" onclick="runBatch()">Run Evaluation</button>
+            <button class="btn btn-ghost btn-sm" onclick="document.getElementById('batch-file').click()">Upload JSON</button>
+            <input type="file" id="batch-file" accept=".json,application/json" style="display:none" onchange="loadBatchFile(this)">
+            <button class="btn btn-ghost btn-sm" onclick="loadBatchSample()">Load example</button>
+          </div>
+        </div>
+
+        <div id="batch-summary-col">
+          <div class="empty-state">
+            <div class="empty-state-icon">📊</div>
+            <p>Run an evaluation to see metrics</p>
+          </div>
+        </div>
+      </div>
+
+      <div id="batch-results" style="display:none;margin-top:24px">
+        <div id="pdf-header" style="margin-bottom:20px;padding-bottom:12px;border-bottom:2px solid #333">
+          <div style="font-size:18pt;font-weight:700">DLP ML Evaluation Report</div>
+          <div id="pdf-meta" style="font-size:10pt;color:#555;margin-top:4px"></div>
+        </div>
+        <div id="batch-stats-row" class="grid4"></div>
+        <div class="grid2 section-gap" style="gap:16px">
+          <div class="card">
+            <div class="card-title">Per-Label Metrics</div>
+            <div id="label-table-wrap" style="overflow-x:auto">
+              <table class="tbl" id="label-table"></table>
+            </div>
+          </div>
+          <div>
+            <div class="card">
+              <div class="card-title">Top Misclassifications</div>
+              <div id="error-pairs"></div>
+            </div>
+            <div class="card section-gap">
+              <div class="card-title">Latency (ms)</div>
+              <div id="latency-chart"></div>
+            </div>
+          </div>
+        </div>
+        <div class="card section-gap">
+          <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+            Per-Case Results
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-ghost btn-sm" onclick="exportCSV()">Export CSV</button>
+              <button class="btn btn-ghost btn-sm" onclick="exportJSON()">Export JSON</button>
+              <button class="btn btn-ghost btn-sm" onclick="exportPDF()">Export PDF</button>
+            </div>
+          </div>
+          <div style="overflow-x:auto">
+            <table class="tbl" id="case-table"></table>
+          </div>
+        </div>
+      </div>
+
+      <div id="batch-error" class="error-msg" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ================================================================ INFO -->
+  <div id="tab-info" class="tab-panel">
+    <div class="container">
+      <div id="info-content">
+        <div class="empty-state"><div class="empty-state-icon">⚙️</div><p>Loading model info…</p></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+// ============================================================================
+// State
+// ============================================================================
+let statusData = null;
+let lastClassifyResult = null;
+const sensitiveLabels = new Set();
+let minConfidence = 0.70;
+
+// ============================================================================
+// Utilities
+// ============================================================================
+const $ = id => document.getElementById(id);
+const pct  = v  => (v * 100).toFixed(1) + '%';
+const ms   = v  => v.toFixed(1) + ' ms';
+const num  = (v, decimals=2) => v.toFixed(decimals);
+const esc  = s  => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function softmax(logits) {
+  const max = Math.max(...logits);
+  const exp = logits.map(v => Math.exp(v - max));
+  const sum = exp.reduce((a,b) => a+b, 0);
+  return exp.map(v => v / sum);
+}
+
+function domainColor(domain) {
+  return { general:'#818cf8', education:'#10b981', defence:'#ef4444' }[domain] || '#94a3b8';
+}
+
+function domainClass(domain) {
+  return { general:'dom-general', education:'dom-education', defence:'dom-defence' }[domain] || '';
+}
+
+// ============================================================================
+// Tabs
+// ============================================================================
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'info') renderInfo();
+  });
+});
+
+// ============================================================================
+// API
+// ============================================================================
+async function apiFetch(path, body) {
+  const opts = body
+    ? { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }
+    : { method:'GET' };
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+// ============================================================================
+// Init / Status
+// ============================================================================
+async function init() {
+  try {
+    statusData = await apiFetch('/api/status');
+    renderStatusBadge(statusData);
+    buildPolicyCheckboxes(statusData.labels || []);
+  } catch(e) {
+    $('model-status-badge').className = 'badge badge-red';
+    $('model-status-badge').innerHTML = '<span class="dot"></span> Server error';
+  }
+}
+
+function renderStatusBadge(s) {
+  const el = $('model-status-badge');
+  if (s.available) {
+    el.className = 'badge badge-green';
+    el.innerHTML = `<span class="dot"></span> ${esc(s.model_version)} loaded`;
+  } else {
+    el.className = 'badge badge-red';
+    el.innerHTML = '<span class="dot"></span> Model unavailable';
+  }
+}
+
+// ============================================================================
+// Policy checkboxes
+// ============================================================================
+function buildPolicyCheckboxes(labels) {
+  const container = $('label-checks-container');
+  const groups = {};
+  labels.forEach(l => {
+    (groups[l.domain] = groups[l.domain] || []).push(l);
+  });
+  const order = ['general','education','defence'];
+  let html = '';
+  for (const domain of order) {
+    if (!groups[domain]) continue;
+    const cls = domainClass(domain);
+    html += `<div class="label-check-group">
+      <div class="label-check-group-title">
+        <span class="${cls}">●</span> ${domain.charAt(0).toUpperCase()+domain.slice(1)}
+      </div>
+      <div class="label-checks">`;
+    for (const l of groups[domain]) {
+      html += `<label class="label-check" id="lc-${l.id}" title="${esc(l.name)}">
+        <input type="checkbox" value="${l.id}" onchange="onLabelCheck(this)">
+        ${l.id}
+      </label>`;
+    }
+    html += '</div></div>';
+  }
+  container.innerHTML = html;
+}
+
+function onLabelCheck(el) {
+  const lc = el.closest('.label-check');
+  if (el.checked) { sensitiveLabels.add(el.value); lc.classList.add('checked'); }
+  else            { sensitiveLabels.delete(el.value); lc.classList.remove('checked'); }
+  if (lastClassifyResult) renderVerdict(lastClassifyResult);
+}
+
+function markAllSensitive() {
+  document.querySelectorAll('.label-check input').forEach(cb => {
+    cb.checked = true; cb.closest('.label-check').classList.add('checked');
+    sensitiveLabels.add(cb.value);
+  });
+  if (lastClassifyResult) renderVerdict(lastClassifyResult);
+}
+
+function clearAllSensitive() {
+  document.querySelectorAll('.label-check input').forEach(cb => {
+    cb.checked = false; cb.closest('.label-check').classList.remove('checked');
+  });
+  sensitiveLabels.clear();
+  if (lastClassifyResult) renderVerdict(lastClassifyResult);
+}
+
+function markDefenceSensitive() {
+  clearAllSensitive();
+  document.querySelectorAll('.label-check input').forEach(cb => {
+    const label = (statusData?.labels || []).find(l => l.id === cb.value);
+    if (label?.domain === 'defence') {
+      cb.checked = true; cb.closest('.label-check').classList.add('checked');
+      sensitiveLabels.add(cb.value);
+    }
+  });
+  if (lastClassifyResult) renderVerdict(lastClassifyResult);
+}
+
+function onConfSlider() {
+  minConfidence = parseFloat($('conf-slider').value);
+  $('conf-slider-val').textContent = minConfidence.toFixed(2);
+  if (lastClassifyResult) renderVerdict(lastClassifyResult);
+}
+
+// ============================================================================
+// Classify
+// ============================================================================
+const SAMPLES = {
+  fin: `The revised budget allocation for FY2026 has been approved by the Finance Committee. Total capital expenditure is set at £42.7 million, with £18.3 million earmarked for infrastructure upgrades. Quarterly variance reports will be submitted to the Auditor-General by the 15th of each month following the reporting period. Accrued liabilities for the preceding fiscal year have been reconciled against the general ledger and carry forward balances confirmed.`,
+  nuc: `The reactor coolant system pressure boundary integrity has been verified following the scheduled outage maintenance window. Core power levels returned to 97% nominal rated thermal output at 14:32 UTC. Neutron flux monitoring systems are within expected parameters. Secondary circuit water chemistry was adjusted per the radiological control team's recommendation to address trace tritium concentrations detected in condensate sampling.`,
+  ops: `Operation COBALT REACH is scheduled to commence at 0600 local on 14 November. Forward elements are to establish a security perimeter at grid reference 4731-8820 NLT 0430. Logistics convoy will depart the forward operating base at 0345 with a primary route via Route AMBER and alternate via Route DELTA. All units are to maintain radio silence from H-2 hours until the assault phase is complete. Medevac grid is 4788-9013, call sign ANGEL.`,
+  int: `INTELLIGENCE ASSESSMENT — RESTRICTED. Assessment of signals intercepted over the past 14 days indicates a 70% probability of coordinated adversarial cyber activity targeting the eastern logistics network. Technical indicators suggest use of a novel exfiltration framework consistent with TTPs associated with threat group JADE SERPENT. Recommend immediate hardening of jump servers at nodes 14, 17 and 23. Further technical detail appended at Annex C.`,
+  med: `Patient presented with acute onset chest pain radiating to the left arm, diaphoresis and nausea. 12-lead ECG showed ST-elevation in leads II, III and aVF consistent with inferior STEMI. Troponin I at presentation was 4.2 μg/L. Patient was taken to catheterisation laboratory within 58 minutes of arrival. Successful PCI performed on the right coronary artery with drug-eluting stent placement. Post-procedure ejection fraction estimated at 48%.`,
+  cyb: `Incident response report — TIER 1 PRIORITY. Unauthorized access detected on domain controller DC-PROD-04 at 02:17 UTC. Forensic analysis of Windows Event Log artefacts confirms credential stuffing attack exploiting a legacy NTLMv1 authentication path. Lateral movement observed across 11 workstations using pass-the-hash technique. Indicators of compromise include: MD5 c3ab8ff13720e8ad9047dd39466b3c89, C2 beacon to 198.51.100.47:443. Containment action: host isolation applied at 03:09 UTC.`
+};
+
+function loadSample() {
+  const key = $('sample-select').value;
+  if (key && SAMPLES[key]) $('classify-input').value = SAMPLES[key];
+  $('sample-select').value = '';
+}
+
+async function runClassify() {
+  const text = $('classify-input').value.trim();
+  if (!text) return;
+
+  $('classify-btn').disabled = true;
+  $('classify-btn').innerHTML = '<span class="spinner"></span>Classifying…';
+  $('classify-result').style.display = 'none';
+  $('classify-error').style.display = 'none';
+
+  try {
+    const result = await apiFetch('/api/classify', { text });
+    lastClassifyResult = result;
+    renderClassifyResult(result);
+    $('classify-result').style.display = 'block';
+  } catch(e) {
+    $('classify-error').textContent = 'Server error: ' + e.message;
+    $('classify-error').style.display = 'block';
+  } finally {
+    $('classify-btn').disabled = false;
+    $('classify-btn').textContent = 'Classify';
+  }
+}
+
+function renderClassifyResult(r) {
+  if (!r.ok) {
+    $('result-header').innerHTML = `<div><div class="badge badge-red">Error</div>
+      <div style="margin-top:8px;color:var(--danger);font-size:13px">${esc(r.error || 'Classification failed')}</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:4px">status: ${esc(r.error_status)} · reason: ${esc(r.error_reason)}</div>
+      <div style="font-size:12px;color:var(--muted)">${ms(r.latency_ms)}</div></div>`;
+    renderVerdict(r);
+    return;
+  }
+
+  const label = (statusData?.labels || []).find(l => l.id === r.label_id);
+  const dColor = domainColor(r.domain);
+  const dClass = domainClass(r.domain);
+
+  $('result-header').innerHTML = `
+    <div class="result-label-badge ${dClass}" style="border-left:4px solid ${dColor}">
+      <div style="font-size:11px;color:var(--muted);font-weight:600;margin-bottom:2px">${esc(r.domain?.toUpperCase())}</div>
+      <div style="font-size:28px;font-weight:800">${esc(r.label_id)}</div>
+    </div>
+    <div style="flex:1">
+      <div style="font-size:18px;font-weight:700">${esc(r.label_name)}</div>
+      <div class="conf-bar-wrap"><div class="conf-bar" style="width:${pct(r.confidence)};background:${dColor}"></div></div>
+      <div class="result-meta">
+        <span>Confidence: <strong>${pct(r.confidence)}</strong></span>
+        <span>Chunks: <strong>${r.chunks}${r.chunks_total > r.chunks ? ' / ' + r.chunks_total + ' (capped)' : ''}</strong></span>
+        <span>Tokens: <strong>${r.tokens}</strong></span>
+        <span>Latency: <strong>${ms(r.latency_ms)}</strong></span>
+      </div>
+    </div>`;
+
+  renderVerdict(r);
+
+  if (r.logits) {
+    const probs = softmax(r.logits);
+    const labels = statusData?.labels || [];
+    const groups = { general:[], education:[], defence:[] };
+    labels.forEach((l,i) => { if (groups[l.domain]) groups[l.domain].push({...l, prob:probs[i], idx:i}); });
+    const domOrder = ['general','education','defence'];
+    let html = '';
+    for (const dom of domOrder) {
+      const grp = groups[dom];
+      if (!grp?.length) continue;
+      const cls = domainClass(dom);
+      html += `<div class="logit-group-label"><span class="${cls}">●</span> ${dom.charAt(0).toUpperCase()+dom.slice(1)}</div>`;
+      const sorted = [...grp].sort((a,b) => b.prob - a.prob);
+      for (const l of sorted) {
+        const isWinner = l.id === r.label_id;
+        const color = domainColor(dom);
+        html += `<div class="logit-row${isWinner?' logit-winner':''}">
+          <span class="logit-id ${cls}">${esc(l.id)}</span>
+          <div class="logit-bar-wrap"><div class="logit-bar" style="width:${pct(l.prob)};background:${color}${isWinner?'':';opacity:.6'}"></div></div>
+          <span class="logit-pct">${pct(l.prob)}</span>
+        </div>`;
+      }
+    }
+    $('logit-bars').innerHTML = html;
+  }
+}
+
+function renderVerdict(r) {
+  const box = $('verdict-box');
+  if (!r.ok) {
+    box.innerHTML = `<div class="verdict-box verdict-unavailable">
+      <div class="verdict-icon">⚠</div>
+      <div><div class="verdict-title" style="color:var(--warn)">MODEL UNAVAILABLE</div>
+      <div class="verdict-reason">failBlock = true → DLP blocks by default when model cannot classify</div></div>
+    </div>`;
+    return;
+  }
+  const isMarked = sensitiveLabels.has(r.label_id);
+  const aboveThreshold = r.confidence >= minConfidence;
+  let html;
+  if (isMarked && aboveThreshold) {
+    html = `<div class="verdict-box verdict-blocked">
+      <div class="verdict-icon">🚫</div>
+      <div><div class="verdict-title" style="color:var(--danger)">BLOCKED</div>
+      <div class="verdict-reason">${esc(r.label_id)} is marked sensitive · confidence ${pct(r.confidence)} ≥ threshold ${pct(minConfidence)}</div></div>
+    </div>`;
+  } else if (isMarked && !aboveThreshold) {
+    html = `<div class="verdict-box verdict-unavailable" style="border-color:var(--warn)">
+      <div class="verdict-icon">⚡</div>
+      <div><div class="verdict-title" style="color:var(--warn)">BELOW THRESHOLD</div>
+      <div class="verdict-reason">${esc(r.label_id)} is marked sensitive but confidence ${pct(r.confidence)} &lt; threshold ${pct(minConfidence)} → allowed</div></div>
+    </div>`;
+  } else {
+    html = `<div class="verdict-box verdict-allowed">
+      <div class="verdict-icon">✅</div>
+      <div><div class="verdict-title" style="color:var(--success)">ALLOWED</div>
+      <div class="verdict-reason">${isMarked ? 'Confidence too low' : `Label ${esc(r.label_id)} not marked sensitive in simulation policy`}</div></div>
+    </div>`;
+  }
+  box.innerHTML = html;
+}
+
+// ============================================================================
+// Batch eval
+// ============================================================================
+function loadBatchFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => { $('batch-input').value = e.target.result; input.value = ''; };
+  reader.readAsText(file);
+}
+
+function loadBatchSample() {
+  const sample = [
+    { name:'fin-memo-1',  expected:'FIN', text:'The quarterly budget reconciliation confirms total expenditure of £4.2 million against the approved allocation of £4.5 million, leaving a favourable variance of £0.3 million carried forward to Q4.' },
+    { name:'fin-memo-2',  expected:'FIN', text:'Capital appropriation request for replacement of central heating infrastructure: estimated total cost £890,000 including VAT. Funding to be drawn from the capital reserves fund (account code 7742).' },
+    { name:'ops-order-1', expected:'OPS', text:'Operational order for Exercise IRON BRIDGE. Objective: establish forward assembly area at grid 4502-7210 by 0600 on D+1. Logistics package to be confirmed by Brigade HQ NLT 1800 D-1.' },
+    { name:'ops-order-2', expected:'OPS', text:'Movement order for tactical convoy. Primary route via Route HAWK, alternate DOVE. Departure 0400, arrive FOB ANVIL NLT 0700. Comms plan attached at Annex B.' },
+    { name:'nuc-brief-1', expected:'NUC', text:'Reactor power reduction to 60% nominal for scheduled in-service inspection of primary coolant loop. Radiation protection officer briefing at 0800 in the health physics office.' },
+    { name:'int-assess-1',expected:'INT', text:'Current intelligence assessment indicates elevated probability of adversarial reconnaissance activity in the northern sector. HUMINT source COBALT reports scheduled meeting at a known safe house.' },
+    { name:'cyb-inc-1',   expected:'CYB', text:'Anomalous outbound traffic detected from workstation WS-0441. Packet capture indicates exfiltration attempt to IP 203.0.113.44 over port 443. EDR alert raised at 14:22 UTC.' },
+    { name:'med-record-1',expected:'MED', text:'Post-operative note: patient returned to ward at 15:30 following uneventful laparoscopic cholecystectomy. Observations stable. Pain management: IV paracetamol 1g QDS, rescue morphine PRN.' }
+  ];
+  $('batch-input').value = JSON.stringify(sample, null, 2);
+}
+
+async function runBatch() {
+  const raw = $('batch-input').value.trim();
+  if (!raw) return;
+
+  let cases;
+  try { cases = JSON.parse(raw); }
+  catch(e) { $('batch-error').textContent = 'Invalid JSON: ' + e.message; $('batch-error').style.display='block'; return; }
+  if (!Array.isArray(cases)) { $('batch-error').textContent = 'Expected a JSON array'; $('batch-error').style.display='block'; return; }
+
+  $('batch-btn').disabled = true;
+  $('batch-btn').innerHTML = '<span class="spinner"></span>Running…';
+  $('batch-results').style.display = 'none';
+  $('batch-error').style.display = 'none';
+
+  try {
+    const result = await apiFetch('/api/batch', { cases });
+    renderBatchResult(result);
+  } catch(e) {
+    $('batch-error').textContent = 'Server error: ' + e.message;
+    $('batch-error').style.display = 'block';
+  } finally {
+    $('batch-btn').disabled = false;
+    $('batch-btn').textContent = 'Run Evaluation';
+  }
+}
+
+let lastBatchResult = null;
+
+async function exportPDF() {
+  if (!lastBatchResult) return;
+  const btn = document.querySelector('button[onclick="exportPDF()"]');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Rendering…';
+
+  try {
+    const el = $('batch-results');
+    // Temporarily show the pdf-header for the capture
+    $('pdf-header').style.display = 'block';
+
+    const canvas = await html2canvas(el, {
+      scale: 2,
+      backgroundColor: getComputedStyle(document.body).backgroundColor,
+      logging: false,
+      useCORS: true,
+      scrollX: 0,
+      scrollY: -window.scrollY,
+      windowWidth: el.scrollWidth,
+      width: el.scrollWidth
+    });
+
+    $('pdf-header').style.display = 'none';
+
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const margin = 8;
+    const printW = pageW - margin * 2;
+    const printH = (canvas.height * printW) / canvas.width;
+    const imgData = canvas.toDataURL('image/png');
+
+    let remaining = printH;
+    let srcY = 0;
+    let first = true;
+
+    while (remaining > 0) {
+      if (!first) pdf.addPage();
+      first = false;
+      const sliceH = Math.min(remaining, pageH - margin * 2);
+      const srcSlicePx = (sliceH / printH) * canvas.height;
+
+      const slice = document.createElement('canvas');
+      slice.width = canvas.width;
+      slice.height = Math.round(srcSlicePx);
+      slice.getContext('2d').drawImage(canvas, 0, srcY, canvas.width, slice.height, 0, 0, slice.width, slice.height);
+
+      pdf.addImage(slice.toDataURL('image/png'), 'PNG', margin, margin, printW, sliceH);
+      srcY += slice.height;
+      remaining -= sliceH;
+    }
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    pdf.save(`dlp-eval-${ts}.pdf`);
+  } catch(e) {
+    alert('PDF generation failed: ' + e.message);
+  } finally {
+    $('pdf-header').style.display = 'none';
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function exportJSON() {
+  if (!lastBatchResult) return;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const blob = new Blob([JSON.stringify(lastBatchResult, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `dlp-eval-${ts}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function exportCSV() {
+  if (!lastBatchResult) return;
+  const r = lastBatchResult;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const header = 'name,expected,predicted,confidence,latency_ms,correct,error';
+  const rows = r.cases.map(c =>
+    [c.name, c.expected, c.predicted || '', c.confidence != null ? c.confidence.toFixed(4) : '',
+     c.latency_ms != null ? c.latency_ms.toFixed(1) : '', c.correct ? '1' : '0', c.error || '']
+    .map(v => `"${String(v).replace(/"/g, '""')}"`)
+    .join(',')
+  );
+  const csv = [header, ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `dlp-eval-${ts}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function renderBatchResult(r) {
+  if (!r.ok) {
+    $('batch-error').textContent = r.error || 'Batch evaluation failed';
+    $('batch-error').style.display = 'block';
+    return;
+  }
+  lastBatchResult = r;
+
+  // PDF header metadata
+  const now = new Date().toLocaleString();
+  $('pdf-meta').textContent = `Generated: ${now}  ·  Cases: ${r.total_cases}  ·  Accuracy: ${(r.accuracy*100).toFixed(1)}%  ·  Macro F1: ${r.macro_f1.toFixed(3)}  ·  Throughput: ${r.throughput_docs_per_sec.toFixed(1)} docs/sec`;
+
+  // Summary stats
+  const accColor = r.accuracy >= 0.9 ? 'var(--success)' : r.accuracy >= 0.7 ? 'var(--warn)' : 'var(--danger)';
+  $('batch-stats-row').innerHTML = `
+    <div class="stat"><div class="stat-val" style="color:${accColor}">${pct(r.accuracy)}</div><div class="stat-label">Accuracy</div></div>
+    <div class="stat"><div class="stat-val">${num(r.macro_f1,3)}</div><div class="stat-label">Macro F1</div></div>
+    <div class="stat"><div class="stat-val">${num(r.throughput_docs_per_sec,1)}</div><div class="stat-label">Docs / sec</div></div>
+    <div class="stat"><div class="stat-val">${r.passed} / ${r.total_cases}</div><div class="stat-label">Passed</div></div>`;
+
+  // Per-label table
+  let rows = r.label_metrics.map(m => {
+    const f1Color = m.f1 >= 0.8 ? 'var(--success)' : m.f1 >= 0.5 ? 'var(--warn)' : 'var(--danger)';
+    return `<tr>
+      <td><span class="badge badge-blue" style="font-size:11px">${esc(m.id)}</span></td>
+      <td>${esc(m.name)}</td>
+      <td class="num">${m.support}</td>
+      <td class="num">${num(m.precision,3)}</td>
+      <td class="num">${num(m.recall,3)}</td>
+      <td class="num" style="color:${f1Color};font-weight:700">${num(m.f1,3)}</td>
+    </tr>`;
+  }).join('');
+  $('label-table').innerHTML = `<thead><tr>
+    <th>ID</th><th>Label</th><th class="num">Support</th>
+    <th class="num">Precision</th><th class="num">Recall</th><th class="num">F1</th>
+  </tr></thead><tbody>${rows}</tbody>`;
+
+  // Top errors
+  if (r.top_errors.length === 0) {
+    $('error-pairs').innerHTML = '<p style="color:var(--success);font-size:13px">🎉 No misclassifications!</p>';
+  } else {
+    $('error-pairs').innerHTML = r.top_errors.map(e =>
+      `<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px">
+        <span class="badge badge-blue">${esc(e.expected)}</span>
+        <span style="color:var(--muted)">→</span>
+        <span class="badge badge-red">${esc(e.predicted)}</span>
+        <span style="color:var(--muted);margin-left:auto;font-family:monospace">${e.count}×</span>
+      </div>`
+    ).join('');
+  }
+
+  // Latency summary (text-based)
+  const lt = r.latency;
+  $('latency-chart').innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:12px">
+      ${[['P50',lt.p50],['P95',lt.p95],['P99',lt.p99],['Mean',lt.mean],['Min',lt.min],['Max',lt.max]]
+        .map(([k,v]) => `<div style="display:flex;justify-content:space-between;padding:4px 8px;
+          background:var(--surface-hi);border-radius:4px">
+          <span style="color:var(--muted)">${k}</span>
+          <span style="font-family:monospace;font-weight:600">${ms(v)}</span>
+        </div>`).join('')}
+    </div>`;
+
+  // Per-case table (cap at 200 to keep DOM manageable)
+  const caseRows = r.cases.slice(0, 200).map(c => {
+    const ok = c.correct;
+    return `<tr class="${ok?'correct':'incorrect'}">
+      <td>${esc(c.name)}</td>
+      <td><span class="badge badge-blue" style="font-size:11px">${esc(c.expected)}</span></td>
+      <td>${c.predicted ? `<span class="badge ${ok?'badge-green':'badge-red'}" style="font-size:11px">${esc(c.predicted)}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+      <td class="num">${c.confidence != null ? pct(c.confidence) : '—'}</td>
+      <td class="num">${ms(c.latency_ms)}</td>
+      <td>${ok ? '✅' : (c.error ? `<span style="color:var(--danger)" title="${esc(c.error)}">⚠ error</span>` : '❌')}</td>
+    </tr>`;
+  }).join('');
+  const truncNote = r.cases.length > 200 ? `<div style="padding:8px;color:var(--muted);font-size:12px">Showing first 200 of ${r.cases.length} cases</div>` : '';
+  $('case-table').innerHTML = `<thead><tr>
+    <th>Name</th><th>Expected</th><th>Predicted</th>
+    <th class="num">Confidence</th><th class="num">Latency</th><th>Result</th>
+  </tr></thead><tbody>${caseRows}</tbody>`;
+  if (truncNote) $('case-table').insertAdjacentHTML('afterend', truncNote);
+
+  $('batch-results').style.display = 'block';
+  $('batch-results').scrollIntoView({ behavior:'smooth', block:'start' });
+}
+
+// ============================================================================
+// Model Info
+// ============================================================================
+function renderInfo() {
+  if (!statusData) { $('info-content').innerHTML = '<div class="empty-state"><p>Status not loaded</p></div>'; return; }
+  const s = statusData;
+  const g = s.geometry;
+
+  const cards = [
+    ['Model Version',   s.model_version   || '—',                        s.available ? 'badge-green' : 'badge-red'],
+    ['Graph Backend',   s.graph_kind      || '—',                        'badge-blue'],
+    ['Label Count',     String(s.label_count),                           'badge-blue'],
+    ['Max Chars',       s.max_chars != null ? s.max_chars.toLocaleString() : '— (sidecar default)', 'badge-blue'],
+    ['Model Root',      s.model_root      || '—',                        'badge-blue'],
+  ].map(([label, val, cls]) => `
+    <div class="card" style="word-break:break-all">
+      <div class="card-title">${label}</div>
+      <div class="badge ${cls}" style="font-size:14px;font-family:monospace;padding:6px 12px;border-radius:6px;width:fit-content">${esc(val)}</div>
+    </div>`).join('');
+
+  const geoCard = g ? `
+    <div class="card" style="grid-column:span 2">
+      <div class="card-title">Chunk Geometry</div>
+      <div style="display:flex;gap:20px;flex-wrap:wrap">
+        ${[['Max tokens / chunk', g.max_tokens], ['Overlap tokens', g.overlap_tokens], ['Min tokens', g.min_tokens]]
+          .map(([k,v]) => `<div><div style="font-size:11px;color:var(--muted)">${k}</div>
+            <div style="font-size:24px;font-weight:700;font-family:monospace">${v}</div></div>`).join('')}
+      </div>
+    </div>` : '';
+
+  const shaCard = s.model_sha256 ? `
+    <div class="card" style="grid-column:span 2">
+      <div class="card-title">Model SHA-256</div>
+      <div style="font-family:monospace;font-size:12px;color:var(--muted);word-break:break-all">${esc(s.model_sha256)}</div>
+    </div>` : '';
+
+  const errCard = s.load_error ? `
+    <div class="card" style="grid-column:span 2;border-color:var(--danger)">
+      <div class="card-title" style="color:var(--danger)">Load Error</div>
+      <div style="font-size:13px;color:var(--danger)">${esc(s.load_error)}</div>
+    </div>` : '';
+
+  const labelsHtml = (s.labels || []).map(l => {
+    const cls = domainClass(l.domain);
+    return `<span class="badge badge-blue" style="font-size:11px;font-family:monospace" title="${esc(l.name)} (${l.domain})">${l.id}</span>`;
+  }).join(' ');
+
+  $('info-content').innerHTML = `
+    <div class="grid2" style="gap:16px">${cards}${geoCard}${shaCard}${errCard}</div>
+    <div class="card section-gap">
+      <div class="card-title">Label Space (${s.label_count} labels, frozen)</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">${labelsHtml}</div>
+      <div style="margin-top:12px;font-size:12px;color:var(--muted)">
+        <span class="dom-general">● general</span> &nbsp;
+        <span class="dom-education">● education</span> &nbsp;
+        <span class="dom-defence">● defence</span>
+      </div>
+    </div>`;
+}
+
+// ============================================================================
+// Boot
+// ============================================================================
+init();
+</script>
+</body>
+</html>

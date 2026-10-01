@@ -30,6 +30,7 @@ const CHANNELS = {
   clipboard: 'Clipboard',
   'web-upload': 'Web upload',
   network: 'Network',
+  bluetooth: 'Bluetooth',
 }
 const channelLabel = (c) => CHANNELS[c] || c || '—'
 
@@ -397,6 +398,7 @@ export default function Incidents() {
             <option value="clipboard">Clipboard</option>
             <option value="web-upload">Web upload</option>
             <option value="network">Network</option>
+            <option value="bluetooth">Bluetooth</option>
           </Select>
         </div>
         <div className="w-44">
